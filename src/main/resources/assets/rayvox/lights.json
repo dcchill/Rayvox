@@ -1,0 +1,14 @@
+{
+  "minecraft:torch": {"color":[1,0.65,0.28],"intensity":1.5,"radius":14,"shadows":true},
+  "minecraft:wall_torch": {"color":[1,0.65,0.28],"intensity":1.5,"radius":14,"shadows":true},
+  "minecraft:soul_torch": {"color":[0.12,0.65,1],"intensity":1.5,"radius":10,"shadows":true},
+  "minecraft:soul_wall_torch": {"color":[0.12,0.65,1],"intensity":1.5,"radius":10,"shadows":true},
+  "minecraft:lantern": {"color":[1,0.7,0.35],"intensity":1.8,"radius":15,"shadows":true},
+  "minecraft:soul_lantern": {"color":[0.12,0.65,1],"intensity":1.8,"radius":10,"shadows":true},
+  "minecraft:glowstone": {"color":[1,0.82,0.45],"intensity":1.5,"radius":15,"shadows":true},
+  "minecraft:sea_lantern": {"color":[0.6,0.9,1],"intensity":1.5,"radius":15,"shadows":true},
+  "minecraft:lava": {"color":[1,0.32,0.05],"intensity":1.5,"radius":15,"shadows":true},
+  "minecraft:redstone_lamp": {"color":[1,0.48,0.2],"intensity":1.8,"radius":15,"shadows":true},
+  "minecraft:end_rod": {"color":[0.85,0.75,1],"intensity":1.5,"radius":14,"shadows":true},
+  "minecraft:shroomlight": {"color":[1,0.45,0.18],"intensity":1.8,"radius":15,"shadows":true}
+}

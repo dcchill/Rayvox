@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.rayvox.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["LevelRendererMixin", "ClientLevelMixin", "GameRendererMixin"],
+  "injectors": {"defaultRequire": 1}
+}

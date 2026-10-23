@@ -1,0 +1,44 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.95'
+}
+
+group = 'dev.rayvox'
+version = '0.1.0'
+base.archivesName = 'rayvox'
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = '21.1.228'
+    runs {
+        client { client() }
+    }
+    mods {
+        rayvox { sourceSet sourceSets.main }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+
+sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
+sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
+
+tasks.register('cacheCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.rayvox.VoxelGridCheck'
+}
+tasks.named('check') { dependsOn cacheCheck }
+tasks.register('lightingCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.rayvox.LightingCheck'
+}
+tasks.named('check') { dependsOn lightingCheck }
+
+// Uses the same GLSL assets as the mod against a hidden, real OpenGL context.
+tasks.register('gpuCheck', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.rayvox.ShaderCheck'
+}

@@ -1,0 +1,9 @@
+{
+  "key.categories.rayvox": "Rayvox",
+  "key.rayvox.debug": "Open lighting debugger",
+  "screen.rayvox.debug": "Rayvox — RGB lights and shadows",
+  "screen.rayvox.view": "View: %s",
+  "screen.rayvox.enable": "Lighting: %s",
+  "screen.rayvox.place": "Toggle red/blue test pair ahead",
+  "screen.rayvox.close": "Return to world"
+}
