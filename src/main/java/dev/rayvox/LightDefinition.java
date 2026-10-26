@@ -17,6 +17,8 @@ public record LightDefinition(float red, float green, float blue, float intensit
         return value <= 0.04045f ? value / 12.92f : (float)Math.pow((value + 0.055f) / 1.055f, 2.4);
     }
 
+    public boolean contributes() { return intensity > 0 && (red > 0 || green > 0 || blue > 0); }
+
     public static Map<String, LightDefinition> read(Reader reader) {
         var result = new HashMap<String, LightDefinition>();
         var json = JsonParser.parseReader(reader).getAsJsonObject();

@@ -16,6 +16,8 @@ public final class VoxelWorldCache {
     public int extractedLastTick;
     private final LightColors colors;
     private final MaterialTable materials;
+    private final ShapeMask.Cache shapeMask = new ShapeMask.Cache();
+    private final java.util.Map<net.minecraft.world.level.block.Block, String> blockIds = new java.util.IdentityHashMap<>();
 
     public VoxelWorldCache(int radius, LightColors colors, MaterialTable materials) {
         grid = new VoxelGrid(radius);
@@ -27,10 +29,15 @@ public final class VoxelWorldCache {
     public void tick(ClientLevel level, int cameraX, int cameraY, int cameraZ, int budget) {
         grid.recenter(Math.floorDiv(cameraX, 16), Math.floorDiv(cameraY, 16), Math.floorDiv(cameraZ, 16));
         // Polling identity also catches distance changes and unloads missed during transitions.
-        for (var slot : grid.slots) {
-            var chunk = slot.y < level.getMinSection() || slot.y >= level.getMaxSection() ? null
-                    : level.getChunkSource().getChunk(slot.x, slot.z, ChunkStatus.FULL, false);
-            if (slot.source != chunk) { slot.setSource(chunk); grid.revision++; }
+        for (int z = grid.centerZ - grid.radius; z <= grid.centerZ + grid.radius; z++) {
+            for (int x = grid.centerX - grid.radius; x <= grid.centerX + grid.radius; x++) {
+                var chunk = level.getChunkSource().getChunk(x, z, ChunkStatus.FULL, false);
+                for (int y = grid.centerY - grid.radius; y <= grid.centerY + grid.radius; y++) {
+                    var slot = grid.get(x, y, z);
+                    var source = y < level.getMinSection() || y >= level.getMaxSection() ? null : chunk;
+                    if (slot.source != source) { slot.setSource(source); grid.revision++; }
+                }
+            }
         }
         extractedLastTick = 0;
         scheduler.tick(grid);
@@ -42,7 +49,7 @@ public final class VoxelWorldCache {
             var slot = grid.slots[next];
             var chunk = (LevelChunk)slot.source;
             long start = System.nanoTime();
-            extract(level, chunk, slot);
+            extract(level, chunk.getSection(level.getSectionIndexFromSectionY(slot.y)), slot);
             scheduler.completed(next, System.nanoTime() - start);
             slot.dirty = false;
             slot.ready = true;
@@ -53,8 +60,7 @@ public final class VoxelWorldCache {
         }
     }
 
-    private void extract(ClientLevel level, LevelChunk chunk, VoxelGrid.Slot slot) {
-        var section = chunk.getSection(level.getSectionIndexFromSectionY(slot.y));
+    void extract(net.minecraft.world.level.BlockGetter level, net.minecraft.world.level.chunk.LevelChunkSection section, VoxelGrid.Slot slot) {
         var lights = new ArrayList<LightSourceManager.Light>();
         slot.lightOverflow = false;
         if (section.hasOnlyAir()) {
@@ -67,32 +73,28 @@ public final class VoxelWorldCache {
                 for (int x = 0; x < 16; x++) {
                     var state = section.getBlockState(x, y, z);
                     cursor.set(slot.x * 16 + x, slot.y * 16 + y, slot.z * 16 + z);
-                    String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                    int index = x + 16 * (y + 16 * z);
                     int emission = state.getLightEmission(level, cursor);
+                    // Mixed sections are often mostly air. Avoid registry, material, shape and albedo queries for it.
+                    if (state.isAir() && emission == 0) {
+                        slot.data[index] = 0;
+                        continue;
+                    }
+                    String blockId = blockIds.computeIfAbsent(state.getBlock(), block -> BuiltInRegistries.BLOCK.getKey(block).toString());
                     if (emission > 0) {
-                        if (lights.size() == LightSourceManager.PER_SNAPSHOT) slot.lightOverflow = true;
-                        else {
-                            String id = blockId;
-                            var definition = colors.resolve(state, emission);
-                            lights.add(new LightSourceManager.Light(id, cursor.getX() + 0.5, cursor.getY() + 0.5,
-                                    cursor.getZ() + 0.5, definition));
+                        var definition = colors.resolve(state, emission);
+                        if (definition.contributes()) {
+                            if (lights.size() == LightSourceManager.PER_SNAPSHOT) slot.lightOverflow = true;
+                            else lights.add(new LightSourceManager.Light(blockId, cursor.getX() + 0.5, cursor.getY() + 0.5,
+                                        cursor.getZ() + 0.5, definition));
                         }
                     }
-                    byte material;
-                    if (state.isAir()) material = 0;
-                    else if (materials.blocks.containsKey(blockId)) material = materials.blocks.get(blockId).byteValue();
-                    else if (state.isSolidRender(level, cursor)) material = 1;
-                    else if (state.getFluidState().is(net.minecraft.tags.FluidTags.WATER)) material = 3;
-                    else if (!state.getFluidState().isEmpty()) material = 4;
-                    else if (state.getShape(level, cursor).isEmpty()) material = 0;
-                    else material = (byte)(state.getLightBlock(level, cursor) == 0 ? 4 : 2);
-                    int index = VoxelGrid.voxelIndex(x, y, z);
+                    byte material = VoxelMaterials.classify(state, level, cursor, materials.blocks.get(blockId));
                     slot.data[index] = material;
-                    if (material == 2) {
-                        long mask = 0;
-                        for (var box : state.getShape(level, cursor).toAabbs())
-                            mask |= ShapeMask.box(box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ);
-                        slot.shapes[index] = mask;
+                    if (material == 2 || material == 3 || Byte.toUnsignedInt(material) >= 16) {
+                        var shape = material == 3 ? state.getFluidState().getShape(level, cursor) : state.getShape(level, cursor);
+                        slot.shapes[index] = shapeMask.of(shape, material != 3 && !state.getBlock().hasDynamicShape());
+                        if (shapeMask.boxEncoded()) slot.data[index] |= (byte)BoxShape.FLAG;
                     }
                     // shortcut: map colors approximate texture reflectance; replace with atlas sampling for higher-fidelity GI.
                     int color = state.getMapColor(level, cursor).col;

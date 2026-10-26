@@ -20,9 +20,9 @@ public final class ShadowRay {
         double traveled = 0;
         for (int step = 0; step < 128; step++) {
             var slot = grid.get(Math.floorDiv(cell[0], 16), Math.floorDiv(cell[1], 16), Math.floorDiv(cell[2], 16));
-            if (slot == null || slot.state() != 1) return new Result(false, true, cell[0], cell[1], cell[2], traveled * length);
+            if (slot == null || (slot.state() & 3) != 1) return new Result(false, true, cell[0], cell[1], cell[2], traveled * length);
             if (java.util.Arrays.equals(cell, goal)) return new Result(true, false, cell[0], cell[1], cell[2], length);
-            byte material = slot.data[VoxelGrid.voxelIndex(cell[0], cell[1], cell[2])];
+            int material = slot.data[VoxelGrid.voxelIndex(cell[0], cell[1], cell[2])] & BoxShape.MATERIAL_MASK;
             if (material == 1 || material == 2) return new Result(false, false, cell[0], cell[1], cell[2], traveled * length);
             traveled = Math.min(next[0], Math.min(next[1], next[2]));
             if (traveled >= 1) return new Result(true, false, cell[0], cell[1], cell[2], length);

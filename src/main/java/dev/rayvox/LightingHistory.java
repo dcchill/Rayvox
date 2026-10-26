@@ -5,6 +5,8 @@ import static org.lwjgl.opengl.GL33C.*;
 /** Two-frame GPU lighting history. Surface keys reject disocclusions; revisions reject stale lighting. */
 final class LightingHistory implements AutoCloseable {
     private final int[] color = new int[2], key = new int[2], indirect = new int[2];
+    private final long[] keyRevision = {Long.MIN_VALUE, Long.MIN_VALUE};
+    private final int[] keySunRevision = {Integer.MIN_VALUE, Integer.MIN_VALUE};
     private final int framebuffer = glGenFramebuffers();
     private final int drawBuffers = glGetInteger(GL_MAX_DRAW_BUFFERS);
     private int width, height, write, target;
@@ -14,16 +16,27 @@ final class LightingHistory implements AutoCloseable {
     private long revision = Long.MIN_VALUE;
     private int oldColor, oldKey, oldActive, oldFramebuffer;
     private int oldIndirect;
+    private int cachedProgram, validLocation, sunValidLocation, indirectLocation, colorLocation, keyLocation;
     private boolean gi;
+    private boolean cameraKnown, cameraMoving;
+    private double cameraX, cameraY, cameraZ;
     private final boolean[] blend = new boolean[4];
     private final int[] drawMasks = new int[4];
     private final java.nio.ByteBuffer colorMask = org.lwjgl.BufferUtils.createByteBuffer(4);
     private static final float[] ZERO = {0, 0, 0, 0};
-    private static final int[] CLEAR = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
-    private static final int[] CLEAR_DIRECT = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
     private static final int[] DRAW = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
     private static final int[] DRAW_GI = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3};
     String status = "Lighting history warming";
+
+    void camera(double x, double y, double z, boolean directional) {
+        boolean moving = directional && cameraKnown && (x != cameraX || y != cameraY || z != cameraZ);
+        // Sun visibility includes a camera-centered caster fade. Refresh it during motion, then reset
+        // both key buffers once on stopping so sparse older surfaces cannot retain a different camera's fade.
+        if (cameraMoving && !moving) java.util.Arrays.fill(keySunRevision, Integer.MIN_VALUE);
+        cameraMoving = moving;
+        cameraKnown = true;
+        cameraX = x; cameraY = y; cameraZ = z;
+    }
 
     void begin(int width, int height, long revision) {
         begin(width, height, revision, 0);
@@ -60,26 +73,26 @@ final class LightingHistory implements AutoCloseable {
         target = bound;
         if (this.width != width || this.height != height || this.gi != gi) { this.gi = gi; allocate(width, height); }
         previous = availablePrevious(revision);
-        previousSun = previous && this.sunRevision == sunRevision;
+        previousSun = previous && this.sunRevision == sunRevision && keySunRevision[write] == sunRevision && !cameraMoving;
         this.sunRevision = sunRevision;
         this.revision = revision;
         write ^= 1;
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color[write], 0);
-        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, key[write], 0);
-        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, gi ? indirect[write] : 0, 0);
-        glDrawBuffers(gi ? CLEAR : CLEAR_DIRECT);
-        // Clear only history, preserving Minecraft's color, depth, clear color and framebuffer.
-        boolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-        glDisable(GL_SCISSOR_TEST);
-        for (int i = 0; i < (gi ? 3 : 2); i++) {
-            int mask = mask(i);
-            glColorMaski(i, true, true, true, true);
-            glClearBufferfv(GL_COLOR, i, ZERO);
-            restoreMask(i, mask);
+        if (keyRevision[write] != revision || keySunRevision[write] != sunRevision) {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, key[write], 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            // A zero key rejects all associated color/GI. Unchanged snapshots can retain older valid surfaces.
+            boolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+            glDisable(GL_SCISSOR_TEST);
+            int mask = mask(0);
+            glColorMaski(0, true, true, true, true);
+            glClearBufferfv(GL_COLOR, 0, ZERO);
+            restoreMask(0, mask);
+            if (scissor) glEnable(GL_SCISSOR_TEST);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, bound);
+            keyRevision[write] = revision;
+            keySunRevision[write] = sunRevision;
         }
-        if (scissor) glEnable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, bound);
         available = true;
         status = "Lighting history: " + (previous ? "reusing unchanged surfaces" : "invalidated / warming")
                 + "; " + ((long)width * height * bytes / 1024 / 1024) + " MiB";
@@ -88,8 +101,16 @@ final class LightingHistory implements AutoCloseable {
     private boolean availablePrevious(long revision) { return this.revision == revision && color[0] != 0; }
 
     boolean attach(int program) {
-        glUniform1i(glGetUniformLocation(program, "HistoryValid"), 0);
-        glUniform1i(glGetUniformLocation(program, "SunHistoryValid"), 0);
+        if (cachedProgram != program) {
+            cachedProgram = program;
+            validLocation = glGetUniformLocation(program, "HistoryValid");
+            sunValidLocation = glGetUniformLocation(program, "SunHistoryValid");
+            indirectLocation = glGetUniformLocation(program, "HistoryIndirect");
+            colorLocation = glGetUniformLocation(program, "HistoryColor");
+            keyLocation = glGetUniformLocation(program, "HistoryKey");
+        }
+        glUniform1i(validLocation, 0);
+        glUniform1i(sunValidLocation, 0);
         if (!available || attached || glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING) != target) return false;
         oldFramebuffer = target;
         oldActive = glGetInteger(GL_ACTIVE_TEXTURE);
@@ -103,13 +124,13 @@ final class LightingHistory implements AutoCloseable {
             glActiveTexture(GL_TEXTURE10);
             oldIndirect = glGetInteger(GL_TEXTURE_BINDING_2D);
             glBindTexture(GL_TEXTURE_2D, indirect[write ^ 1]);
-            glUniform1i(glGetUniformLocation(program, "HistoryIndirect"), 10);
+            glUniform1i(indirectLocation, 10);
         }
         glActiveTexture(oldActive);
-        glUniform1i(glGetUniformLocation(program, "HistoryColor"), 7);
-        glUniform1i(glGetUniformLocation(program, "HistoryKey"), 8);
-        glUniform1i(glGetUniformLocation(program, "HistoryValid"), previous ? 1 : 0);
-        glUniform1i(glGetUniformLocation(program, "SunHistoryValid"), previousSun ? 1 : 0);
+        glUniform1i(colorLocation, 7);
+        glUniform1i(keyLocation, 8);
+        glUniform1i(validLocation, previous ? 1 : 0);
+        glUniform1i(sunValidLocation, previousSun ? 1 : 0);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, color[write], 0);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, key[write], 0);
         if (gi) glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_2D, indirect[write], 0);
@@ -152,7 +173,12 @@ final class LightingHistory implements AutoCloseable {
         oldFramebuffer = 0;
     }
 
-    void invalidate() { revision = Long.MIN_VALUE; previous = available = false; }
+    void invalidate() {
+        revision = Long.MIN_VALUE;
+        java.util.Arrays.fill(keyRevision, Long.MIN_VALUE);
+        java.util.Arrays.fill(keySunRevision, Integer.MIN_VALUE);
+        previous = available = false;
+    }
 
     private int mask(int index) {
         glGetBooleani_v(GL_COLOR_WRITEMASK, index, colorMask);
@@ -192,6 +218,11 @@ final class LightingHistory implements AutoCloseable {
     }
 
     private void releaseTextures() {
+        // Dimensions are set before allocation and reset after release; repeated budget bypasses own no textures.
+        if (width == 0 && height == 0) {
+            invalidate();
+            return;
+        }
         detach();
         int bound = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
@@ -201,6 +232,8 @@ final class LightingHistory implements AutoCloseable {
             glDeleteTextures(color[i]); glDeleteTextures(key[i]);
             glDeleteTextures(indirect[i]);
             color[i] = key[i] = indirect[i] = 0;
+            keyRevision[i] = Long.MIN_VALUE;
+            keySunRevision[i] = Integer.MIN_VALUE;
         }
         width = height = 0;
         invalidate();

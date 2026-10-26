@@ -16,9 +16,35 @@ neoForge {
     mods {
         rayvox { sourceSet sourceSets.main }
     }
+    unitTest {
+        enable()
+        testedMod = mods.rayvox
+    }
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    if (providers.gradleProperty('rayvoxColorBenchmark').isPresent()) {
+        systemProperty 'rayvox.colorBenchmark', 'true'
+        testLogging.showStandardStreams = true
+        outputs.upToDateWhen { false }
+    }
+    if (providers.gradleProperty('rayvoxExtractionBenchmark').isPresent()) {
+        systemProperty 'rayvox.extractionBenchmark', 'true'
+        testLogging.showStandardStreams = true
+        outputs.upToDateWhen { false }
+    }
 }
 
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.withType(JavaExec).configureEach {
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
+}
 
 sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
@@ -36,9 +62,26 @@ tasks.register('lightingCheck', JavaExec) {
 }
 tasks.named('check') { dependsOn lightingCheck }
 
+tasks.register('materialCheck') { dependsOn test }
+
 // Uses the same GLSL assets as the mod against a hidden, real OpenGL context.
 tasks.register('gpuCheck', JavaExec) {
     dependsOn testClasses
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'dev.rayvox.ShaderCheck'
 }
+
+tasks.register('lightingBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.rayvox.LightingBenchmark'
+}
+
+tasks.register('gpuBenchmark', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.rayvox.ShaderCheck'
+    args '--benchmark'
+}
+
+apply from: 'gradle/benchmark.gradle'

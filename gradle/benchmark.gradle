@@ -1,0 +1,68 @@
+// Opt-in integration harness. Its mod and mixins are excluded from normal client runs and the release JAR.
+sourceSets {
+    benchmark {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+def benchmarkDirectory = layout.projectDirectory.dir('run/benchmark-client').asFile
+
+tasks.register('prepareBenchmarkClient') {
+    doLast {
+        new File(benchmarkDirectory, 'config').mkdirs()
+        new File(benchmarkDirectory, 'config/fml.toml').text = 'earlyWindowControl=false\n'
+        new File(benchmarkDirectory, 'options.txt').text = '''enableVsync:false
+maxFps:260
+fullscreen:false
+renderDistance:6
+simulationDistance:5
+pauseOnLostFocus:false
+soundCategory_master:0.0
+'''
+        new File(benchmarkDirectory, 'benchmark-result.json').delete()
+        def digest = { String directory ->
+            def hash = java.security.MessageDigest.getInstance('SHA-256')
+            fileTree(directory).files.sort { project.relativePath(it) }.each { source ->
+                hash.update(project.relativePath(source).replace('\\', '/').getBytes('UTF-8'))
+                hash.update((byte)0)
+                hash.update(source.bytes)
+            }
+            hash.digest().encodeHex().toString()
+        }
+        new File(benchmarkDirectory, 'benchmark-meta.json').text = groovy.json.JsonOutput.toJson([
+            label: providers.gradleProperty('rayvoxBenchmarkLabel').orElse('working-tree').get(),
+            sourceHash: digest('src/main'), harnessHash: digest('src/benchmark')])
+    }
+}
+
+neoForge {
+    addModdingDependenciesTo sourceSets.benchmark
+    mods {
+        rayvox_benchmark { sourceSet sourceSets.benchmark }
+    }
+    unitTest { loadedMods = [mods.rayvox] }
+    runs {
+        client { loadedMods = [mods.rayvox] }
+        benchmarkClient {
+            client()
+            sourceSet = sourceSets.benchmark
+            loadedMods = [mods.rayvox, mods.rayvox_benchmark]
+            gameDirectory = benchmarkDirectory
+            systemProperty 'rayvox.benchmark', 'true'
+            systemProperty 'rayvox.benchmark.scene', providers.gradleProperty('rayvoxBenchmarkScene').orElse('room').get()
+            programArguments.addAll('--username', 'RayvoxBench', '--width', '1280', '--height', '720')
+            taskBefore tasks.named('prepareBenchmarkClient')
+        }
+    }
+}
+
+tasks.named('runBenchmarkClient') {
+    doLast {
+        def result = new File(benchmarkDirectory, 'benchmark-result.json')
+        if (!result.isFile()) throw new GradleException('Client exited without a benchmark report; inspect run/benchmark-client/logs/latest.log')
+        def report = new groovy.json.JsonSlurper().parse(result)
+        if (!report.success) throw new GradleException('Client benchmark failed: ' + report.error)
+        logger.lifecycle('Client benchmark report: ' + result.absolutePath)
+    }
+}

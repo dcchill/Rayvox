@@ -21,6 +21,8 @@ import org.slf4j.Logger;
 public final class RayvoxEngine {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static TerrainShader terrain;
+    // Variant bits: advanced materials = 1, directional shadows = 2, indirect lighting = 4.
+    private static final TerrainShader[] terrainVariants = new TerrainShader[8];
     private static ClientLevel level;
     private static LightColors colors = new LightColors(Map.of());
     private static MaterialTable materials;
@@ -40,8 +42,8 @@ public final class RayvoxEngine {
     private static HistoryStamp historyStamp;
     private static long sourceRevision, historyRevision;
     private static long updateNanos;
-    private static DirectionalLight sun = new DirectionalLight(0, 1, 0, 0, 0);
-    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int view, boolean materials, boolean indirect) {}
+    private static DirectionalLight sun = DirectionalLight.OFF;
+    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int sunDistance, int view, boolean materials, boolean indirect) {}
 
     private RayvoxEngine() {}
 
@@ -54,6 +56,7 @@ public final class RayvoxEngine {
         frozen = false;
         dynamic = List.of();
         terrain = null;
+        java.util.Arrays.fill(terrainVariants, null);
         var caps = GL.getCapabilities();
         gpu = GL11.glGetString(GL11.GL_RENDERER) + " / OpenGL " + GL11.glGetString(GL11.GL_VERSION);
         compute = caps.OpenGL43;
@@ -70,7 +73,7 @@ public final class RayvoxEngine {
                 return;
             }
         }
-        ShaderInstance candidate = null;
+        var candidates = new TerrainShader[terrainVariants.length];
         try {
             try (var reader = event.getResourceProvider().openAsReader(ResourceLocation.fromNamespaceAndPath("rayvox", "lights.json"))) {
                 colors = new LightColors(LightDefinition.read(reader));
@@ -78,23 +81,33 @@ public final class RayvoxEngine {
             try (var reader = event.getResourceProvider().openAsReader(ResourceLocation.fromNamespaceAndPath("rayvox", "materials.json"))) {
                 materials = MaterialTable.read(reader);
             }
-            candidate = new TerrainShader(event.getResourceProvider());
-            if (GL20.glGetProgrami(candidate.getId(), GL20.GL_LINK_STATUS) == GL11.GL_FALSE) {
-                throw new IllegalStateException(GL20.glGetProgramInfoLog(candidate.getId()));
-            }
-            for (String uniform : new String[]{"ModelViewMat", "ProjMat", "ChunkOffset", "ColorModulator",
+            for (int i = 0; i < candidates.length; i++) {
+                boolean directional = (i & 2) != 0, advanced = (i & 1) != 0, indirect = (i & 4) != 0;
+                var candidate = candidates[i] = new TerrainShader(event.getResourceProvider(), directional, advanced, indirect);
+                if (GL20.glGetProgrami(candidate.getId(), GL20.GL_LINK_STATUS) == GL11.GL_FALSE)
+                    throw new IllegalStateException(GL20.glGetProgramInfoLog(candidate.getId()));
+                for (String uniform : new String[]{"ModelViewMat", "ProjMat", "ChunkOffset", "ColorModulator",
                     "FogStart", "FogEnd", "FogColor", "FogShape", "ShadowsEnabled", "ShadowDistance", "AlphaCutoff",
                     "DebugMode", "CacheWidth", "CacheMinSlot", "CameraInCache", "CameraFraction"}) {
-                if (candidate.getUniform(uniform) == null) throw new IllegalStateException("Missing uniform " + uniform);
+                    if (candidate.getUniform(uniform) == null) throw new IllegalStateException("Missing uniform " + uniform);
+                }
+                if (directional && candidate.getUniform("SunShadowDistance") == null)
+                    throw new IllegalStateException("Directional shader lacks its range uniform");
             }
-            // GameRenderer owns registered shaders and closes them on reload and shutdown.
-            event.registerShader(candidate, loaded -> {
-                terrain = (TerrainShader)loaded;
-                status = "Terrain shader ready";
-                LOGGER.info("Rayvox terrain shader compiled and linked");
-            });
+            // GameRenderer owns all variants and closes them on reload and shutdown.
+            for (int i = 0; i < candidates.length; i++) {
+                int variant = i;
+                event.registerShader(candidates[i], loaded -> {
+                    terrainVariants[variant] = (TerrainShader)loaded;
+                    if (variant == 1) terrain = (TerrainShader)loaded;
+                    if (variant == terrainVariants.length - 1) {
+                        status = "Terrain shader ready";
+                        LOGGER.info("Rayvox terrain shader variants compiled and linked");
+                    }
+                });
+            }
         } catch (Exception failure) {
-            if (candidate != null) candidate.close();
+            for (var candidate : candidates) if (candidate != null) candidate.close();
             status = "Vanilla fallback: shader failed; see latest.log";
             LOGGER.error(status, failure);
         }
@@ -120,9 +133,12 @@ public final class RayvoxEngine {
             closeGpuCache();
             return;
         }
-        if (worldCache == null || worldCache.grid.radius != Rayvox.CACHE_RADIUS.get()) {
+        int radius = Rayvox.CACHE_RADIUS.get();
+        if (Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight())
+            radius = Math.max(radius, (Rayvox.SUN_SHADOW_DISTANCE.get() + 15) / 16);
+        if (worldCache == null || worldCache.grid.radius != radius) {
             frozen = false;
-            worldCache = new VoxelWorldCache(Rayvox.CACHE_RADIUS.get(), colors, materials);
+            worldCache = new VoxelWorldCache(radius, colors, materials);
             lights.invalidate();
             closeGpuCache();
         }
@@ -159,15 +175,17 @@ public final class RayvoxEngine {
                     level.getMinSection(), level.getMaxSection())) { gpuLights.upload(lights); sourceRevision++; }
             if (!frozen) dynamic = Rayvox.DYNAMIC.get() ? DynamicLights.collect(level, camera,
                     event.getPartialTick().getGameTimeDeltaPartialTick(false), colors) : List.of();
-            if (!frozen) sun = DirectionalLight.at(level.getSunAngle(event.getPartialTick().getGameTimeDeltaPartialTick(false)),
-                    level.getMoonBrightness(), level.getRainLevel(1), Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight());
+            if (!frozen) sun = Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight()
+                    ? DirectionalLight.at(level.getSunAngle(event.getPartialTick().getGameTimeDeltaPartialTick(false)),
+                            level.getMoonBrightness(), level.getRainLevel(1), true) : DirectionalLight.OFF;
             // shortcut: any scene edit invalidates all history; use regional keys if profiling justifies their complexity.
-            var stamp = new HistoryStamp(worldCache.grid.revision, sourceRevision, distant.revision,
-                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), debugMode, Rayvox.MATERIALS.get(), Rayvox.INDIRECT.get());
+            var stamp = new HistoryStamp(worldCache.grid.snapshotRevision, sourceRevision, distant.revision,
+                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), Rayvox.SUN_SHADOW_DISTANCE.get(), debugMode, Rayvox.MATERIALS.get(), Rayvox.INDIRECT.get());
             if (!stamp.equals(historyStamp)) { historyStamp = stamp; historyRevision++; }
             if (Rayvox.HISTORY.get() && (debugMode == 0 || debugMode == 5 || debugMode == 6 || debugMode == 7)) {
                 if (history == null) history = new LightingHistory();
                 var target = Minecraft.getInstance().getMainRenderTarget();
+                history.camera(camera.x, camera.y, camera.z, sun.strength() > 0);
                 if (org.lwjgl.opengl.GL30.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING) == target.frameBufferId)
                     history.begin(target.width, target.height, historyRevision, sun.epoch(), Rayvox.INDIRECT.get());
                 else history.invalidate();
@@ -217,9 +235,12 @@ public final class RayvoxEngine {
     }
 
     public static void sectionLights(int x, int y, int z, double cameraX, double cameraY, double cameraZ) {
-        if (terrain == null || !terrain.drawing) return;
+        TerrainShader drawing = null;
+        for (var candidate : terrainVariants) if (candidate != null && candidate.drawing) { drawing = candidate; break; }
+        if (drawing == null || !drawing.drawing) return;
         int sx = Math.floorDiv(x, 16), sy = Math.floorDiv(y, 16), sz = Math.floorDiv(z, 16);
-        terrain.section(distant.section(sx, sy, sz), lights, distant.ready(sx, sz), cameraX, cameraY, cameraZ);
+        boolean ready = distant.ready(sx, sz);
+        drawing.section(ready ? distant.section(sx, sy, sz, lights) : List.of(), lights, ready, cameraX, cameraY, cameraZ);
     }
 
     public static void toggleTestLights() {
@@ -242,26 +263,31 @@ public final class RayvoxEngine {
         updateLevel(Minecraft.getInstance().level);
         if (terrain == null || level == null || !Rayvox.ENABLED.get() || gpuCache == null || gpuLights == null || worldCache == null) return vanilla;
         if (layer != RenderType.solid() && layer != RenderType.cutout() && layer != RenderType.cutoutMipped()) return vanilla;
-        terrain.getUniform("ShadowsEnabled").set(Rayvox.SHADOWS.get() ? 1 : 0);
-        terrain.getUniform("ShadowDistance").set((float)Rayvox.SHADOW_DISTANCE.get());
-        terrain.getUniform("AlphaCutoff").set(layer == RenderType.cutout() ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
-        terrain.getUniform("DebugMode").set(debugMode);
+        int variant = (Rayvox.MATERIALS.get() ? 1 : 0) | (sun.strength() > 0 ? 2 : 0) | (Rayvox.INDIRECT.get() ? 4 : 0);
+        var shader = terrainVariants[variant];
+        if (shader == null) return vanilla;
+        shader.getUniform("ShadowsEnabled").set(Rayvox.SHADOWS.get() ? 1 : 0);
+        shader.getUniform("ShadowDistance").set((float)Rayvox.SHADOW_DISTANCE.get());
+        var sunDistance = shader.getUniform("SunShadowDistance");
+        if (sunDistance != null) sunDistance.set((float)Rayvox.SUN_SHADOW_DISTANCE.get());
+        shader.getUniform("AlphaCutoff").set(layer == RenderType.cutout() ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
+        shader.getUniform("DebugMode").set(debugMode);
         var grid = worldCache.grid;
         int minX = grid.centerX - grid.radius, minY = grid.centerY - grid.radius, minZ = grid.centerZ - grid.radius;
         int bx = (int)Math.floor(cameraX), by = (int)Math.floor(cameraY), bz = (int)Math.floor(cameraZ);
-        terrain.cache = gpuCache;
-        terrain.lights = gpuLights;
-        terrain.history = history;
-        terrain.timer = timer;
-        terrain.dynamic = dynamic;
-        terrain.sun = sun;
-        terrain.materials = materials;
-        terrain.cameraX = cameraX; terrain.cameraY = cameraY; terrain.cameraZ = cameraZ;
-        terrain.getUniform("CacheWidth").set(grid.width);
-        terrain.getUniform("CacheMinSlot").set(Math.floorMod(minX, grid.width), Math.floorMod(minY, grid.width), Math.floorMod(minZ, grid.width));
-        terrain.getUniform("CameraInCache").set(bx - minX * 16, by - minY * 16, bz - minZ * 16);
-        terrain.getUniform("CameraFraction").set((float)(cameraX - bx), (float)(cameraY - by), (float)(cameraZ - bz));
-        return terrain;
+        shader.cache = gpuCache;
+        shader.lights = gpuLights;
+        shader.history = history;
+        shader.timer = timer;
+        shader.dynamic = dynamic;
+        shader.sun = sun;
+        shader.materials = materials;
+        shader.cameraX = cameraX; shader.cameraY = cameraY; shader.cameraZ = cameraZ;
+        shader.getUniform("CacheWidth").set(grid.width);
+        shader.getUniform("CacheMinSlot").set(Math.floorMod(minX, grid.width), Math.floorMod(minY, grid.width), Math.floorMod(minZ, grid.width));
+        shader.getUniform("CameraInCache").set(bx - minX * 16, by - minY * 16, bz - minZ * 16);
+        shader.getUniform("CameraFraction").set((float)(cameraX - bx), (float)(cameraY - by), (float)(cameraZ - bz));
+        return shader;
     }
 
     public static void cycleDebugMode() { debugMode = (debugMode + 1) % 8; }
@@ -303,7 +329,8 @@ public final class RayvoxEngine {
     }
     public static String uploadStats() {
         return gpuCache == null ? "GPU cache not allocated" : "GPU cache: " + gpuCache.bytes() / 1024
-                + " KiB; uploaded " + gpuCache.uploadedLastFrame + " sections/frame";
+                + " KiB; uploaded " + gpuCache.uploadedLastFrame + " sections / "
+                + gpuCache.uploadedBytesLastFrame / 1024 + " KiB this frame";
     }
 
     public static String status() { return status; }

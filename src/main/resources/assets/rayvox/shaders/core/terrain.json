@@ -13,6 +13,7 @@
     {"name":"FogShape","type":"int","count":1,"values":[0]},
     {"name":"ShadowsEnabled","type":"int","count":1,"values":[1]},
     {"name":"ShadowDistance","type":"float","count":1,"values":[16]},
+    {"name":"SunShadowDistance","type":"float","count":1,"values":[48]},
     {"name":"AlphaCutoff","type":"float","count":1,"values":[0]},
     {"name":"DebugMode","type":"int","count":1,"values":[0]},
     {"name":"CacheWidth","type":"int","count":1,"values":[3]},

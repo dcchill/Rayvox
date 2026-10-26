@@ -28,6 +28,7 @@ public final class Rayvox {
     public static final ModConfigSpec.BooleanValue HISTORY;
     public static final ModConfigSpec.BooleanValue DYNAMIC;
     public static final ModConfigSpec.BooleanValue SUNLIGHT;
+    public static final ModConfigSpec.IntValue SUN_SHADOW_DISTANCE;
     public static final ModConfigSpec.BooleanValue MATERIALS;
     public static final ModConfigSpec.BooleanValue INDIRECT;
     public static final KeyMapping DEBUG_KEY = new KeyMapping("key.rayvox.debug", InputConstants.Type.KEYSYM,
@@ -53,7 +54,9 @@ public final class Rayvox {
                 .define("heldItemLights", true);
         SUNLIGHT = builder.comment("Experimental bounded sun/moon shadows; retains vanilla sky outside the voxel cache.")
                 .define("directionalShadows", false);
-        MATERIALS = builder.comment("Experimental RGB glass, water attenuation and quarter-block partial shadow shapes.")
+        SUN_SHADOW_DISTANCE = builder.comment("Sun/moon shadow range in blocks, with gradual receiver and caster fades. Expands the voxel cache only while directional shadows are enabled.")
+                .defineInRange("directionalShadowDistance", 48, 16, 64);
+        MATERIALS = builder.comment("Experimental RGB glass, water attenuation and box/quarter-block partial shadow shapes.")
                 .define("advancedMaterials", false);
         INDIRECT = builder.comment("Experimental one-bounce voxel GI: one six-block gather per pixel, eight-frame accumulation. Expensive; no dynamic-light bounce.")
                 .define("indirectPrototype", false);

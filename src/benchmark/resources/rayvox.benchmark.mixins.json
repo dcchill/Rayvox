@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.rayvox.benchmark.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["HiddenWindowMixin", "FrameMixin"],
+  "injectors": {"defaultRequire": 1}
+}

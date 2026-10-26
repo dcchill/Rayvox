@@ -31,16 +31,22 @@ public final class LightSourceManager {
     private final Map<Light, LightDefinition> overrides = new LinkedHashMap<>();
     private long lastRevision = -1;
     private int lastX, lastY, lastZ, lastLimit, lastPerSection;
+    private int lastMinSection, lastMaxSection;
+    private int eligibleSources;
+    private long definitionRevision;
 
     public boolean rebuild(VoxelGrid grid, int x, int y, int z, int limit, int perSection, int minSection, int maxSection) {
         if (limit < 1 || limit > MAX_LIGHTS || perSection < 1 || perSection > PER_SECTION)
             throw new IllegalArgumentException("Invalid light budget");
-        if (lastRevision == grid.revision && x == lastX && y == lastY && z == lastZ
-                && limit == lastLimit && perSection == lastPerSection) return false;
+        if (lastRevision == grid.snapshotRevision && (eligibleSources <= limit || x == lastX && y == lastY && z == lastZ)
+                && limit == lastLimit && perSection == lastPerSection
+                && minSection == lastMinSection && maxSection == lastMaxSection) return false;
         long start = System.nanoTime();
-        boolean sameInputs = lastRevision == grid.revision && limit == lastLimit && perSection == lastPerSection;
-        lastRevision = grid.revision;
+        boolean sameInputs = lastRevision == grid.snapshotRevision && limit == lastLimit && perSection == lastPerSection
+                && minSection == lastMinSection && maxSection == lastMaxSection;
+        lastRevision = grid.snapshotRevision;
         lastX = x; lastY = y; lastZ = z; lastLimit = limit; lastPerSection = perSection;
+        lastMinSection = minSection; lastMaxSection = maxSection;
         var all = new ArrayList<Light>();
         var retained = new ArrayList<Light>();
         for (var slot : grid.slots) if (slot.source != null) {
@@ -50,22 +56,31 @@ public final class LightSourceManager {
         }
         all.addAll(testLights);
         retained.addAll(testLights);
-        overrides.keySet().retainAll(retained);
+        if (overrides.keySet().retainAll(retained)) definitionRevision++;
         if (selected != null && !retained.contains(selected)) selected = null;
         discovered = all.size();
-        all.sort(Comparator.comparingDouble(light -> light.distanceSquared(x, y, z)));
-        var selection = all.subList(0, Math.min(limit, all.size()));
-        if (sameInputs && active.equals(selection)) return false;
+        all.removeIf(light -> !definition(light).contributes());
+        eligibleSources = all.size();
+        boolean[] included = new boolean[all.size()];
+        var selection = selectNearest(all, x, y, z, limit, included);
+        // Camera motion can reorder the same sources. Keep their GPU indices and history stable.
+        if (sameInputs && sameSources(active, selection)) return false;
         active = List.copyOf(selection);
         boolean[] omittedInfluence = new boolean[grid.slots.length];
-        for (int i = active.size(); i < all.size(); i++) {
+        int omittedSections = 0;
+        for (int i = 0; i < all.size() && omittedSections < grid.slots.length; i++) {
+            if (included[i]) continue;
             var light = all.get(i);
             float radius = definition(light).radius();
             for (int sz = (int)Math.floor((light.z - radius) / 16); sz <= (int)Math.floor((light.z + radius) / 16); sz++) {
                 for (int sy = (int)Math.floor((light.y - radius) / 16); sy <= (int)Math.floor((light.y + radius) / 16); sy++) {
                     for (int sx = (int)Math.floor((light.x - radius) / 16); sx <= (int)Math.floor((light.x + radius) / 16); sx++) {
-                        if (grid.get(sx, sy, sz) != null && aabbDistanceSquared(light, sx * 16, sy * 16, sz * 16, 16) < radius * radius)
-                            omittedInfluence[grid.index(sx, sy, sz)] = true;
+                        if (grid.get(sx, sy, sz) == null) continue;
+                        int index = grid.index(sx, sy, sz);
+                        if (!omittedInfluence[index] && aabbDistanceSquared(light, sx * 16, sy * 16, sz * 16, 16) < radius * radius) {
+                            omittedInfluence[index] = true;
+                            omittedSections++;
+                        }
                     }
                 }
             }
@@ -92,13 +107,27 @@ public final class LightSourceManager {
         completeSections = truncatedSections = 0;
         int[] nearest = new int[PER_SECTION];
         double[] distances = new double[PER_SECTION];
+        double[] radiusSquared = new double[active.size()];
+        for (int i = 0; i < active.size(); i++) {
+            float radius = definition(active.get(i)).radius();
+            radiusSquared[i] = radius * radius;
+        }
+        int[] candidates = new int[active.size()];
         for (int row = 0; row < grid.slots.length; row++) {
             var slot = grid.slots[row];
-            boolean complete = !omittedInfluence[row];
-            for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-                if (slot.y + dy < minSection || slot.y + dy >= maxSection) continue;
-                var neighbor = grid.get(slot.x + dx, slot.y + dy, slot.z + dz);
-                if (neighbor == null || !neighbor.uploaded || neighbor.uploadedLightOverflow) complete = false;
+            // A tile is contained in its section: reject distant sources once, rather than 64 times.
+            int candidateCount = 0;
+            for (int i = 0; i < active.size(); i++)
+                if (aabbDistanceSquared(active.get(i), slot.x * 16, slot.y * 16, slot.z * 16, 16) < radiusSquared[i])
+                    candidates[candidateCount++] = i;
+            boolean complete = !omittedInfluence[row] && completeNeighbors(grid, slot, minSection, maxSection);
+            if (candidateCount == 0) {
+                if (complete) {
+                    completeSections++;
+                    int offset = row * LIST_WIDTH;
+                    for (int tile = 0; tile < TILES_PER_SECTION; tile++) lists[offset + tile * 9] = 0x100;
+                }
+                continue;
             }
             boolean truncated = false;
             for (int tile = 0; tile < TILES_PER_SECTION; tile++) {
@@ -106,11 +135,11 @@ public final class LightSourceManager {
                 int ty = slot.y * 16 + (tile / 4 % 4) * TILE_SIZE;
                 int tz = slot.z * 16 + (tile / 16) * TILE_SIZE;
                 int relevant = 0, count = 0;
-                for (int i = 0; i < active.size(); i++) {
+                for (int candidate = 0; candidate < candidateCount; candidate++) {
+                    int i = candidates[candidate];
                     var light = active.get(i);
                     double distance = aabbDistanceSquared(light, tx, ty, tz, TILE_SIZE);
-                    float radius = definition(light).radius();
-                    if (distance >= radius * radius) continue;
+                    if (distance >= radiusSquared[i]) continue;
                     relevant++;
                     double score = light.distanceSquared(tx + 2, ty + 2, tz + 2);
                     int position = count;
@@ -144,12 +173,63 @@ public final class LightSourceManager {
         return dx * dx + dy * dy + dz * dz;
     }
 
+    private static boolean completeNeighbors(VoxelGrid grid, VoxelGrid.Slot slot, int minSection, int maxSection) {
+        for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+            if (slot.y + dy < minSection || slot.y + dy >= maxSection) continue;
+            var neighbor = grid.get(slot.x + dx, slot.y + dy, slot.z + dz);
+            if (neighbor == null || !neighbor.uploaded || neighbor.uploadedLightOverflow) return false;
+        }
+        return true;
+    }
+
+    private record RankedLight(Light light, double distance, int order) {}
+    private static final Comparator<RankedLight> NEAREST = Comparator.comparingDouble(RankedLight::distance)
+            .thenComparingInt(RankedLight::order);
+
+    private static List<Light> selectNearest(ArrayList<Light> all, int x, int y, int z, int limit, boolean[] included) {
+        if (all.size() <= limit * 2) {
+            all.sort(Comparator.comparingDouble(light -> light.distanceSquared(x, y, z)));
+            int count = Math.min(limit, all.size());
+            Arrays.fill(included, 0, count, true);
+            return all.subList(0, count);
+        }
+        // Dense emissive sections can supply thousands of sources. Rank only the bounded active set.
+        var nearest = new java.util.PriorityQueue<>(limit, NEAREST.reversed());
+        for (int i = 0; i < all.size(); i++) {
+            var light = all.get(i);
+            double distance = light.distanceSquared(x, y, z);
+            if (nearest.size() == limit) {
+                if (Double.compare(distance, nearest.peek().distance()) >= 0) continue;
+                nearest.remove();
+            }
+            nearest.add(new RankedLight(light, distance, i));
+        }
+        var ordered = nearest.toArray(RankedLight[]::new);
+        Arrays.sort(ordered, NEAREST);
+        var result = new ArrayList<Light>(ordered.length);
+        for (var ranked : ordered) {
+            included[ranked.order()] = true;
+            result.add(ranked.light());
+        }
+        return result;
+    }
+
+    private static boolean sameSources(List<Light> first, List<Light> second) {
+        if (first.size() != second.size()) return false;
+        if (first.equals(second)) return true;
+        var remaining = new ArrayList<>(second);
+        for (var light : first) if (!remaining.remove(light)) return false;
+        return true;
+    }
+
     public LightDefinition definition(Light light) { return overrides.getOrDefault(light, light.definition); }
+    long definitionRevision() { return definitionRevision; }
     public void invalidate() { lastRevision = -1; }
     public void adjust(LightDefinition definition) {
         if (selected == null) return;
         if (overrides.size() >= MAX_LIGHTS && !overrides.containsKey(selected)) overrides.remove(overrides.keySet().iterator().next());
         overrides.put(selected, definition);
+        definitionRevision++;
         invalidate();
     }
 

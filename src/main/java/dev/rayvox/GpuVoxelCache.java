@@ -14,14 +14,18 @@ public final class GpuVoxelCache implements AutoCloseable {
     private final ByteBuffer section = BufferUtils.createByteBuffer(VoxelGrid.SECTION_BYTES * 4);
     private final java.nio.IntBuffer shapeData = BufferUtils.createIntBuffer(VoxelGrid.SECTION_BYTES * 2);
     private final ByteBuffer metadata;
+    private final boolean[] airSnapshots;
+    private static final byte[] AIR = new byte[VoxelGrid.SECTION_BYTES];
     private int next;
     public int uploadedLastFrame;
+    public int uploadedBytesLastFrame;
 
     public GpuVoxelCache(int width) {
         RenderSystem.assertOnRenderThread();
         if (width < 3 || width > 9 || width % 2 == 0) throw new IllegalArgumentException("Invalid section width");
         this.width = width;
         metadata = BufferUtils.createByteBuffer(width * width * width);
+        airSnapshots = new boolean[width * width * width];
         var saved = new UploadState();
         int data = 0, status = 0, shape = 0;
         try {
@@ -60,6 +64,7 @@ public final class GpuVoxelCache implements AutoCloseable {
         RenderSystem.assertOnRenderThread();
         if (grid.width != width) throw new IllegalArgumentException("CPU/GPU cache dimensions differ");
         uploadedLastFrame = 0;
+        uploadedBytesLastFrame = 0;
         boolean changed = false;
         for (int i = 0; i < grid.slots.length; i++) {
             if (grid.slots[i].ready || metadata.get(i) != (byte)grid.slots[i].state()) {
@@ -72,34 +77,56 @@ public final class GpuVoxelCache implements AutoCloseable {
         try {
             glBindTexture(GL_TEXTURE_3D, voxels);
             for (int scanned = 0; scanned < grid.slots.length && uploadedLastFrame < budget; scanned++) {
-                var slot = grid.slots[next];
+                int index = next;
+                var slot = grid.slots[index];
                 next = (next + 1) % grid.slots.length;
                 if (!slot.ready || slot.dirty) continue;
                 section.clear(); shapeData.clear();
-                for (int i = 0; i < VoxelGrid.SECTION_BYTES; i++) {
-                    section.put(slot.data[i]).put(slot.albedo[i * 3]).put(slot.albedo[i * 3 + 1]).put(slot.albedo[i * 3 + 2]);
-                    shapeData.put((int)slot.shapes[i]).put((int)(slot.shapes[i] >>> 32));
+                boolean needsShapes = false;
+                boolean rayEmpty = true;
+                // Physical ring slots retain their texels across recentering. Air has no observable albedo/shape.
+                boolean retainedAir = airSnapshots[index] && java.util.Arrays.equals(slot.data, AIR);
+                if (!retainedAir) {
+                    boolean allAir = true;
+                    for (int i = 0; i < VoxelGrid.SECTION_BYTES; i++) {
+                        section.put(slot.data[i]).put(slot.albedo[i * 3]).put(slot.albedo[i * 3 + 1]).put(slot.albedo[i * 3 + 2]);
+                        int material = Byte.toUnsignedInt(slot.data[i]) & BoxShape.MATERIAL_MASK;
+                        allAir &= slot.data[i] == 0;
+                        needsShapes |= material == 2 || material == 3 || material >= 16;
+                        rayEmpty &= material == 0 || material >= 4 && material < 16;
+                    }
+                    section.flip();
+                    glBindTexture(GL_TEXTURE_3D, voxels);
+                    glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 16,
+                            Math.floorMod(slot.y, width) * 16, Math.floorMod(slot.z, width) * 16,
+                            16, 16, 16, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, section);
+                    uploadedBytesLastFrame += VoxelGrid.SECTION_BYTES * 4;
+                    airSnapshots[index] = allAir;
                 }
-                section.flip(); shapeData.flip();
-                glBindTexture(GL_TEXTURE_3D, voxels);
-                glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 16,
-                        Math.floorMod(slot.y, width) * 16, Math.floorMod(slot.z, width) * 16,
-                        16, 16, 16, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, section);
-                glBindTexture(GL_TEXTURE_3D, shapes);
-                glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 16,
-                        Math.floorMod(slot.y, width) * 16, Math.floorMod(slot.z, width) * 16,
-                        16, 16, 16, GL_RG_INTEGER, GL_UNSIGNED_INT, shapeData);
+                // A material snapshot without partial geometry or filters never samples the shape texture.
+                if (needsShapes) {
+                    for (long mask : slot.shapes) shapeData.put((int)mask).put((int)(mask >>> 32));
+                    shapeData.flip();
+                    glBindTexture(GL_TEXTURE_3D, shapes);
+                    glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 16,
+                            Math.floorMod(slot.y, width) * 16, Math.floorMod(slot.z, width) * 16,
+                            16, 16, 16, GL_RG_INTEGER, GL_UNSIGNED_INT, shapeData);
+                    uploadedBytesLastFrame += VoxelGrid.SECTION_BYTES * 8;
+                }
                 slot.ready = false;
                 slot.uploaded = true;
+                slot.uploadedRayEmpty = rayEmpty;
                 slot.uploadedLights = slot.lights;
                 slot.uploadedLightOverflow = slot.lightOverflow;
                 uploadedLastFrame++;
                 grid.revision++;
+                grid.snapshotRevision++;
             }
             boolean stateChanged = false;
             for (int i = 0; i < grid.slots.length; i++) {
                 byte state = (byte)grid.slots[i].state();
                 if (metadata.get(i) != state) {
+                    if (((metadata.get(i) ^ state) & 1) != 0) grid.snapshotRevision++;
                     metadata.put(i, state);
                     stateChanged = true;
                 }
@@ -107,6 +134,7 @@ public final class GpuVoxelCache implements AutoCloseable {
             if (stateChanged) {
                 glBindTexture(GL_TEXTURE_3D, states);
                 glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, width, width, width, GL_RED_INTEGER, GL_UNSIGNED_BYTE, metadata);
+                uploadedBytesLastFrame += metadata.capacity();
             }
         } finally { saved.restore(); }
     }

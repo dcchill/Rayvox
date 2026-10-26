@@ -16,19 +16,25 @@ import net.neoforged.neoforge.client.model.data.ModelData;
 /** Client-thread color resolution shared by near, distant and held lights; replaced on resource reload. */
 final class LightColors {
     private final Map<String, LightDefinition> explicit;
-    private final Map<BlockState, Integer> generated = new IdentityHashMap<>();
+    private final Map<BlockState, StateLight> resolved = new IdentityHashMap<>();
+    private final TextureColorCache spriteColors = new TextureColorCache();
+    private static final Direction[] FACES = Direction.values();
+    private int generated;
     private int fallbacks;
 
     LightColors(Map<String, LightDefinition> explicit) { this.explicit = explicit; }
 
     LightDefinition resolve(BlockState state, int emission) {
         if (emission <= 0) throw new IllegalArgumentException("Only emissive states are light sources");
-        String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-        var defined = explicit.get(id);
-        if (defined != null) return defined;
-        int rgb = generated.computeIfAbsent(state, this::sample);
-        return new LightDefinition((rgb >> 16 & 255) / 255f, (rgb >> 8 & 255) / 255f, (rgb & 255) / 255f,
-                Math.clamp(emission / 15f, 0, 8), Math.clamp(emission, 1, 16), true);
+        var cached = resolved.get(state);
+        if (cached == null) {
+            String id = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+            var defined = explicit.get(id);
+            if (defined != null) cached = new StateLight(defined);
+            else { cached = new StateLight(sample(state)); generated++; }
+            resolved.put(state, cached);
+        }
+        return cached.resolve(emission);
     }
 
     private int sample(BlockState state) {
@@ -39,7 +45,7 @@ final class LightColors {
             // shortcut: state-based model textures omit position-specific model data/tints; use lights.json for those emitters.
             for (int face = 0; face < 7 && sprites.size() < 16; face++) {
                 random.setSeed(42);
-                var quads = model.getQuads(state, face == 6 ? null : Direction.values()[face], random, ModelData.EMPTY, null);
+                var quads = model.getQuads(state, face == 6 ? null : FACES[face], random, ModelData.EMPTY, null);
                 for (var quad : quads) {
                     sprites.add(quad.getSprite());
                     if (sprites.size() == 16) break;
@@ -50,11 +56,7 @@ final class LightColors {
             for (var sprite : sprites) {
                 var contents = sprite.contents();
                 if (contents.name().equals(MissingTextureAtlasSprite.getLocation())) continue;
-                int[] frames = contents.getUniqueFrames().limit(4).toArray();
-                int width = Math.min(contents.width(), 16), height = Math.min(contents.height(), 16);
-                for (int frame : frames) for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
-                    color.add(sprite.getPixelRGBA(frame, x * contents.width() / width, y * contents.height() / height));
-                }
+                spriteColors.add(color, sprite);
             }
             if (!color.hasColor()) fallbacks++;
             return color.rgb();
@@ -65,5 +67,25 @@ final class LightColors {
         }
     }
 
-    String status() { return "Texture light colors: " + generated.size() + " states cached; " + fallbacks + " neutral fallbacks"; }
+    String status() { return "Texture light colors: " + generated + " states cached; " + fallbacks + " neutral fallbacks"; }
+
+    private static final class StateLight {
+        private final int rgb;
+        private final boolean fixed;
+        private int emission;
+        private LightDefinition definition;
+
+        StateLight(int rgb) { this.rgb = rgb; fixed = false; }
+        StateLight(LightDefinition definition) { this.definition = definition; rgb = 0; fixed = true; }
+
+        LightDefinition resolve(int emission) {
+            int bounded = Math.min(emission, 120);
+            if (!fixed && this.emission != bounded) {
+                this.emission = bounded;
+                definition = new LightDefinition((rgb >> 16 & 255) / 255f, (rgb >> 8 & 255) / 255f, (rgb & 255) / 255f,
+                        bounded / 15f, Math.clamp(bounded, 1, 16), true);
+            }
+            return definition;
+        }
+    }
 }

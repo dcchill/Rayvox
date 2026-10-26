@@ -9,6 +9,8 @@ public final class VoxelGrid {
     public final Slot[] slots;
     public int centerX, centerY, centerZ;
     public long revision;
+    /** Revision of the visible GPU snapshot and its logical origin, excluding pending CPU extraction. */
+    public long snapshotRevision;
     private boolean centered;
 
     public VoxelGrid(int radius) {
@@ -34,6 +36,7 @@ public final class VoxelGrid {
         centerZ = z;
         centered = true;
         revision++;
+        snapshotRevision++;
         int replaced = 0;
         for (int sz = z - radius; sz <= z + radius; sz++) {
             for (int sy = y - radius; sy <= y + radius; sy++) {
@@ -104,6 +107,7 @@ public final class VoxelGrid {
     public static final class Slot {
         public int x, y, z;
         public boolean assigned, dirty, ready, uploaded;
+        public boolean uploadedRayEmpty;
         public Object source;
         public java.util.List<LightSourceManager.Light> lights = java.util.List.of();
         public java.util.List<LightSourceManager.Light> uploadedLights = java.util.List.of();
@@ -128,7 +132,7 @@ public final class VoxelGrid {
         }
 
         public int state() {
-            return (uploaded ? 1 : 0) | (dirty || ready ? 2 : 0);
+            return (uploaded ? 1 : 0) | (dirty || ready ? 2 : 0) | (uploaded && uploadedRayEmpty ? 4 : 0);
         }
     }
 }
