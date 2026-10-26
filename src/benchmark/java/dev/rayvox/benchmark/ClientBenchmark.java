@@ -42,6 +42,11 @@ import static org.lwjgl.opengl.GL33C.*;
 public final class ClientBenchmark {
     private static ClientBenchmark instance;
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
+    private static final boolean TEMPORAL = SCENE.equals("temporal");
+    private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi");
+    private static final boolean GOVERNOR_PIPELINE = SCENE.equals("pipeline-governor");
+    private static final boolean HELD_PIPELINE = SCENE.equals("pipeline-held");
+    private static final boolean PIPELINE = SCENE.equals("pipeline") || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
     private static final boolean ENTITIES = SCENE.equals("entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
     private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS;
@@ -49,7 +54,30 @@ public final class ClientBenchmark {
     private static final String WORLD = ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
-    private final List<Phase> phases = ENTITIES ? List.of(
+    private final List<Phase> phases = HELD_PIPELINE ? List.of(
+            new Phase("legacy-held-static", true, false, false, false, 8, 6),
+            new Phase("deferred-held-static", true, false, false, false, 8, 6),
+            new Phase("legacy-held-moving", true, false, false, true, 8, 6),
+            new Phase("deferred-held-moving", true, false, false, true, 8, 6),
+            new Phase("deferred-held-removed", true, false, false, false, 8, 6)) : GOVERNOR_PIPELINE ? List.of(
+            new Phase("deferred-fixed-moving", true, true, true, true, 10, 6),
+            new Phase("deferred-cpu-bound-moving", true, true, true, true, 8, 6),
+            new Phase("deferred-governor-moving", true, true, true, true, 16, 12),
+            new Phase("deferred-cpu-recovery-moving", true, true, true, true, 16, 6)) : INDIRECT_PIPELINE ? List.of(
+            new Phase("legacy-gi-static", true, true, true, false, 8, 6),
+            new Phase("deferred-gi-static", true, true, true, false, 8, 6),
+            new Phase("legacy-gi-moving", true, true, true, true, 8, 6),
+            new Phase("deferred-gi-moving", true, true, true, true, 8, 6),
+            new Phase("deferred-gi-slow-moving", true, true, true, true, 8, 6)) : PIPELINE ? List.of(
+            new Phase("legacy-static", true, false, false, false, 8, 6),
+            new Phase("deferred-static", true, false, false, false, 8, 6),
+            new Phase("legacy-moving", true, false, false, true, 8, 6),
+            new Phase("deferred-moving", true, false, false, true, 8, 6),
+            new Phase("deferred-sparse-moving", true, false, false, true, 8, 6),
+            new Phase("deferred-history-off", true, false, false, false, 4, 4)) : TEMPORAL ? List.of(
+            new Phase("reference-moving", true, false, false, true, 8, 6),
+            new Phase("history-static", true, false, false, false, 8, 6),
+            new Phase("history-moving", true, false, false, true, 8, 6)) : ENTITIES ? List.of(
             new Phase("entity-sharp", true, false, false, false, 12, 6),
             new Phase("entity-soft", true, false, false, false, 8, 6)) : DIRECTIONAL ? List.of(
             new Phase("sun-static", true, DIRECTIONAL_MATERIALS, false, false, 20, 6, 64, 8, 0),
@@ -66,8 +94,11 @@ public final class ClientBenchmark {
             new Phase("partial-advanced", true, true, false, false, 6, 4, 64, 8, 64));
     private final int[] queries = new int[128], queryPhase = new int[64];
     private final boolean[] pending = new boolean[64];
+    // A hidden window has no presentation backpressure; bound the queue to two frames for meaningful frame times.
+    private final long[] frameFences = new long[2];
+    private int frameFence;
     private int phase = -1, framePhase = -1, activeQuery = -1, nextQuery, ticks, phaseTick;
-    private long phaseStart, measuredStart, lastFrame, renderStart;
+    private long phaseStart, measuredStart, lastFrame, renderStart, phasePassDraws, phaseIndirectDraws, phaseCompositionDraws, phaseDynamicDraws;
     private boolean opening, preparing, finished, timers;
     private int shadowEntityId;
     private CompletableFuture<Void> setup;
@@ -84,7 +115,8 @@ public final class ClientBenchmark {
         var mc = Minecraft.getInstance();
         try {
             ticks++;
-            if (System.nanoTime() - boot > 240_000_000_000L) throw new IllegalStateException("Client benchmark timed out: " + mc.screen);
+            if (System.nanoTime() - boot > (PIPELINE ? 600_000_000_000L : 240_000_000_000L))
+                throw new IllegalStateException("Client benchmark timed out: " + mc.screen);
             if (!opening && mc.getOverlay() == null) {
                 if (!mc.gameDirectory.toPath().toAbsolutePath().normalize().getFileName().toString().equals("benchmark-client"))
                     throw new IllegalStateException("Benchmark requires its isolated benchmark-client directory");
@@ -130,7 +162,8 @@ public final class ClientBenchmark {
                     }
                     var player = server.getPlayerList().getPlayer(mc.player.getUUID());
                     if (player == null) throw new IllegalStateException("Integrated server player missing");
-                    player.setGameMode(GameType.SPECTATOR);
+                    player.setGameMode(HELD_PIPELINE ? GameType.CREATIVE : GameType.SPECTATOR);
+                    if (HELD_PIPELINE) { player.getAbilities().flying = true; player.onUpdateAbilities(); }
                     player.teleportTo(server.overworld(), .5, DIRECTIONAL ? 68 : 66, DIRECTIONAL ? 28 : 13.5, 180, DIRECTIONAL ? 25 : 12);
                 }, server);
             }
@@ -171,6 +204,7 @@ public final class ClientBenchmark {
         mc.options.fov().set(70);
         mc.getWindow().updateVsync(false);
         mc.getWindow().setFramerateLimit(260);
+        if (PIPELINE && !RayvoxEngine.profiling()) RayvoxEngine.toggleProfiling();
     }
 
     private static void prepareWorld(ServerLevel world) {
@@ -215,9 +249,35 @@ public final class ClientBenchmark {
 
     private void beginPhase(int index) {
         phase = index; phaseTick = ticks; phaseStart = System.nanoTime(); measuredStart = 0;
+        phasePassDraws = RayvoxEngine.lightingPassDraws();
+        phaseIndirectDraws = RayvoxEngine.indirectPassDraws();
+        phaseCompositionDraws = RayvoxEngine.compositionPassDraws();
+        phaseDynamicDraws = RayvoxEngine.dynamicPassDraws();
         var config = phases.get(index);
+        config.lastQualityLevel = RayvoxEngine.governorLevel();
         Rayvox.ENABLED.set(config.enabled); Rayvox.MATERIALS.set(config.materials); Rayvox.INDIRECT.set(config.indirect);
-        Rayvox.HISTORY.set(true); Rayvox.SHADOWS.set(true); Rayvox.SUNLIGHT.set(DIRECTIONAL); Rayvox.DYNAMIC.set(false);
+        Rayvox.HISTORY.set(!config.name.equals("reference-moving") && !config.name.equals("deferred-history-off"));
+        Rayvox.PIPELINE.set(PIPELINE && config.name.startsWith("deferred-")
+                ? dev.rayvox.LightingPipeline.DEFERRED : dev.rayvox.LightingPipeline.LEGACY);
+        Rayvox.REFRESH_INTERVAL.set(config.name.equals("deferred-sparse-moving") ? 4 : 1);
+        Rayvox.INDIRECT_INTERVAL.set(config.name.equals("deferred-gi-slow-moving") ? 4 : 1);
+        Rayvox.GOVERNOR_TARGET.set(GOVERNOR_PIPELINE && !config.name.equals("deferred-fixed-moving") ? 60 : 0);
+        Rayvox.GOVERNOR_MIN.set(0); Rayvox.GOVERNOR_MAX.set(4);
+        if (PIPELINE) { Rayvox.SHADOW_SOFTNESS.set(2); Rayvox.SHADOW_DRAW_DISTANCE.set(32); }
+        Rayvox.SHADOWS.set(true); Rayvox.SUNLIGHT.set(DIRECTIONAL); Rayvox.DYNAMIC.set(HELD_PIPELINE);
+        if (HELD_PIPELINE) {
+            var mc = Minecraft.getInstance();
+            boolean removed = config.name.endsWith("removed");
+            mc.player.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND, removed
+                    ? net.minecraft.world.item.ItemStack.EMPTY : new net.minecraft.world.item.ItemStack(Blocks.TORCH));
+            var server = mc.getSingleplayerServer();
+            setup = CompletableFuture.runAsync(() -> {
+                var player = server.getPlayerList().getPlayer(mc.player.getUUID());
+                player.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND, removed
+                        ? net.minecraft.world.item.ItemStack.EMPTY : new net.minecraft.world.item.ItemStack(Blocks.TORCH));
+                player.inventoryMenu.broadcastChanges();
+            }, server);
+        }
         if (ENTITIES) {
             Rayvox.ENTITY_SHADOWS.set(true);
             Rayvox.SHADOW_SOFTNESS.set(config.name.equals("entity-sharp") ? 0 : 2);
@@ -272,6 +332,20 @@ public final class ClientBenchmark {
     private void start() {
         framePhase = -1; renderStart = 0;
         if (finished || phase < 0) return;
+        if (frameFences[frameFence] != 0) {
+            int result;
+            long deadline = System.nanoTime() + 10_000_000_000L;
+            do {
+                result = glClientWaitSync(frameFences[frameFence], 0, 0);
+                // Finite native waits may busy-spin in the driver and masquerade as game CPU work.
+                if (result == GL_TIMEOUT_EXPIRED) java.util.concurrent.locks.LockSupport.parkNanos(250_000L);
+            } while (result == GL_TIMEOUT_EXPIRED && System.nanoTime() < deadline);
+            if (result == GL_WAIT_FAILED || result == GL_TIMEOUT_EXPIRED) {
+                fail(new IllegalStateException("Benchmark frame fence wait failed or timed out")); return;
+            }
+            glDeleteSync(frameFences[frameFence]);
+            frameFences[frameFence] = 0;
+        }
         poll();
         if (System.nanoTime() - phaseStart < phases.get(phase).warm * 1_000_000_000L) return;
         if (measuredStart == 0) measuredStart = System.nanoTime();
@@ -284,11 +358,28 @@ public final class ClientBenchmark {
     }
 
     private void renderedFrame() {
-        if (finished || framePhase < 0) return;
-        phases.get(framePhase).cpu.add(System.nanoTime() - renderStart);
-        if (activeQuery >= 0) {
-            glQueryCounter(queries[activeQuery * 2 + 1], GL_TIMESTAMP);
-            pending[activeQuery] = true; activeQuery = -1;
+        if (finished || phase < 0) return;
+        var current = phases.get(phase);
+        if (GOVERNOR_PIPELINE && current.lastQualityLevel != RayvoxEngine.governorLevel()) {
+            current.lastQualityLevel = RayvoxEngine.governorLevel();
+            current.qualityDecisions.add(RayvoxEngine.governorStats());
+            LogUtils.getLogger().info("Rayvox governor decision in {}: {}", current.name, RayvoxEngine.governorStats());
+        }
+        if (framePhase >= 0) {
+            phases.get(framePhase).cpu.add(System.nanoTime() - renderStart);
+            if (activeQuery >= 0) {
+                glQueryCounter(queries[activeQuery * 2 + 1], GL_TIMESTAMP);
+                pending[activeQuery] = true; activeQuery = -1;
+            }
+        }
+        // Actual CPU work (not a sleep) tests overlapping CPU/GPU bottlenecks without changing the GPU workload.
+        long cpuLoad = current.name.equals("deferred-cpu-bound-moving") ? 30_000_000L
+                : current.name.equals("deferred-cpu-recovery-moving") ? 80_000_000L : 0;
+        if (cpuLoad > 0) {
+            // Submit the end timestamps before CPU load so unflushed commands do not time GPU idle as lighting.
+            glFlush();
+            long until = System.nanoTime() + cpuLoad;
+            while (System.nanoTime() < until) Thread.onSpinWait();
         }
     }
 
@@ -296,7 +387,15 @@ public final class ClientBenchmark {
         long now = System.nanoTime();
         try {
             if (!finished && phase >= 0) {
-                if (framePhase == phase && lastFrame != 0) phases.get(phase).wall.add(now - lastFrame);
+                if (framePhase == phase && lastFrame != 0) {
+                    phases.get(phase).wall.add(now - lastFrame);
+                    int level = RayvoxEngine.governorLevel();
+                    if (level < 0 || level >= phases.get(phase).qualityFrames.length)
+                        throw new IllegalStateException("Governor selected an out-of-range quality level " + level);
+                    phases.get(phase).qualityFrames[level]++;
+                    double cpuMs = RayvoxEngine.cpuWorkMillis();
+                    if (Double.isFinite(cpuMs) && cpuMs >= 0) phases.get(phase).cpuWork.add((long)(cpuMs * 1_000_000));
+                }
                 var current = phases.get(phase);
                 // Driver compilation can consume the warmup frame; measure a full window afterwards.
                 if (measuredStart != 0 && now - measuredStart >= current.seconds * 1_000_000_000L) {
@@ -305,6 +404,26 @@ public final class ClientBenchmark {
                         throw new IllegalStateException("Rayvox did not activate: " + RayvoxEngine.status() + "; " + RayvoxEngine.lightStats());
                     if (ENTITIES && RayvoxEngine.entityShadowCount() == 0)
                         throw new IllegalStateException("Moving entity was not published to the terrain shader");
+                    if (PIPELINE && configDeferred(current) != RayvoxEngine.deferredActive())
+                        throw new IllegalStateException("Unexpected pipeline: " + RayvoxEngine.pipelineStats());
+                    if (PIPELINE && configDeferred(current) && RayvoxEngine.lightingPassDraws() <= phasePassDraws)
+                        throw new IllegalStateException("Deferred pass did not draw");
+                    if (PIPELINE && configDeferred(current) != (RayvoxEngine.compositionPassDraws() > phaseCompositionDraws))
+                        throw new IllegalStateException("Unexpected same-frame composition activity in " + current.name);
+                    if (HELD_PIPELINE && RayvoxEngine.dynamicLightCount() != (current.name.endsWith("removed") ? 0 : 1))
+                        throw new IllegalStateException("Held-light collection failed in " + current.name + ": " + RayvoxEngine.dynamicStats());
+                    if (HELD_PIPELINE && configDeferred(current) && !current.name.endsWith("removed")
+                            && RayvoxEngine.dynamicPassDraws() <= phaseDynamicDraws)
+                        throw new IllegalStateException("Current-frame held-light pass did not draw");
+                    if ((current.name.equals("deferred-cpu-bound-moving") || current.name.equals("deferred-cpu-recovery-moving"))
+                            && RayvoxEngine.governorLevel() != 4)
+                        throw new IllegalStateException("Governor did not hold/recover quality during " + current.name + ": "
+                                + RayvoxEngine.governorStats() + "; quality frames " + Arrays.toString(current.qualityFrames)
+                                + "; CPU work " + stats(current.cpuWork) + "; decisions " + current.qualityDecisions);
+                    if (PIPELINE && (configDeferred(current) && current.indirect)
+                            != (RayvoxEngine.indirectPassDraws() > phaseIndirectDraws))
+                        throw new IllegalStateException("Unexpected indirect pass activity in " + current.name
+                                + ": " + RayvoxEngine.governorStats());
                     int error = glGetError();
                     if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error in " + current.name + ": " + error);
                     Path screenshot = mc.gameDirectory.toPath().resolve(current.name + ".png");
@@ -315,12 +434,33 @@ public final class ClientBenchmark {
                     if (ENTITIES) report.put("entityCasters", RayvoxEngine.entityShadowCount());
                     report.put("cache", RayvoxEngine.cacheStats()); report.put("lights", RayvoxEngine.lightStats());
                     report.put("history", RayvoxEngine.historyStats()); report.put("screenshot", screenshot.toAbsolutePath().toString());
+                    report.put("pipeline", RayvoxEngine.pipelineStats()); report.put("governor", RayvoxEngine.governorStats());
+                    report.put("governorTargetFps", Rayvox.GOVERNOR_TARGET.get());
+                    report.put("qualityLevelFrames", current.qualityFrames);
+                    report.put("qualityDecisions", current.qualityDecisions);
+                    report.put("deferredPassDraws", RayvoxEngine.lightingPassDraws() - phasePassDraws);
+                    report.put("indirectPassDraws", RayvoxEngine.indirectPassDraws() - phaseIndirectDraws);
+                    report.put("compositionPassDraws", RayvoxEngine.compositionPassDraws() - phaseCompositionDraws);
+                    report.put("dynamicPassDraws", RayvoxEngine.dynamicPassDraws() - phaseDynamicDraws);
+                    report.put("dynamicLights", RayvoxEngine.dynamicLightCount());
+                    if (Double.isFinite(RayvoxEngine.spanMillis())) report.put("opaqueSpanMs", RayvoxEngine.spanMillis());
+                    if (RayvoxEngine.deferredActive() && Double.isFinite(RayvoxEngine.passMillis()))
+                        report.put("deferredPassMs", RayvoxEngine.passMillis());
+                    if (RayvoxEngine.deferredActive() && current.indirect && Double.isFinite(RayvoxEngine.indirectPassMillis()))
+                        report.put("indirectPassMs", RayvoxEngine.indirectPassMillis());
+                    measurements(current, report);
                     reports.add(report);
                     if (phase + 1 < phases.size()) beginPhase(phase + 1);
                     else complete();
                 }
             }
         } catch (Throwable error) { fail(error); }
+        if (!finished && phase >= 0) {
+            frameFences[frameFence] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (frameFences[frameFence] == 0) fail(new IllegalStateException("Cannot allocate benchmark frame fence"));
+            frameFence = (frameFence + 1) % frameFences.length;
+            glFlush();
+        }
         lastFrame = now;
     }
 
@@ -336,22 +476,20 @@ public final class ClientBenchmark {
 
     private void complete() throws Exception {
         glFinish(); poll();
+        releaseFences();
         if (timers) glDeleteQueries(queries);
         for (int i = 0; i < phases.size(); i++) {
-            var p = phases.get(i); var report = reports.get(i);
-            if (p.wall.isEmpty()) throw new IllegalStateException("No measured frames for " + p.name);
-            var wall = stats(p.wall);
-            report.put("frameMs", wall); report.put("renderThreadMs", stats(p.cpu)); report.put("gpuRenderMs", stats(p.gpu));
-            report.put("meanFps", 1000.0 / ((Number)wall.get("mean")).doubleValue());
+            measurements(phases.get(i), reports.get(i));
         }
         var mc = Minecraft.getInstance();
         var result = new LinkedHashMap<String, Object>();
         result.put("success", true); result.put("gpu", RayvoxEngine.gpu());
         result.put("width", mc.getMainRenderTarget().width); result.put("height", mc.getMainRenderTarget().height);
         result.put("renderDistance", mc.options.renderDistance().get()); result.put("phases", reports);
-        result.put("scene", ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
+        result.put("scene", HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
                 : DIRECTIONAL ? (DIRECTIONAL_MATERIALS ? "directional-v1" : "directional-basic-v1") : "fixed-room-v3"); result.put("seed", 42);
         result.put("hidden", GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) == GLFW.GLFW_FALSE);
+        result.put("maxFramesInFlight", frameFences.length);
         result.put("createdAt", java.time.Instant.now().toString());
         result.put("build", JsonParser.parseString(Files.readString(mc.gameDirectory.toPath().resolve("benchmark-meta.json"))));
         write(result); finished = true; mc.stop();
@@ -369,12 +507,31 @@ public final class ClientBenchmark {
         return report;
     }
 
+    private static void measurements(Phase phase, Map<String, Object> report) {
+        if (phase.wall.isEmpty()) throw new IllegalStateException("No measured frames for " + phase.name);
+        var wall = stats(phase.wall);
+        report.put("frameMs", wall); report.put("renderThreadMs", stats(phase.cpu)); report.put("gpuRenderMs", stats(phase.gpu));
+        report.put("cpuWorkMs", stats(phase.cpuWork));
+        report.put("meanFps", 1000.0 / ((Number)wall.get("mean")).doubleValue());
+    }
+
+    private static boolean configDeferred(Phase phase) {
+        return phase.name.startsWith("deferred-") && !phase.name.equals("deferred-history-off");
+    }
+
     private void fail(Throwable error) {
         if (finished) return;
         finished = true; LogUtils.getLogger().error("Rayvox client benchmark failed", error);
+        releaseFences();
         try { write(Map.of("success", false, "error", error.toString(), "completedPhases", reports)); }
         catch (Exception failure) { LogUtils.getLogger().error("Cannot write benchmark failure", failure); }
         Minecraft.getInstance().stop();
+    }
+
+    private void releaseFences() {
+        for (int i = 0; i < frameFences.length; i++) if (frameFences[i] != 0) {
+            glDeleteSync(frameFences[i]); frameFences[i] = 0;
+        }
     }
 
     private static void write(Map<String, ?> result) throws Exception {
@@ -387,6 +544,10 @@ public final class ClientBenchmark {
         final boolean enabled, materials, indirect, moving;
         final int warm, seconds, limit, perTile, expectedLights;
         final LongArrayList wall = new LongArrayList(16384), cpu = new LongArrayList(16384), gpu = new LongArrayList(16384);
+        final LongArrayList cpuWork = new LongArrayList(16384);
+        final int[] qualityFrames = new int[5];
+        final List<String> qualityDecisions = new ArrayList<>();
+        int lastQualityLevel;
         Phase(String name, boolean enabled, boolean materials, boolean indirect, boolean moving, int warm, int seconds) {
             this(name, enabled, materials, indirect, moving, warm, seconds, 32, 4, 10);
         }

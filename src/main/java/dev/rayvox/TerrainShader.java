@@ -24,7 +24,7 @@ final class TerrainShader extends ShaderInstance {
     private final float[] moving = new float[32];
     private final SectionLightUniforms sectionUniforms;
     private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
-    private final int sunLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation;
+    private final int sunLocation, sunRadianceLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation, deferredLocation;
     private final int entityCountLocation, entityRecordsLocation, softnessLocation;
     private final float[] entities = new float[EntityShadows.MAX_CASTERS * 8];
     private final float[] distant = new float[LightSourceManager.PER_SECTION * 8];
@@ -44,9 +44,11 @@ final class TerrainShader extends ShaderInstance {
         indirectLocation = glGetUniformLocation(getId(), "IndirectEnabled");
         transmissionLocation = glGetUniformLocation(getId(), "MaterialTransmission[0]");
         sunLocation = glGetUniformLocation(getId(), "SunDirection");
+        sunRadianceLocation = glGetUniformLocation(getId(), "SunRadiance");
         dynamicCountLocation = glGetUniformLocation(getId(), "DynamicCount");
         dynamicRecordsLocation = glGetUniformLocation(getId(), "DynamicRecords[0]");
         historyValidLocation = glGetUniformLocation(getId(), "HistoryValid");
+        deferredLocation = glGetUniformLocation(getId(), "DeferredLighting");
         budgetLocation = glGetUniformLocation(getId(), "ShadowBudget");
         entityCountLocation = glGetUniformLocation(getId(), "EntityCount");
         entityRecordsLocation = glGetUniformLocation(getId(), "EntityRecords[0]");
@@ -59,6 +61,10 @@ final class TerrainShader extends ShaderInstance {
         glBindFragDataLocation(getId(), 1, "cachedLight");
         glBindFragDataLocation(getId(), 2, "cachedKey");
         glBindFragDataLocation(getId(), 3, "cachedIndirect");
+        glBindFragDataLocation(getId(), 4, "deferredInputs");
+        glBindFragDataLocation(getId(), 5, "geometryBase");
+        glBindFragDataLocation(getId(), 6, "geometryEmission");
+        glBindFragDataLocation(getId(), 7, "geometryAlbedo");
     }
 
     @Override
@@ -75,43 +81,42 @@ final class TerrainShader extends ShaderInstance {
         }
         glActiveTexture(active);
         if (history != null) history.attach(getId());
-        else glUniform1i(historyValidLocation, 0);
+        else {
+            glUniform1i(historyValidLocation, 0);
+            glUniform1i(deferredLocation, 0);
+        }
         glActiveTexture(GL_TEXTURE9);
         previousShapes = glGetInteger(GL_TEXTURE_BINDING_3D);
         glBindTexture(GL_TEXTURE_3D, cache.shapes);
         glUniform1i(shapesLocation, 9);
         glActiveTexture(active);
         glUniform1i(advancedLocation, Rayvox.MATERIALS.get() ? 1 : 0);
-        glUniform1i(indirectLocation, Rayvox.INDIRECT.get() ? 1 : 0);
+        glUniform1i(indirectLocation, RayvoxEngine.indirectActive() ? 1 : 0);
         // A table is immutable after resource loading; raw uniforms survive program rebindings.
         if (publishedMaterials != materials) {
             glUniform3fv(transmissionLocation, materials.transmission);
             publishedMaterials = materials;
         }
         glUniform4f(sunLocation, sun.x(), sun.y(), sun.z(), sun.strength());
-        glUniform1i(softnessLocation, Rayvox.SHADOW_SOFTNESS.get());
-        int entityCount = Rayvox.ENTITY_SHADOWS.get() ? Math.min(EntityShadows.MAX_CASTERS, entityCasters.size()) : 0;
+        glUniform3f(sunRadianceLocation, sun.red(), sun.green(), sun.blue());
+        glUniform1i(softnessLocation, RayvoxEngine.shadowSoftness());
+        int entityCount = packEntities(entityCasters, cameraX, cameraY, cameraZ, entities);
         glUniform1i(entityCountLocation, entityCount);
-        var camera = new net.minecraft.world.phys.Vec3(cameraX, cameraY, cameraZ);
-        for (int i = 0; i < entityCount; i++) {
-            var bounds = entityCasters.get(i);
-            var center = bounds.getCenter();
-            int offset = i * 8;
-            entities[offset] = (float)(center.x - cameraX);
-            entities[offset + 1] = (float)(center.y - cameraY);
-            entities[offset + 2] = (float)(center.z - cameraZ);
-            entities[offset + 3] = EntityShadows.weight(bounds, entityCasters, camera);
-            entities[offset + 4] = (float)Math.max(0.025, bounds.getXsize() * 0.5);
-            entities[offset + 5] = (float)Math.max(0.025, bounds.getYsize() * 0.5);
-            entities[offset + 6] = (float)Math.max(0.025, bounds.getZsize() * 0.5);
-            entities[offset + 7] = 0;
-        }
         if (entityCount > 0) glUniform4fv(entityRecordsLocation, entities);
         if (budgetBoundary == null) glUniform4f(budgetLocation, 0, 0, 0, 0);
         else glUniform4f(budgetLocation, (float)(budgetBoundary.x() - cameraX),
                 (float)(budgetBoundary.y() - cameraY), (float)(budgetBoundary.z() - cameraZ), 1);
-        glUniform1i(dynamicCountLocation, dynamic.size());
-        for (int i = 0; i < dynamic.size(); i++) {
+        int dynamicCount = packDynamic(dynamic, cameraX, cameraY, cameraZ, radiances, moving);
+        glUniform1i(dynamicCountLocation, dynamicCount);
+        if (dynamicCount > 0) glUniform4fv(dynamicRecordsLocation, moving);
+        if (timer != null) timer.begin();
+        drawing = true;
+    }
+
+    static int packDynamic(java.util.List<LightSourceManager.Light> dynamic, double cameraX, double cameraY,
+            double cameraZ, LightRadianceCache radiances, float[] moving) {
+        int count = Math.min(4, dynamic.size());
+        for (int i = 0; i < count; i++) {
             var source = dynamic.get(i); var def = source.definition(); int offset = i * 8;
             var rgb = radiances.get(def);
             moving[offset] = (float)(source.x() - cameraX);
@@ -123,9 +128,28 @@ final class TerrainShader extends ShaderInstance {
             moving[offset + 6] = rgb[2];
             moving[offset + 7] = def.shadows() ? 1 : 0;
         }
-        if (!dynamic.isEmpty()) glUniform4fv(dynamicRecordsLocation, moving);
-        if (timer != null) timer.begin();
-        drawing = true;
+        return count;
+    }
+
+    /** Camera-relative entity caster records shared by terrain shading and the deferred pass. */
+    static int packEntities(java.util.List<net.minecraft.world.phys.AABB> casters, double cameraX, double cameraY,
+            double cameraZ, float[] out) {
+        int count = Rayvox.ENTITY_SHADOWS.get() ? Math.min(EntityShadows.MAX_CASTERS, casters.size()) : 0;
+        var camera = new net.minecraft.world.phys.Vec3(cameraX, cameraY, cameraZ);
+        for (int i = 0; i < count; i++) {
+            var bounds = casters.get(i);
+            var center = bounds.getCenter();
+            int offset = i * 8;
+            out[offset] = (float)(center.x - cameraX);
+            out[offset + 1] = (float)(center.y - cameraY);
+            out[offset + 2] = (float)(center.z - cameraZ);
+            out[offset + 3] = EntityShadows.weight(bounds, casters, camera);
+            out[offset + 4] = (float)Math.max(0.025, bounds.getXsize() * 0.5);
+            out[offset + 5] = (float)Math.max(0.025, bounds.getYsize() * 0.5);
+            out[offset + 6] = (float)Math.max(0.025, bounds.getZsize() * 0.5);
+            out[offset + 7] = 0;
+        }
+        return count;
     }
 
     void section(java.util.List<LightSourceManager.Light> selected, LightSourceManager manager, boolean ready, double x, double y, double z) {

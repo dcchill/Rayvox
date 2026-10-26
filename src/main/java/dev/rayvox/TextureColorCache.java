@@ -8,13 +8,13 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 final class TextureColorCache {
     private final Map<TextureAtlasSprite, TextureColor> colors = new IdentityHashMap<>();
 
-    void add(TextureColor target, TextureAtlasSprite sprite) {
+    TextureColor get(TextureAtlasSprite sprite) {
         var sampled = colors.get(sprite);
         if (sampled == null) {
             sampled = sample(sprite);
             colors.put(sprite, sampled);
         }
-        target.merge(sampled);
+        return sampled;
     }
 
     static TextureColor sample(TextureAtlasSprite sprite) {

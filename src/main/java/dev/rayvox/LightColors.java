@@ -56,7 +56,7 @@ final class LightColors {
             for (var sprite : sprites) {
                 var contents = sprite.contents();
                 if (contents.name().equals(MissingTextureAtlasSprite.getLocation())) continue;
-                spriteColors.add(color, sprite);
+                color.merge(spriteColors.get(sprite));
             }
             if (!color.hasColor()) fallbacks++;
             return color.rgb();

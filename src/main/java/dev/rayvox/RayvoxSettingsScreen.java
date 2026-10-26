@@ -33,6 +33,29 @@ final class RayvoxSettingsScreen extends Screen {
                     "Maximum sections scanned each tick, also subject to the soft 2 ms budget.");
             slider("Uploads per frame", Rayvox.UPLOAD_BUDGET, 1, 16, " sections",
                     "Higher limits refresh edited terrain faster but can cause frame spikes.");
+            cycle("Preset", () -> Rayvox.PRESET.get().name(), () -> {
+                var presets = new QualityPreset[]{QualityPreset.PERFORMANCE, QualityPreset.BALANCED, QualityPreset.QUALITY};
+                int index = java.util.Arrays.asList(presets).indexOf(Rayvox.PRESET.get());
+                presets[(index + 1) % presets.length].apply();
+                rebuildWidgets();
+            }, "Performance: integrated GPUs. Balanced: midrange. Quality: high-end. Selects pipeline, refresh, shadow, light and governor budgets.");
+            cycle("Pipeline", () -> Rayvox.PIPELINE.get().name(), () -> {
+                Rayvox.PIPELINE.set(Rayvox.PIPELINE.get() == LightingPipeline.LEGACY ? LightingPipeline.DEFERRED : LightingPipeline.LEGACY);
+                Rayvox.PRESET.set(QualityPreset.CUSTOM);
+            }, "LEGACY: original inline tracing (reference). DEFERRED: terrain samples cached lighting; a separate pass traces only new/stale pixels. Requires lighting history.");
+            slider("Deferred refresh", Rayvox.REFRESH_INTERVAL, 1, 4, " frames",
+                    "Frames over which stale cached pixels are re-traced. Higher is cheaper but lags lighting changes. New surfaces are always traced.");
+            slider("Indirect update interval", Rayvox.INDIRECT_INTERVAL, 1, 8, " frames",
+                    "DEFERRED GI gathers progressive samples in a separate pass. Higher intervals reduce work while converging; new surfaces start immediately.");
+            cycle("Governor target", () -> Rayvox.GOVERNOR_TARGET.get() == 0 ? "OFF" : Rayvox.GOVERNOR_TARGET.get() + " FPS", () -> {
+                int[] targets = {0, 30, 60, 90, 120};
+                int next = 0;
+                for (int i = 0; i < targets.length; i++) if (targets[i] == Rayvox.GOVERNOR_TARGET.get()) next = (i + 1) % targets.length;
+                Rayvox.GOVERNOR_TARGET.set(targets[next]);
+                Rayvox.PRESET.set(QualityPreset.CUSTOM);
+            }, "Lowers shadow softness, distances, lights per cell, GI and refresh rate when Rayvox GPU time exceeds the frame budget. Holds when CPU-bound.");
+            slider("Governor min level", Rayvox.GOVERNOR_MIN, 0, 4, "", "Lowest quality level the governor may select.");
+            slider("Governor max level", Rayvox.GOVERNOR_MAX, 0, 4, "", "Highest quality level; 4 applies no caps to configured settings.");
         } else {
             toggle("RGB lighting", Rayvox.ENABLED, "Enable Rayvox lighting.");
             toggle("Block shadows", Rayvox.SHADOWS, "Enable shadow rays for block and held lights; also gates sky shadows.");
@@ -40,7 +63,8 @@ final class RayvoxSettingsScreen extends Screen {
                     "Camera range for block and held-light shadows. Fades to unshadowed RGB light outside this range.");
             slider("Shadow ray length", Rayvox.SHADOW_DISTANCE, 1, 16, " blocks",
                     "Maximum source-to-surface shadow ray length. Shorter rays suppress distant light to prevent leaks.");
-            toggle("Sky shadows", Rayvox.SUNLIGHT, "Experimental sun/moon shadows. Requires block shadows and a dimension with skylight.");
+            toggle("Sunlight", Rayvox.SUNLIGHT, "Warm sun and cool moon illumination with traced shadows. Requires block shadows and a normal sky.");
+            toggle("Godrays", Rayvox.GODRAYS, "Volumetric sunlight through terrain gaps. Requires Sunlight. Evaluated at quarter resolution; adds GPU work.");
             slider("Sky shadow draw distance", Rayvox.SUN_SHADOW_DISTANCE, 16, 64, " blocks",
                     "Sun/moon shadow range. Larger distances expand the voxel cache and cost more memory and GPU time.");
             toggle("Held item lights", Rayvox.DYNAMIC, "Light from emissive blocks held by nearby players.");
@@ -65,8 +89,17 @@ final class RayvoxSettingsScreen extends Screen {
     private void toggle(String label, ModConfigSpec.BooleanValue setting, String help) {
         var button = addRenderableWidget(Button.builder(toggleLabel(label, setting), clicked -> {
             setting.set(!setting.get());
+            Rayvox.PRESET.set(QualityPreset.CUSTOM);
             setting.save();
             clicked.setMessage(toggleLabel(label, setting));
+        }).bounds(x(), y(), columnWidth, 20).build());
+        button.setTooltip(Tooltip.create(Component.literal(help)));
+    }
+
+    private void cycle(String label, java.util.function.Supplier<String> value, Runnable action, String help) {
+        var button = addRenderableWidget(Button.builder(Component.literal(label + ": " + value.get()), clicked -> {
+            action.run();
+            clicked.setMessage(Component.literal(label + ": " + value.get()));
         }).bounds(x(), y(), columnWidth, 20).build());
         button.setTooltip(Tooltip.create(Component.literal(help)));
     }
@@ -84,7 +117,7 @@ final class RayvoxSettingsScreen extends Screen {
             }
             @Override protected void applyValue() {
                 int selected = min + (int)Math.round(value * (max - min));
-                if (selected != setting.get()) setting.set(selected);
+                if (selected != setting.get()) { setting.set(selected); Rayvox.PRESET.set(QualityPreset.CUSTOM); }
             }
         });
         slider.setTooltip(Tooltip.create(Component.literal(help)));

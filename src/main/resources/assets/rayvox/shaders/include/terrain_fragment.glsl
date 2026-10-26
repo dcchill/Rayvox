@@ -43,6 +43,9 @@ const int IndirectEnabled = 0;
 uniform int IndirectEnabled;
 #endif
 uniform sampler2D HistoryIndirect;
+// Deferred pipeline: history stays geometry-valid across scene revisions; HistoryStale marks stored lighting outdated.
+uniform int DeferredLighting;
+uniform int HistoryStale;
 
 #moj_import <rayvox:shadow.glsl>
 
@@ -59,28 +62,12 @@ out vec4 fragColor;
 out vec4 cachedLight;
 out vec4 cachedKey;
 out vec4 cachedIndirect;
+out vec4 deferredInputs;
+out vec4 geometryBase;
+out vec4 geometryEmission;
+out vec4 geometryAlbedo;
 
-vec3 toLinear(vec3 value) {
-    return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), value));
-}
-
-vec3 toSrgb(vec3 value) {
-    return mix(value * 12.92, 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), value));
-}
-
-float historyNormalKey(vec3 normal) {
-    // Preserve the common axis-aligned keys and their inexpensive path.
-    float axis = abs(normal.x) == 1.0 ? (normal.x > 0.0 ? 1.0 : 2.0)
-            : abs(normal.y) == 1.0 ? (normal.y > 0.0 ? 3.0 : 4.0)
-            : abs(normal.z) == 1.0 ? (normal.z > 0.0 ? 5.0 : 6.0) : 0.0;
-    if (axis > 0.0 || dot(normal, normal) < 0.999) return axis;
-    vec2 oct = normal.xy / (abs(normal.x) + abs(normal.y) + abs(normal.z));
-    if (normal.z < 0.0)
-        oct = (1.0 - abs(oct.yx)) * mix(vec2(-1.0), vec2(1.0), greaterThanEqual(oct, vec2(0.0)));
-    vec2 encoded = round((oct * 0.5 + 0.5) * 2047.0);
-    // A 22-bit octahedral direction plus the reserved axis/invalid values fits exactly in RGBA32F.
-    return 7.0 + encoded.x + encoded.y * 2048.0;
-}
+#moj_import <rayvox:history.glsl>
 
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
 float sunColorKey(float face, vec3 visibility, float mean) {
@@ -98,36 +85,21 @@ vec3 sunColorVisibility(float mean, float key) {
 #endif
 
 #moj_import <rayvox:soft_shadow.glsl>
+#moj_import <rayvox:lighting_common.glsl>
+#moj_import <rayvox:sunlight.glsl>
 
-vec3 blockVisibility(vec3 origin, vec3 target) {
-    vec3 camera = CameraFraction + vec3(CameraInCache);
-    // Both ends must fade before the section-aligned cache can drop a source or its ray.
-    float cameraDistance = max(length(origin - camera), length(target - camera));
-    float fade = 1.0 - smoothstep(ShadowDrawDistance * 0.5, ShadowDrawDistance, cameraDistance);
-    if (fade <= 0.0) return vec3(1.0);
-    vec3 visibility = distance(origin, target) > ShadowDistance ? vec3(0.0) : softTransmission(origin, target);
-    return mix(vec3(1.0), visibility, fade);
+bool farMatched(int index) {
+    bool matched = false;
+    for (int i = 0; i < 8; i++) {
+        if (i >= FarLightCount) break;
+        if (int(FarLightRecords[i * 2 + 1].w) == index + 1) matched = true;
+    }
+    return matched;
 }
 
 vec3 staticVisibility(vec3 origin, vec3 target, int index, bool shadows) {
-    bool matched = false;
-    if (FarReady != 0) {
-        for (int i = 0; i < 8; i++) {
-            if (i >= FarLightCount) break;
-            if (int(FarLightRecords[i * 2 + 1].w) == index + 1) matched = true;
-        }
-    }
-    float sourceDistance = length(target - CameraFraction - vec3(CameraInCache));
-    float weight = 1.0;
-    if (ShadowBudget.w > 0.0) {
-        float boundary = length(ShadowBudget.xyz);
-        weight = 1.0 - smoothstep(max(0.0, boundary - 8.0), boundary, sourceDistance);
-    }
-    if (FarReady != 0 && !matched) {
-        // Extra near sources in dense sections fade before the ring can drop them in a 16-block step.
-        float range = float(CacheWidth / 2) * 16.0;
-        weight *= 1.0 - smoothstep(max(0.0, range - 16.0), range, sourceDistance);
-    }
+    bool matched = FarReady != 0 && farMatched(index);
+    float weight = staticWeight(target, FarReady != 0, matched);
     if (weight <= 0.0) return vec3(0.0);
     vec3 visibility = shadows ? blockVisibility(origin, target) : vec3(1.0);
     // Ready section lights provide stable RGB; matching near records contribute only the shadow correction.
@@ -140,6 +112,10 @@ void main() {
     cachedLight = vec4(0.0);
     cachedKey = vec4(0.0);
     cachedIndirect = vec4(0.0);
+    deferredInputs = vec4(0.0);
+    geometryBase = vec4(0.0);
+    geometryEmission = vec4(0.0);
+    geometryAlbedo = vec4(0.0);
     vec4 albedo = texture(Sampler0, texCoord0) * vertexColor * ColorModulator;
     float alpha = albedo.a * vanillaLight.a;
     if (alpha < AlphaCutoff) discard;
@@ -178,18 +154,93 @@ void main() {
     vec3 localPosition = surfacePosition + CameraFraction + vec3(CameraInCache);
     float face = historyNormalKey(normal);
     vec4 receiver = vec4(localPosition, face);
-    ivec2 pixel = ivec2(gl_FragCoord.xy);
-    vec4 prior = HistoryValid != 0 ? texelFetch(HistoryKey, pixel, 0) : vec4(0.0);
-    float priorFace = prior.w;
-#ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
-    if (AdvancedMaterials != 0 && priorFace >= 8388608.0) priorFace = float(uint(priorFace) & 7u);
-#endif
-    bool reused = HistoryValid != 0 && face > 0.0 && priorFace == face
-            && all(lessThan(abs(prior.xyz - localPosition), vec3(0.00001)));
+    ivec2 pixel = ivec2(0);
+    bool projected = HistoryValid != 0 && historyPixel(surfacePosition, pixel);
+    float footprint = max(length(dFdx(localPosition)), length(dFdy(localPosition)));
+    vec4 prior = HistoryValid != 0 && projected ? texelFetch(HistoryKey, pixel, 0) : vec4(0.0);
+    bool matchedSurface = HistoryValid != 0 && projected && historySurface(prior, localPosition, normal, face, footprint);
+    bool deferred = DeferredLighting != 0;
+    // Legacy history is exact-revision; deferred history remains geometry-valid and tracks staleness per pixel.
+    bool reused = matchedSurface && !deferred;
     ivec3 cell = ivec3(floor(localPosition - normal * 0.02));
+    bool inCache = all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(CacheWidth * 16)));
     vec3 direct = reused ? texelFetch(HistoryColor, pixel, 0).rgb : vec3(0.0);
     float replacement = 0.0;
-    if (all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(CacheWidth * 16)))) {
+    float sunlight = 1.0;
+    int deferredState = 0;
+    if (deferred) {
+        // States: 0 fresh (reuse), 1 stale (reuse, re-trace within the refresh interval), 2 new (estimate, always traced).
+        vec3 anchor = matchedSurface ? prior.xyz : localPosition;
+        vec3 anchorSurface = anchor - CameraFraction - vec3(CameraInCache);
+        vec4 stored = matchedSurface ? texelFetch(HistoryColor, pixel, 0) : vec4(0.0, 0.0, 0.0, 1.0);
+        bool storedStale = stored.a >= 2.0;
+        deferredState = !matchedSurface ? 2 : storedStale || HistoryStale != 0 ? 1 : 0;
+        if (matchedSurface) { direct = stored.rgb; sunlight = storedStale ? stored.a - 2.0 : stored.a; }
+#ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
+        if (deferredState == 0 && SunHistoryValid == 0 && SunDirection.w > 0.0 && dot(normal, SunDirection.xyz) > 0.0
+                && length(surfacePosition) < SunShadowDistance) deferredState = 1;
+#endif
+        vec3 farBase = vec3(0.0);
+        vec3 unshadowed = vec3(0.0);
+        float farMask = 0.0;
+        if (inCache) {
+            ivec3 sectionSlot = cacheSlot(cell);
+            int row = sectionSlot.x + CacheWidth * (sectionSlot.y + CacheWidth * sectionSlot.z);
+            ivec3 tile = (cell % 16) / 4;
+            int column = (tile.x + 4 * (tile.y + 4 * tile.z)) * 9;
+            uint header = texelFetch(LightLists, ivec2(column, row), 0).r;
+            if ((texelFetch(VoxelState, sectionSlot, 0).r & 1u) != 0u) {
+                vec3 edge = min(localPosition, vec3(CacheWidth * 16) - localPosition);
+                replacement = smoothstep(0.0, 16.0, min(edge.x, min(edge.y, edge.z)));
+            }
+            int count = int(header & 255u);
+            if (deferredState == 0 && any(notEqual(HistoryCameraOffset, vec3(0.0)))) {
+                for (int i = 0; i < 8; i++) {
+                    if (i >= count) break;
+                    int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                    vec4 light = texelFetch(LightData, ivec2(0, index), 0);
+                    vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
+                    vec3 toLight = light.xyz - localPosition;
+                    if (dot(toLight, toLight) >= light.w * light.w || dot(normal, toLight) <= 0.0) continue;
+                    if (!historyStaticLight(localPosition + normal * 0.03, light.xyz,
+                            ShadowsEnabled != 0 && radiance.w > 0.5)) { deferredState = 1; break; }
+                }
+            }
+            // Ray-free terms the pass cannot rebuild: per-section far records and which list entries they match.
+            for (int i = 0; i < 8 && deferredState != 0; i++) {
+                if (i >= count) break;
+                int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                vec4 light = texelFetch(LightData, ivec2(0, index), 0);
+                vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
+                vec3 contribution = nearContribution(light, radiance, anchor, normal);
+                if (all(equal(contribution, vec3(0.0)))) continue;
+                bool matched = FarReady != 0 && farMatched(index);
+                if (matched) farMask += exp2(float(i));
+                float weight = staticWeight(light.xyz, FarReady != 0, matched);
+                if (weight <= 0.0) continue;
+                if (matched) farBase -= contribution * weight;
+                unshadowed += contribution * weight;
+            }
+        }
+        if (deferredState != 0 && FarReady != 0) {
+            for (int i = 0; i < 8; i++) {
+                if (i >= FarLightCount) break;
+                farBase += nearContribution(FarLightRecords[i * 2], FarLightRecords[i * 2 + 1], anchorSurface, normal);
+            }
+        }
+        if (deferredState == 2) {
+            // No rays this frame: colour from Rayvox, intensity bounded by vanilla flood-fill light to limit leaks.
+            vec3 estimate = FarReady != 0 ? max(farBase + unshadowed, vec3(0.0)) : unshadowed;
+            const vec3 luma = vec3(0.2126, 0.7152, 0.0722);
+            float bound = dot(toLinear(vanillaLight.rgb), luma) + 0.02;
+            direct = estimate * min(1.0, bound / max(dot(estimate, luma), 0.0001));
+            sunlight = 1.0;
+        }
+        cachedLight = vec4(direct, sunlight + (deferredState != 0 ? 2.0 : 0.0));
+        cachedKey = vec4(anchor, face);
+        deferredInputs = vec4(farBase, farMask + (FarReady != 0 ? 256.0 : 0.0) + float(deferredState) * 512.0);
+    }
+    if (!deferred && inCache) {
         ivec3 sectionSlot = cacheSlot(cell);
         int row = sectionSlot.x + CacheWidth * (sectionSlot.y + CacheWidth * sectionSlot.z);
         ivec3 tile = (cell % 16) / 4;
@@ -200,6 +251,19 @@ void main() {
             replacement = smoothstep(0.0, 16.0, min(edge.x, min(edge.y, edge.z)));
         }
         int count = int(header & 255u);
+        if (reused && any(notEqual(HistoryCameraOffset, vec3(0.0)))) {
+            for (int i = 0; i < 8; i++) {
+                if (i >= count) break;
+                int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                vec4 light = texelFetch(LightData, ivec2(0, index), 0);
+                vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
+                vec3 toLight = light.xyz - localPosition;
+                if (dot(toLight, toLight) >= light.w * light.w || dot(normal, toLight) <= 0.0) continue;
+                if (!historyStaticLight(localPosition + normal * 0.03, light.xyz,
+                        ShadowsEnabled != 0 && radiance.w > 0.5)) { reused = false; break; }
+            }
+            if (!reused) direct = vec3(0.0);
+        }
         for (int i = 0; i < 8 && !reused; i++) {
             if (i >= count) break;
             int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
@@ -217,7 +281,7 @@ void main() {
         }
     }
     vec3 farDirect = vec3(0.0);
-    if (!reused && FarReady != 0) {
+    if (!deferred && !reused && FarReady != 0) {
         for (int i = 0; i < 8; i++) {
             if (i >= FarLightCount) break;
             vec4 light = FarLightRecords[i * 2];
@@ -230,13 +294,13 @@ void main() {
         }
         direct = max(farDirect + direct, vec3(0.0));
     }
-    float sunlight = 1.0;
     float sunFade = 0.0;
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
-    vec3 sunTransmission = vec3(1.0);
+    // Deferred mode carries scalar sun visibility; coloured sun transmission remains a legacy-path feature.
+    vec3 sunTransmission = vec3(sunlight);
     float sunFacing = max(dot(normal, SunDirection.xyz), 0.0);
     sunFade = 1.0 - smoothstep(SunShadowDistance * 0.5, SunShadowDistance, length(surfacePosition));
-    if (SunDirection.w > 0.0 && sunFade > 0.0 && sunFacing > 0.0) {
+    if (!deferred && SunDirection.w > 0.0 && sunFade > 0.0 && sunFacing > 0.0) {
         bool axisFace = face > 0.0 && face <= 6.0;
         if (reused && SunHistoryValid != 0 && (AdvancedMaterials == 0 || axisFace)) {
             sunlight = texelFetch(HistoryColor, pixel, 0).a;
@@ -256,19 +320,23 @@ void main() {
         }
     }
 #endif
-    cachedLight = vec4(direct, sunlight);
-    cachedKey = receiver;
+    if (!deferred) {
+        cachedLight = vec4(direct, sunlight);
+        // Keep the original sample position so nearest-pixel reuse cannot drift across a surface over many frames.
+        cachedKey = reused ? vec4(prior.xyz, receiver.w) : receiver;
+    }
     vec3 indirect = vec3(0.0);
     if (IndirectEnabled != 0 && replacement > 0.0) {
-        vec4 accumulated = reused ? texelFetch(HistoryIndirect, pixel, 0) : vec4(0.0);
+        bool giReuse = reused || (deferred && matchedSurface && HistoryStale == 0);
+        vec4 accumulated = giReuse ? texelFetch(HistoryIndirect, pixel, 0) : vec4(0.0);
         float count = clamp(accumulated.a, 0.0, 8.0);
-        indirect = count >= 8.0 ? accumulated.rgb : (accumulated.rgb * count
+        indirect = deferred || count >= 8.0 ? accumulated.rgb : (accumulated.rgb * count
                 + bounceSample(localPosition + normal * 0.03, normal, int(count))) / (count + 1.0);
-        cachedIndirect = vec4(indirect, min(count + 1.0, 8.0));
+        cachedIndirect = vec4(indirect, deferred ? count : min(count + 1.0, 8.0));
         indirect *= replacement;
     }
-    // Moving lights stay outside static history; their four rays update every rendered frame.
-    for (int i = 0; i < 4; i++) {
+    // Deferred moving-light rays run after geometry, independently of static history.
+    for (int i = 0; i < 4 && !deferred; i++) {
         if (i >= DynamicCount) break;
         vec4 light = DynamicRecords[i * 2];
         vec4 radiance = DynamicRecords[i * 2 + 1];
@@ -282,8 +350,19 @@ void main() {
             visibility = blockVisibility(localPosition + normal * 0.03, light.xyz + CameraFraction + vec3(CameraInCache));
         direct += radiance.rgb * (falloff * falloff * diffuse * visibility);
     }
+    vec3 base = mix(toLinear(vanillaLight.rgb), toLinear(skyLight.rgb), FarReady != 0 ? 1.0 : replacement);
+    if (deferred) {
+        float fog = vertexDistance <= FogStart ? 0.0 : vertexDistance < FogEnd
+                ? smoothstep(FogStart, FogEnd, vertexDistance) : 1.0;
+        geometryBase = vec4(toSrgb(base), replacement);
+        geometryEmission = vec4(sourceLight, fog * FogColor.a);
+        geometryAlbedo = vec4(albedo.rgb, alpha);
+    }
     if (DebugMode == 6) {
-        fragColor = vec4(reused ? vec3(0.1, 0.8, 0.2) : vec3(0.8, 0.15, 0.05), alpha);
+        // Deferred: green fresh, amber stale (awaiting refresh), red newly visible estimate.
+        vec3 reuse = deferred ? (deferredState == 0 ? vec3(0.1, 0.8, 0.2) : deferredState == 1 ? vec3(0.9, 0.65, 0.05)
+                : vec3(0.8, 0.15, 0.05)) : reused ? vec3(0.1, 0.8, 0.2) : vec3(0.8, 0.15, 0.05);
+        fragColor = vec4(reuse, alpha);
         return;
     }
     if (DebugMode == 7) {
@@ -295,12 +374,8 @@ void main() {
         return;
     }
     // Source budgets and dirty flags must never switch vanilla block lighting back on under RGB shadows.
-    vec3 base = mix(toLinear(vanillaLight.rgb), toLinear(skyLight.rgb), FarReady != 0 ? 1.0 : replacement);
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
-    if (SunDirection.w > 0.0) {
-        vec3 occlusion = (vec3(1.0) - sunTransmission) * sunFacing;
-        base *= vec3(1.0) - 0.65 * occlusion * sunFade * SunDirection.w;
-    }
+    base = sunlitBase(base, normal, sunTransmission, length(surfacePosition));
 #endif
     // A source's own glow is independent of diffuse normals, occlusion and source-list budgets.
     vec3 illumination = max(max(base, direct) + indirect, toLinear(sourceLight));

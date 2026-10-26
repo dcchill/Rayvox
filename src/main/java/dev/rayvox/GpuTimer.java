@@ -36,6 +36,10 @@ final class GpuTimer implements AutoCloseable {
         active = -1;
     }
 
+    /** Latest completed sample in milliseconds; samples() increases when a new delayed result has been read. */
+    double millis() { return millis; }
+    int samples() { return samples; }
+
     String status() { return samples == 0 ? "GPU timing: warming (asynchronous)"
             : String.format(java.util.Locale.ROOT, "GPU: last terrain layer %.3f ms (%d samples; includes draw + lighting)", millis, samples); }
 

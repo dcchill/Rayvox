@@ -22,6 +22,15 @@ vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
             visibility = blockVisibility(hit + normal * 0.03, light.xyz);
         result += radiance.rgb * falloff * falloff * diffuse * visibility;
     }
+#ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
+    float sunFacing = max(dot(normal, SunDirection.xyz), 0.0);
+    if (SunDirection.w > 0.0 && sunFacing > 0.0) {
+        vec3 origin = hit + normal * 0.03;
+        vec3 sunlight = traceDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
+                CameraFraction + vec3(CameraInCache), SunShadowDistance);
+        result += SunRadiance * (SunDirection.w * sunFacing) * sunlight;
+    }
+#endif
     vec3 reflectance = toLinear(vec3(texelFetch(VoxelData, slot * 16 + cell % 16, 0).gba) / 255.0);
     return result * reflectance * 0.5;
 }

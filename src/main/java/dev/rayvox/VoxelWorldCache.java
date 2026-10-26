@@ -17,6 +17,7 @@ public final class VoxelWorldCache {
     private final LightColors colors;
     private final MaterialTable materials;
     private final ShapeMask.Cache shapeMask = new ShapeMask.Cache();
+    private final BlockReflectance reflectance = new BlockReflectance();
     private final java.util.Map<net.minecraft.world.level.block.Block, String> blockIds = new java.util.IdentityHashMap<>();
 
     public VoxelWorldCache(int radius, LightColors colors, MaterialTable materials) {
@@ -96,11 +97,12 @@ public final class VoxelWorldCache {
                         slot.shapes[index] = shapeMask.of(shape, material != 3 && !state.getBlock().hasDynamicShape());
                         if (shapeMask.boxEncoded()) slot.data[index] |= (byte)BoxShape.FLAG;
                     }
-                    // shortcut: map colors approximate texture reflectance; replace with atlas sampling for higher-fidelity GI.
-                    int color = state.getMapColor(level, cursor).col;
-                    slot.albedo[index * 3] = (byte)(color >> 16);
-                    slot.albedo[index * 3 + 1] = (byte)(color >> 8);
-                    slot.albedo[index * 3 + 2] = (byte)color;
+                    if (material == 1 || material == 2) {
+                        int color = reflectance.resolve(state, level, cursor);
+                        slot.albedo[index * 3] = (byte)(color >> 16);
+                        slot.albedo[index * 3 + 1] = (byte)(color >> 8);
+                        slot.albedo[index * 3 + 2] = (byte)color;
+                    }
                 }
             }
         }

@@ -36,6 +36,7 @@ public final class RayvoxEngine {
     private static GpuVoxelCache gpuCache;
     private static int debugMode;
     private static LightingHistory history;
+    private static WorldLightingState worldLighting;
     private static GpuTimer timer;
     private static boolean frozen, profiling;
     private static List<LightSourceManager.Light> dynamic = List.of();
@@ -44,7 +45,22 @@ public final class RayvoxEngine {
     private static long sourceRevision, historyRevision;
     private static long updateNanos;
     private static DirectionalLight sun = DirectionalLight.OFF;
-    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int drawDistance, int sunDistance, int view, boolean materials, boolean indirect, int softness, boolean entities) {}
+    private static LightingRenderPipeline lightingPipeline;
+    private static SunlightVolume sunlightVolume;
+    private static boolean volumeFailed;
+    private static boolean passFailed, deferredActive;
+    // Span: AFTER_SKY (before uploads) to the end of opaque terrain and the deferred pass. Includes vanilla terrain draws.
+    private static GpuTimer spanTimer, passTimer, indirectTimer;
+    private static int spanSamples;
+    private static long lastFrameNanos;
+    private static final java.lang.management.ThreadMXBean cpuClock = java.lang.management.ManagementFactory.getThreadMXBean();
+    private static long lastCpuNanos;
+    private static double cpuWorkMs = Double.NaN;
+    private static final PerformanceGovernor governor = new PerformanceGovernor();
+    // Effective per-frame settings: user configuration capped by the governor's current level.
+    private static int effSoftness = 2, effDrawDistance = 32, effLightsPerCell = 4, effSunDistance = 48, effRefresh = 1, effIndirectInterval = 1;
+    private static boolean effIndirect;
+    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int drawDistance, int sunDistance, int view, boolean materials, boolean indirect, int softness, boolean entities, int indirectSky) {}
 
     private RayvoxEngine() {}
 
@@ -58,6 +74,10 @@ public final class RayvoxEngine {
         dynamic = List.of();
         entityCasters = List.of();
         terrain = null;
+        lightingPipeline = null;
+        sunlightVolume = null;
+        volumeFailed = false;
+        passFailed = false;
         java.util.Arrays.fill(terrainVariants, null);
         var caps = GL.getCapabilities();
         gpu = GL11.glGetString(GL11.GL_RENDERER) + " / OpenGL " + GL11.glGetString(GL11.GL_VERSION);
@@ -112,6 +132,26 @@ public final class RayvoxEngine {
             for (var candidate : candidates) if (candidate != null) candidate.close();
             status = "Vanilla fallback: shader failed; see latest.log";
             LOGGER.error(status, failure);
+            return;
+        }
+        // GameRenderer owns the pipeline and all its stages through the registered composition shader.
+        LightingRenderPipeline pipeline = null;
+        try {
+            pipeline = new LightingRenderPipeline(event.getResourceProvider());
+            event.registerShader(pipeline, loaded -> lightingPipeline = (LightingRenderPipeline)loaded);
+        } catch (Exception failure) {
+            if (pipeline != null) pipeline.close();
+            passFailed = true;
+            LOGGER.error("Rayvox deferred lighting pipeline unavailable; legacy pipeline remains active", failure);
+        }
+        SunlightVolume volume = null;
+        try {
+            volume = new SunlightVolume(event.getResourceProvider());
+            event.registerShader(volume, loaded -> sunlightVolume = (SunlightVolume)loaded);
+        } catch (Exception failure) {
+            if (volume != null) volume.close();
+            volumeFailed = true;
+            LOGGER.error("Rayvox godray shaders unavailable; surface lighting remains active", failure);
         }
     }
 
@@ -139,7 +179,7 @@ public final class RayvoxEngine {
         int radius = Rayvox.CACHE_RADIUS.get();
         if (Rayvox.SHADOWS.get())
             radius = Math.max(radius, (Rayvox.SHADOW_DRAW_DISTANCE.get() + 15) / 16);
-        if (Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight())
+        if (Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && normalSky())
             radius = Math.max(radius, (Rayvox.SUN_SHADOW_DISTANCE.get() + 15) / 16);
         if (worldCache == null || worldCache.grid.radius != radius) {
             frozen = false;
@@ -166,17 +206,29 @@ public final class RayvoxEngine {
 
     public static void renderStage(RenderLevelStageEvent event) {
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_LEVEL && worldCache != null && Rayvox.ENABLED.get()) {
+            renderSunlightVolume(event);
             LightDebugView.render(event, lights, worldCache.grid, debugMode);
+        }
+        if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) {
+            finishOpaqueTerrain(event);
+            return;
         }
         if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_SKY || worldCache == null) return;
         try {
             long start = System.nanoTime();
+            boolean timing = profiling || Rayvox.GOVERNOR_TARGET.get() > 0;
+            if (timing && spanTimer == null && (GL.getCapabilities().OpenGL33 || GL.getCapabilities().GL_ARB_timer_query)) {
+                spanTimer = new GpuTimer(); passTimer = new GpuTimer(); indirectTimer = new GpuTimer(); spanSamples = 0;
+            }
+            if (!timing && spanTimer != null) closeSpanTimers();
+            if (spanTimer != null) spanTimer.begin();
+            resolveQuality(start);
             if (gpuCache == null) gpuCache = new GpuVoxelCache(worldCache.grid.width);
             if (!frozen) gpuCache.upload(worldCache.grid, Rayvox.UPLOAD_BUDGET.get());
             if (gpuLights == null) { gpuLights = new GpuLightCache(worldCache.grid.slots.length); lights.invalidate(); }
             var camera = event.getCamera().getPosition();
             if (!frozen && lights.rebuild(worldCache.grid, (int)Math.floor(camera.x), (int)Math.floor(camera.y),
-                    (int)Math.floor(camera.z), Rayvox.ACTIVE_LIGHTS.get(), Rayvox.LIGHTS_PER_SECTION.get(),
+                    (int)Math.floor(camera.z), Rayvox.ACTIVE_LIGHTS.get(), effLightsPerCell,
                     level.getMinSection(), level.getMaxSection())) { gpuLights.upload(lights); sourceRevision++; }
             if (!frozen) dynamic = Rayvox.DYNAMIC.get() ? DynamicLights.collect(level, camera,
                     event.getPartialTick().getGameTimeDeltaPartialTick(false), colors) : List.of();
@@ -186,20 +238,29 @@ public final class RayvoxEngine {
                         : List.<net.minecraft.world.phys.AABB>of();
                 if (!entityCasters.equals(nextCasters)) { entityCasters = nextCasters; historyRevision++; }
             }
-            if (!frozen) sun = Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight()
+            if (!frozen) sun = Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && normalSky()
                     ? DirectionalLight.at(level.getSunAngle(event.getPartialTick().getGameTimeDeltaPartialTick(false)),
                             level.getMoonBrightness(), level.getRainLevel(1), true) : DirectionalLight.OFF;
+            if (worldLighting == null) worldLighting = new WorldLightingState();
+            if (!frozen) worldLighting.update(worldCache.grid, distant.revision, lights, dynamic, sun, entityCasters);
             // shortcut: any scene edit invalidates all history; use regional keys if profiling justifies their complexity.
             var stamp = new HistoryStamp(worldCache.grid.snapshotRevision, sourceRevision, distant.revision,
-                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), Rayvox.SHADOW_DRAW_DISTANCE.get(), Rayvox.SUN_SHADOW_DISTANCE.get(), debugMode, Rayvox.MATERIALS.get(), Rayvox.INDIRECT.get(), Rayvox.SHADOW_SOFTNESS.get(), Rayvox.ENTITY_SHADOWS.get());
+                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), effDrawDistance, effSunDistance, debugMode, Rayvox.MATERIALS.get(), effIndirect, effSoftness, Rayvox.ENTITY_SHADOWS.get(), effIndirect ? sun.epoch() : 0);
             if (!stamp.equals(historyStamp)) { historyStamp = stamp; historyRevision++; }
-            if (Rayvox.HISTORY.get() && (debugMode == 0 || debugMode == 5 || debugMode == 6 || debugMode == 7)) {
+            boolean historyView = debugMode == 0 || debugMode == 5 || debugMode == 6 || debugMode == 7;
+            deferredActive = Rayvox.PIPELINE.get() == LightingPipeline.DEFERRED && lightingPipeline != null && !passFailed
+                    && Rayvox.HISTORY.get() && historyView
+                    // shortcut: the pass stores scalar sky visibility; retain RGB glass transmission via legacy until it has RGB storage.
+                    && !(Rayvox.MATERIALS.get() && sun.strength() > 0);
+            if (Rayvox.HISTORY.get() && historyView) {
                 if (history == null) history = new LightingHistory();
                 var target = Minecraft.getInstance().getMainRenderTarget();
-                history.camera(camera.x, camera.y, camera.z, sun.strength() > 0);
+                history.camera(camera.x, camera.y, camera.z, sun.strength() > 0,
+                        event.getModelViewMatrix(), event.getProjectionMatrix());
                 if (org.lwjgl.opengl.GL30.glGetInteger(org.lwjgl.opengl.GL30.GL_DRAW_FRAMEBUFFER_BINDING) == target.frameBufferId)
-                    history.begin(target.width, target.height, historyRevision, sun.epoch(), Rayvox.INDIRECT.get());
+                    history.begin(target.width, target.height, historyRevision, sun.epoch(), effIndirect, deferredActive);
                 else history.invalidate();
+                deferredActive &= history.deferredAvailable();
             } else if (history != null) { history.close(); history = null; }
             if (profiling && timer == null && (GL.getCapabilities().OpenGL33 || GL.getCapabilities().GL_ARB_timer_query)) timer = new GpuTimer();
             if (!profiling && timer != null) { timer.close(); timer = null; }
@@ -216,23 +277,117 @@ public final class RayvoxEngine {
         if (frozen) return;
         if (changedLevel == level) distant.changed(Math.floorDiv(x, 16), Math.floorDiv(z, 16), level.getMinSection(), false);
         if (changedLevel == level && worldCache != null) worldCache.grid.blockChanged(x, y, z);
+        if (changedLevel == level && worldLighting != null) {
+            var slot = worldCache == null ? null : worldCache.grid.get(Math.floorDiv(x, 16), Math.floorDiv(y, 16), Math.floorDiv(z, 16));
+            if (slot == null || !slot.uploaded) worldLighting.geometryUnavailable();
+        }
     }
 
     public static void columnChanged(ClientLevel changedLevel, int x, int z, boolean unload) {
         if (frozen) return;
         if (changedLevel == level) distant.changed(x, z, level.getMinSection(), unload);
         if (changedLevel == level && worldCache != null) worldCache.columnChanged(x, z, unload);
+        if (changedLevel == level && worldLighting != null) worldLighting.geometryUnavailable();
+    }
+
+    /** Stage B after opaque terrain: trace new/stale deferred pixels, then close the GPU span measurement. */
+    private static void finishOpaqueTerrain(RenderLevelStageEvent event) {
+        try {
+            if (deferredActive && history != null && lightingPipeline != null && worldCache != null && gpuCache != null
+                    && gpuLights != null && history.passReady()) {
+                lightingPipeline.renderFrame(history, lightingFrame(event), passTimer, indirectTimer);
+            }
+        } catch (RuntimeException failure) {
+            passFailed = true;
+            deferredActive = false;
+            if (history != null) history.invalidate();
+            LOGGER.error("Rayvox deferred lighting pass failed; reverting to the legacy pipeline", failure);
+        }
+        if (spanTimer != null) spanTimer.end();
+    }
+
+    private static boolean normalSky() {
+        return level != null && level.effects().skyType() == net.minecraft.client.renderer.DimensionSpecialEffects.SkyType.NORMAL;
+    }
+
+    private static LightingPass.Frame lightingFrame(RenderLevelStageEvent event) {
+        var camera = event.getCamera().getPosition();
+        return new LightingPass.Frame(worldCache.grid, gpuCache, gpuLights, lights.budgetBoundary,
+                camera.x, camera.y, camera.z, sun, materials, entityCasters, Rayvox.SHADOWS.get(),
+                Rayvox.SHADOW_DISTANCE.get(), effDrawDistance, effSunDistance, effSoftness, effRefresh, effIndirectInterval,
+                dynamic, effIndirect, debugMode, RenderSystem.getShaderFogColor());
+    }
+
+    private static void renderSunlightVolume(RenderLevelStageEvent event) {
+        if (sunlightVolume == null) return;
+        if (volumeFailed || !Rayvox.GODRAYS.get() || !Rayvox.SUNLIGHT.get() || !Rayvox.SHADOWS.get()
+                || sun.strength() <= 0 || debugMode != 0 || gpuCache == null || !normalSky()
+                || event.getCamera().getFluidInCamera() != net.minecraft.world.level.material.FogType.NONE
+                || RenderSystem.getShaderFogEnd() <= 4) {
+            sunlightVolume.releaseTargets();
+            return;
+        }
+        try {
+            sunlightVolume.render(Minecraft.getInstance().getMainRenderTarget(), lightingFrame(event),
+                    event.getModelViewMatrix(), event.getProjectionMatrix(), level.getRainLevel(1), 8 + governor.level() * 2);
+        } catch (RuntimeException failure) {
+            volumeFailed = true;
+            sunlightVolume.releaseTargets();
+            LOGGER.error("Rayvox godray pass failed; surface lighting remains active", failure);
+        }
+    }
+
+    private static void resolveQuality(long now) {
+        governor.configure(Rayvox.GOVERNOR_TARGET.get(), Rayvox.GOVERNOR_MIN.get(), Rayvox.GOVERNOR_MAX.get());
+        double frameMs = lastFrameNanos == 0 ? Double.NaN : (now - lastFrameNanos) / 1_000_000.0;
+        lastFrameNanos = now;
+        long cpuNanos = (profiling || Rayvox.GOVERNOR_TARGET.get() > 0) && cpuClock.isCurrentThreadCpuTimeSupported()
+                ? cpuClock.getCurrentThreadCpuTime() : 0;
+        cpuWorkMs = cpuNanos > 0 && lastCpuNanos > 0 ? (cpuNanos - lastCpuNanos) / 1_000_000.0 : Double.NaN;
+        lastCpuNanos = Math.max(0, cpuNanos);
+        double gpuMs = Double.NaN;
+        if (spanTimer != null && spanTimer.samples() != spanSamples) {
+            spanSamples = spanTimer.samples();
+            gpuMs = spanTimer.millis() + (sunlightVolume == null ? 0 : sunlightVolume.millis());
+        }
+        var cap = PerformanceGovernor.limits(frozen ? governor.level() : governor.update(now, frameMs, gpuMs, cpuWorkMs));
+        effSoftness = Math.min(Rayvox.SHADOW_SOFTNESS.get(), cap.shadowSoftness());
+        effDrawDistance = Math.max(16, Math.min(Rayvox.SHADOW_DRAW_DISTANCE.get(), cap.shadowDrawDistance()));
+        effLightsPerCell = Math.max(1, Math.min(Rayvox.LIGHTS_PER_SECTION.get(), cap.lightsPerCell()));
+        effSunDistance = Math.max(16, Math.min(Rayvox.SUN_SHADOW_DISTANCE.get(), cap.sunShadowDistance()));
+        effRefresh = Math.max(Rayvox.REFRESH_INTERVAL.get(), cap.refreshInterval());
+        effIndirect = Rayvox.INDIRECT.get() && cap.indirect();
+        effIndirectInterval = Math.max(Rayvox.INDIRECT_INTERVAL.get(), cap.indirectInterval());
+    }
+
+    private static void closeSpanTimers() {
+        if (spanTimer != null) { spanTimer.close(); spanTimer = null; }
+        if (passTimer != null) { passTimer.close(); passTimer = null; }
+        if (indirectTimer != null) { indirectTimer.close(); indirectTimer = null; }
+        spanSamples = 0;
     }
 
     private static void closeGpuCache() {
+        if (sunlightVolume != null) sunlightVolume.releaseTargets();
+        closeWorldLighting();
         if (history != null) { history.close(); history = null; }
         if (timer != null) { timer.close(); timer = null; }
+        closeSpanTimers();
+        governor.reset();
+        lastFrameNanos = 0;
+        lastCpuNanos = 0;
+        cpuWorkMs = Double.NaN;
+        deferredActive = false;
         historyStamp = null;
         if (gpuLights != null) { gpuLights.close(); gpuLights = null; }
         if (gpuCache != null) {
             gpuCache.close();
             gpuCache = null;
         }
+    }
+
+    private static void closeWorldLighting() {
+        if (worldLighting != null) { worldLighting.close(); worldLighting = null; }
     }
 
     public static void close() {
@@ -281,15 +436,15 @@ public final class RayvoxEngine {
         updateLevel(Minecraft.getInstance().level);
         if (terrain == null || level == null || !Rayvox.ENABLED.get() || gpuCache == null || gpuLights == null || worldCache == null) return vanilla;
         if (layer != RenderType.solid() && layer != RenderType.cutout() && layer != RenderType.cutoutMipped()) return vanilla;
-        int variant = (Rayvox.MATERIALS.get() ? 1 : 0) | (sun.strength() > 0 ? 2 : 0) | (Rayvox.INDIRECT.get() ? 4 : 0);
+        int variant = (Rayvox.MATERIALS.get() ? 1 : 0) | (sun.strength() > 0 ? 2 : 0) | (effIndirect ? 4 : 0);
         var shader = terrainVariants[variant];
         if (shader == null) return vanilla;
         shader.getUniform("ShadowsEnabled").set(Rayvox.SHADOWS.get() ? 1 : 0);
         shader.getUniform("ShadowDistance").set((float)Rayvox.SHADOW_DISTANCE.get());
-        shader.getUniform("ShadowDrawDistance").set((float)Rayvox.SHADOW_DRAW_DISTANCE.get());
+        shader.getUniform("ShadowDrawDistance").set((float)effDrawDistance);
         shader.budgetBoundary = lights.budgetBoundary;
         var sunDistance = shader.getUniform("SunShadowDistance");
-        if (sunDistance != null) sunDistance.set((float)Rayvox.SUN_SHADOW_DISTANCE.get());
+        if (sunDistance != null) sunDistance.set((float)effSunDistance);
         shader.getUniform("AlphaCutoff").set(layer == RenderType.cutout() ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
         shader.getUniform("DebugMode").set(debugMode);
         var grid = worldCache.grid;
@@ -320,12 +475,50 @@ public final class RayvoxEngine {
             for (var slot : worldCache.grid.slots) worldCache.grid.markDirty(slot.x, slot.y, slot.z);
             distant = new DistantLightCache();
             lights.invalidate();
+            closeWorldLighting();
         }
         if (history != null) history.invalidate();
     }
     public static boolean profiling() { return profiling; }
     public static void toggleProfiling() { profiling = !profiling; }
     public static String historyStats() { return history == null ? "Lighting history OFF" : history.status; }
+    static int shadowSoftness() { return effSoftness; }
+    static boolean indirectActive() { return effIndirect; }
+    public static boolean deferredActive() { return deferredActive; }
+    public static long godrayDraws() { return sunlightVolume == null ? 0 : sunlightVolume.draws; }
+    public static double godrayMillis() { return sunlightVolume == null ? 0 : sunlightVolume.millis(); }
+    public static String pipelineStats() {
+        String mode = Rayvox.PIPELINE.get() == LightingPipeline.LEGACY ? "LEGACY (inline terrain tracing)"
+                : deferredActive ? "DEFERRED (same-frame composition; static refresh 1/" + effRefresh + ")"
+                : "DEFERRED requested, inactive: " + (passFailed || lightingPipeline == null ? "pass unavailable"
+                        : !Rayvox.HISTORY.get() ? "requires lighting history"
+                        : Rayvox.MATERIALS.get() && sun.strength() > 0 ? "RGB directional transmission uses legacy"
+                        : "diagnostic view or history unavailable");
+        return "Pipeline: " + mode + "; preset " + Rayvox.PRESET.get();
+    }
+    public static String governorStats() {
+        return governor.status() + String.format(java.util.Locale.ROOT, "; effective softness %d, shadow draw %d, sky %d, lights/cell %d, GI %s (cadence %d)",
+                effSoftness, effDrawDistance, effSunDistance, effLightsPerCell, effIndirect ? "on" : "off", effIndirectInterval);
+    }
+    public static String spanStats() {
+        if (spanTimer == null) return "Lighting span GPU timing OFF (enable profiler or governor)";
+        return String.format(java.util.Locale.ROOT, "GPU span sky→opaque terrain %.3f ms (incl. vanilla draws); deferred pass %s; indirect pass %s",
+                spanTimer.millis(), passTimer == null || passTimer.samples() == 0 ? "n/a"
+                        : String.format(java.util.Locale.ROOT, "%.3f ms", passTimer.millis()),
+                indirectTimer == null || indirectTimer.samples() == 0 ? "n/a"
+                        : String.format(java.util.Locale.ROOT, "%.3f ms", indirectTimer.millis()));
+    }
+    public static double spanMillis() { return spanTimer == null || spanTimer.samples() == 0 ? Double.NaN : spanTimer.millis(); }
+    public static double passMillis() { return passTimer == null || passTimer.samples() == 0 ? Double.NaN : passTimer.millis(); }
+    public static int governorLevel() { return governor.level(); }
+    public static double cpuWorkMillis() { return cpuWorkMs; }
+    public static long lightingPassDraws() { return lightingPipeline == null ? 0 : lightingPipeline.direct.draws; }
+    public static long indirectPassDraws() { return lightingPipeline == null ? 0 : lightingPipeline.indirect.draws; }
+    public static long compositionPassDraws() { return lightingPipeline == null ? 0 : lightingPipeline.draws; }
+    public static long dynamicPassDraws() { return lightingPipeline == null ? 0 : lightingPipeline.dynamic.draws; }
+    public static int dynamicLightCount() { return dynamic.size(); }
+    public static double indirectPassMillis() { return indirectTimer == null || indirectTimer.samples() == 0 ? Double.NaN : indirectTimer.millis(); }
+    public static String worldLightingStats() { return worldLighting == null ? "World lighting bookkeeping inactive" : worldLighting.status(); }
     public static String timingStats() { return (timer == null ? "GPU profiler OFF / unsupported" : timer.status())
             + String.format(java.util.Locale.ROOT, "; CPU frame update %.3f ms; last list build %.3f ms", updateNanos / 1_000_000.0, lights.buildNanos / 1_000_000.0); }
     public static String dynamicStats() { return "Moving held lights: " + dynamic.size() + "/4; lighting " + (frozen ? "FROZEN (world simulation continues)" : "live"); }

@@ -1,0 +1,6 @@
+{
+  "vertex": "rayvox:lighting_pass",
+  "fragment": "rayvox:dynamic_pass",
+  "samplers": [],
+  "uniforms": []
+}
