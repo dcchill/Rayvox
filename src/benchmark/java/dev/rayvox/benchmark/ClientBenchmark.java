@@ -42,13 +42,16 @@ import static org.lwjgl.opengl.GL33C.*;
 public final class ClientBenchmark {
     private static ClientBenchmark instance;
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
+    private static final boolean ENTITIES = SCENE.equals("entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
     private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS;
     private static final boolean DIRECTIONAL_MATERIALS = !SCENE.equals("directional-basic");
-    private static final String WORLD = DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
+    private static final String WORLD = ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
-    private final List<Phase> phases = DIRECTIONAL ? List.of(
+    private final List<Phase> phases = ENTITIES ? List.of(
+            new Phase("entity-sharp", true, false, false, false, 12, 6),
+            new Phase("entity-soft", true, false, false, false, 8, 6)) : DIRECTIONAL ? List.of(
             new Phase("sun-static", true, DIRECTIONAL_MATERIALS, false, false, 20, 6, 64, 8, 0),
             new Phase("sun-moving", true, DIRECTIONAL_MATERIALS, false, true, 8, 8, 64, 8, 0),
             new Phase("moon-static", true, DIRECTIONAL_MATERIALS, false, false, 8, 6, 64, 8, 0),
@@ -64,8 +67,9 @@ public final class ClientBenchmark {
     private final int[] queries = new int[128], queryPhase = new int[64];
     private final boolean[] pending = new boolean[64];
     private int phase = -1, framePhase = -1, activeQuery = -1, nextQuery, ticks, phaseTick;
-    private long phaseStart, lastFrame, renderStart;
+    private long phaseStart, measuredStart, lastFrame, renderStart;
     private boolean opening, preparing, finished, timers;
+    private int shadowEntityId;
     private CompletableFuture<Void> setup;
     private final List<Map<String, Object>> reports = new ArrayList<>();
 
@@ -112,6 +116,18 @@ public final class ClientBenchmark {
                 setup = CompletableFuture.runAsync(() -> {
                     if (DIRECTIONAL) prepareDirectional(server.overworld());
                     else prepareWorld(server.overworld());
+                    if (ENTITIES) {
+                        var world = server.overworld();
+                        var area = new net.minecraft.world.phys.AABB(-16, 64, -16, 16, 76, 16);
+                        world.getEntitiesOfClass(net.minecraft.world.entity.npc.Villager.class, area)
+                                .forEach(net.minecraft.world.entity.Entity::discard);
+                        var villager = net.minecraft.world.entity.EntityType.VILLAGER.create(world);
+                        if (villager == null) throw new IllegalStateException("Cannot create shadow test entity");
+                        villager.setNoAi(true);
+                        villager.moveTo(-4, 65, 5, 180, 0);
+                        world.addFreshEntity(villager);
+                        shadowEntityId = villager.getId();
+                    }
                     var player = server.getPlayerList().getPlayer(mc.player.getUUID());
                     if (player == null) throw new IllegalStateException("Integrated server player missing");
                     player.setGameMode(GameType.SPECTATOR);
@@ -131,6 +147,14 @@ public final class ClientBenchmark {
             double x = .5 + (current.moving ? Math.sin((ticks - phaseTick) * .035) * (DIRECTIONAL ? 24 : 6) : 0);
             mc.player.setPos(x, DIRECTIONAL ? 68 : 66, DIRECTIONAL ? 28 : 13.5);
             mc.player.setYRot(180); mc.player.setXRot(DIRECTIONAL ? 25 : 12);
+            if (ENTITIES) {
+                double entityX = -4 + Math.sin(ticks * 0.08) * 2;
+                var server = mc.getSingleplayerServer();
+                server.execute(() -> {
+                    var entity = server.overworld().getEntity(shadowEntityId);
+                    if (entity != null) entity.setPos(entityX, 65, 5);
+                });
+            }
         } catch (Throwable error) { fail(error); }
     }
 
@@ -190,10 +214,14 @@ public final class ClientBenchmark {
     }
 
     private void beginPhase(int index) {
-        phase = index; phaseTick = ticks; phaseStart = System.nanoTime();
+        phase = index; phaseTick = ticks; phaseStart = System.nanoTime(); measuredStart = 0;
         var config = phases.get(index);
         Rayvox.ENABLED.set(config.enabled); Rayvox.MATERIALS.set(config.materials); Rayvox.INDIRECT.set(config.indirect);
         Rayvox.HISTORY.set(true); Rayvox.SHADOWS.set(true); Rayvox.SUNLIGHT.set(DIRECTIONAL); Rayvox.DYNAMIC.set(false);
+        if (ENTITIES) {
+            Rayvox.ENTITY_SHADOWS.set(true);
+            Rayvox.SHADOW_SOFTNESS.set(config.name.equals("entity-sharp") ? 0 : 2);
+        }
         Rayvox.CACHE_RADIUS.set(2); Rayvox.ACTIVE_LIGHTS.set(config.limit); Rayvox.LIGHTS_PER_SECTION.set(config.perTile);
         if (DIRECTIONAL) {
             var server = Minecraft.getInstance().getSingleplayerServer();
@@ -246,6 +274,7 @@ public final class ClientBenchmark {
         if (finished || phase < 0) return;
         poll();
         if (System.nanoTime() - phaseStart < phases.get(phase).warm * 1_000_000_000L) return;
+        if (measuredStart == 0) measuredStart = System.nanoTime();
         framePhase = phase; renderStart = System.nanoTime();
         if (timers && !pending[nextQuery]) {
             activeQuery = nextQuery; nextQuery = (nextQuery + 1) % pending.length;
@@ -269,10 +298,13 @@ public final class ClientBenchmark {
             if (!finished && phase >= 0) {
                 if (framePhase == phase && lastFrame != 0) phases.get(phase).wall.add(now - lastFrame);
                 var current = phases.get(phase);
-                if (now - phaseStart >= (current.warm + current.seconds) * 1_000_000_000L) {
+                // Driver compilation can consume the warmup frame; measure a full window afterwards.
+                if (measuredStart != 0 && now - measuredStart >= current.seconds * 1_000_000_000L) {
                     var mc = Minecraft.getInstance();
                     if (current.enabled && (RayvoxEngine.lights().active.size() != current.expectedLights || !RayvoxEngine.status().equals("Terrain shader ready")))
                         throw new IllegalStateException("Rayvox did not activate: " + RayvoxEngine.status() + "; " + RayvoxEngine.lightStats());
+                    if (ENTITIES && RayvoxEngine.entityShadowCount() == 0)
+                        throw new IllegalStateException("Moving entity was not published to the terrain shader");
                     int error = glGetError();
                     if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error in " + current.name + ": " + error);
                     Path screenshot = mc.gameDirectory.toPath().resolve(current.name + ".png");
@@ -280,6 +312,7 @@ public final class ClientBenchmark {
                     var report = new LinkedHashMap<String, Object>();
                     report.put("phase", current.name); report.put("engine", RayvoxEngine.status());
                     report.put("activeLightLimit", current.limit); report.put("lightsPerTile", current.perTile);
+                    if (ENTITIES) report.put("entityCasters", RayvoxEngine.entityShadowCount());
                     report.put("cache", RayvoxEngine.cacheStats()); report.put("lights", RayvoxEngine.lightStats());
                     report.put("history", RayvoxEngine.historyStats()); report.put("screenshot", screenshot.toAbsolutePath().toString());
                     reports.add(report);
@@ -316,7 +349,7 @@ public final class ClientBenchmark {
         result.put("success", true); result.put("gpu", RayvoxEngine.gpu());
         result.put("width", mc.getMainRenderTarget().width); result.put("height", mc.getMainRenderTarget().height);
         result.put("renderDistance", mc.options.renderDistance().get()); result.put("phases", reports);
-        result.put("scene", DIRECTIONAL_GLASS ? "directional-glass-v1"
+        result.put("scene", ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
                 : DIRECTIONAL ? (DIRECTIONAL_MATERIALS ? "directional-v1" : "directional-basic-v1") : "fixed-room-v3"); result.put("seed", 42);
         result.put("hidden", GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) == GLFW.GLFW_FALSE);
         result.put("createdAt", java.time.Instant.now().toString());

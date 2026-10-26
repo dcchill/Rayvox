@@ -39,11 +39,12 @@ public final class RayvoxEngine {
     private static GpuTimer timer;
     private static boolean frozen, profiling;
     private static List<LightSourceManager.Light> dynamic = List.of();
+    private static List<net.minecraft.world.phys.AABB> entityCasters = List.of();
     private static HistoryStamp historyStamp;
     private static long sourceRevision, historyRevision;
     private static long updateNanos;
     private static DirectionalLight sun = DirectionalLight.OFF;
-    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int sunDistance, int view, boolean materials, boolean indirect) {}
+    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int drawDistance, int sunDistance, int view, boolean materials, boolean indirect, int softness, boolean entities) {}
 
     private RayvoxEngine() {}
 
@@ -55,6 +56,7 @@ public final class RayvoxEngine {
         distant = new DistantLightCache();
         frozen = false;
         dynamic = List.of();
+        entityCasters = List.of();
         terrain = null;
         java.util.Arrays.fill(terrainVariants, null);
         var caps = GL.getCapabilities();
@@ -87,7 +89,7 @@ public final class RayvoxEngine {
                 if (GL20.glGetProgrami(candidate.getId(), GL20.GL_LINK_STATUS) == GL11.GL_FALSE)
                     throw new IllegalStateException(GL20.glGetProgramInfoLog(candidate.getId()));
                 for (String uniform : new String[]{"ModelViewMat", "ProjMat", "ChunkOffset", "ColorModulator",
-                    "FogStart", "FogEnd", "FogColor", "FogShape", "ShadowsEnabled", "ShadowDistance", "AlphaCutoff",
+                    "FogStart", "FogEnd", "FogColor", "FogShape", "ShadowsEnabled", "ShadowDistance", "ShadowDrawDistance", "AlphaCutoff",
                     "DebugMode", "CacheWidth", "CacheMinSlot", "CameraInCache", "CameraFraction"}) {
                     if (candidate.getUniform(uniform) == null) throw new IllegalStateException("Missing uniform " + uniform);
                 }
@@ -122,6 +124,7 @@ public final class RayvoxEngine {
             worldCache = null;
             frozen = false;
             dynamic = List.of();
+            entityCasters = List.of();
             closeGpuCache();
         }
     }
@@ -134,6 +137,8 @@ public final class RayvoxEngine {
             return;
         }
         int radius = Rayvox.CACHE_RADIUS.get();
+        if (Rayvox.SHADOWS.get())
+            radius = Math.max(radius, (Rayvox.SHADOW_DRAW_DISTANCE.get() + 15) / 16);
         if (Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight())
             radius = Math.max(radius, (Rayvox.SUN_SHADOW_DISTANCE.get() + 15) / 16);
         if (worldCache == null || worldCache.grid.radius != radius) {
@@ -175,12 +180,18 @@ public final class RayvoxEngine {
                     level.getMinSection(), level.getMaxSection())) { gpuLights.upload(lights); sourceRevision++; }
             if (!frozen) dynamic = Rayvox.DYNAMIC.get() ? DynamicLights.collect(level, camera,
                     event.getPartialTick().getGameTimeDeltaPartialTick(false), colors) : List.of();
+            if (!frozen) {
+                var nextCasters = Rayvox.SHADOWS.get() && Rayvox.ENTITY_SHADOWS.get()
+                        ? EntityShadows.collect(level, camera, event.getPartialTick().getGameTimeDeltaPartialTick(false))
+                        : List.<net.minecraft.world.phys.AABB>of();
+                if (!entityCasters.equals(nextCasters)) { entityCasters = nextCasters; historyRevision++; }
+            }
             if (!frozen) sun = Rayvox.SUNLIGHT.get() && Rayvox.SHADOWS.get() && level.dimensionType().hasSkyLight()
                     ? DirectionalLight.at(level.getSunAngle(event.getPartialTick().getGameTimeDeltaPartialTick(false)),
                             level.getMoonBrightness(), level.getRainLevel(1), true) : DirectionalLight.OFF;
             // shortcut: any scene edit invalidates all history; use regional keys if profiling justifies their complexity.
             var stamp = new HistoryStamp(worldCache.grid.snapshotRevision, sourceRevision, distant.revision,
-                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), Rayvox.SUN_SHADOW_DISTANCE.get(), debugMode, Rayvox.MATERIALS.get(), Rayvox.INDIRECT.get());
+                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), Rayvox.SHADOW_DRAW_DISTANCE.get(), Rayvox.SUN_SHADOW_DISTANCE.get(), debugMode, Rayvox.MATERIALS.get(), Rayvox.INDIRECT.get(), Rayvox.SHADOW_SOFTNESS.get(), Rayvox.ENTITY_SHADOWS.get());
             if (!stamp.equals(historyStamp)) { historyStamp = stamp; historyRevision++; }
             if (Rayvox.HISTORY.get() && (debugMode == 0 || debugMode == 5 || debugMode == 6 || debugMode == 7)) {
                 if (history == null) history = new LightingHistory();
@@ -232,6 +243,7 @@ public final class RayvoxEngine {
         distant = new DistantLightCache();
         frozen = false;
         dynamic = List.of();
+        entityCasters = List.of();
     }
 
     public static void sectionLights(int x, int y, int z, double cameraX, double cameraY, double cameraZ) {
@@ -240,7 +252,13 @@ public final class RayvoxEngine {
         if (drawing == null || !drawing.drawing) return;
         int sx = Math.floorDiv(x, 16), sy = Math.floorDiv(y, 16), sz = Math.floorDiv(z, 16);
         boolean ready = distant.ready(sx, sz);
-        drawing.section(ready ? distant.section(sx, sy, sz, lights) : List.of(), lights, ready, cameraX, cameraY, cameraZ);
+        var selected = ready ? distant.section(sx, sy, sz, lights) : List.<LightSourceManager.Light>of();
+        if (ready && !lights.testLights.isEmpty()) {
+            var combined = new java.util.ArrayList<>(selected);
+            combined.addAll(lights.testLights);
+            selected = DistantLightCache.select(combined, x, y, z, lights::definition);
+        }
+        drawing.section(selected, lights, ready, cameraX, cameraY, cameraZ);
     }
 
     public static void toggleTestLights() {
@@ -268,6 +286,8 @@ public final class RayvoxEngine {
         if (shader == null) return vanilla;
         shader.getUniform("ShadowsEnabled").set(Rayvox.SHADOWS.get() ? 1 : 0);
         shader.getUniform("ShadowDistance").set((float)Rayvox.SHADOW_DISTANCE.get());
+        shader.getUniform("ShadowDrawDistance").set((float)Rayvox.SHADOW_DRAW_DISTANCE.get());
+        shader.budgetBoundary = lights.budgetBoundary;
         var sunDistance = shader.getUniform("SunShadowDistance");
         if (sunDistance != null) sunDistance.set((float)Rayvox.SUN_SHADOW_DISTANCE.get());
         shader.getUniform("AlphaCutoff").set(layer == RenderType.cutout() ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
@@ -280,6 +300,7 @@ public final class RayvoxEngine {
         shader.history = history;
         shader.timer = timer;
         shader.dynamic = dynamic;
+        shader.entityCasters = entityCasters;
         shader.sun = sun;
         shader.materials = materials;
         shader.cameraX = cameraX; shader.cameraY = cameraY; shader.cameraZ = cameraZ;
@@ -334,6 +355,7 @@ public final class RayvoxEngine {
     }
 
     public static String status() { return status; }
+    public static int entityShadowCount() { return Math.min(EntityShadows.MAX_CASTERS, entityCasters.size()); }
     public static String gpu() { return gpu; }
     public static boolean computeAvailable() { return compute; }
 }

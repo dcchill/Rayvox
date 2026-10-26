@@ -60,6 +60,8 @@ final class RayvoxDebugScreen extends Screen {
         addRenderableWidget(Button.builder(Component.literal("Advanced materials: " + (Rayvox.MATERIALS.get() ? "ON" : "OFF")), button -> {
             Rayvox.MATERIALS.set(!Rayvox.MATERIALS.get()); Rayvox.MATERIALS.save(); rebuildWidgets();
         }).bounds(right, y + 120, columnWidth, 20).build());
+        addRenderableWidget(Button.builder(Component.literal("Lighting settings..."), button ->
+                minecraft.setScreen(new RayvoxSettingsScreen(this))).bounds(right, y + 144, columnWidth, 20).build());
     }
 
     private Component viewLabel() { return Component.translatable("screen.rayvox.view", RayvoxEngine.debugModeName()); }
@@ -87,8 +89,11 @@ final class RayvoxDebugScreen extends Screen {
                 RayvoxEngine.textureColorStats(),
                 RayvoxEngine.historyStats(), RayvoxEngine.timingStats(), RayvoxEngine.dynamicStats(),
                 "History reuse: green=reused static light, red=recomputed",
-                "Static rays: up to " + Rayvox.LIGHTS_PER_SECTION.get() + "; moving: up to 4; sun: 1; GI: 1 gather + 4 light rays",
-                "DDA: 128 steps/ray; shadow distance " + Rayvox.SHADOW_DISTANCE.get() + "; GI distance 6",
+                "Light samples: static up to " + Rayvox.LIGHTS_PER_SECTION.get() + "; moving up to 4; sun 1; "
+                        + (Rayvox.SHADOW_SOFTNESS.get() > 0 ? "4 rays/sample (soft)" : "1 ray/sample (sharp)"),
+                "Entity shadow volumes: " + RayvoxEngine.entityShadowCount() + "/16 within 32 blocks; rounded body bounds",
+                "DDA: 128 steps/ray; block ray length " + Rayvox.SHADOW_DISTANCE.get() + "; GI distance 6",
+                "Shadow draw distances: block " + Rayvox.SHADOW_DRAW_DISTANCE.get() + "; sky " + Rayvox.SUN_SHADOW_DISTANCE.get() + " blocks",
                 "GI: eight-frame stationary accumulation, static sources only; map-color reflectance",
                 "Occupancy: cyan=opaque, orange=partial, blue=transmissive",
                 "Dirty: green=clean, amber=pending, purple=missing",

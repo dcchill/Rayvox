@@ -17,6 +17,8 @@ uniform sampler2D LightData;
 uniform usampler2D LightLists;
 uniform int ShadowsEnabled;
 uniform float ShadowDistance;
+uniform float ShadowDrawDistance;
+uniform vec4 ShadowBudget;
 uniform float SunShadowDistance;
 uniform int FarLightCount;
 uniform int FarReady;
@@ -48,6 +50,7 @@ in float vertexDistance;
 in vec4 vertexColor;
 in vec4 vanillaLight;
 in vec4 skyLight;
+in vec3 sourceLight;
 in vec2 texCoord0;
 in vec3 surfacePosition;
 in vec3 surfaceNormal;
@@ -93,6 +96,43 @@ vec3 sunColorVisibility(float mean, float key) {
     return clamp(vec3(chroma, max(1.0 - chroma.x - chroma.y, 0.0)) * (3.0 * mean), vec3(0.0), vec3(1.0));
 }
 #endif
+
+#moj_import <rayvox:soft_shadow.glsl>
+
+vec3 blockVisibility(vec3 origin, vec3 target) {
+    vec3 camera = CameraFraction + vec3(CameraInCache);
+    // Both ends must fade before the section-aligned cache can drop a source or its ray.
+    float cameraDistance = max(length(origin - camera), length(target - camera));
+    float fade = 1.0 - smoothstep(ShadowDrawDistance * 0.5, ShadowDrawDistance, cameraDistance);
+    if (fade <= 0.0) return vec3(1.0);
+    vec3 visibility = distance(origin, target) > ShadowDistance ? vec3(0.0) : softTransmission(origin, target);
+    return mix(vec3(1.0), visibility, fade);
+}
+
+vec3 staticVisibility(vec3 origin, vec3 target, int index, bool shadows) {
+    bool matched = false;
+    if (FarReady != 0) {
+        for (int i = 0; i < 8; i++) {
+            if (i >= FarLightCount) break;
+            if (int(FarLightRecords[i * 2 + 1].w) == index + 1) matched = true;
+        }
+    }
+    float sourceDistance = length(target - CameraFraction - vec3(CameraInCache));
+    float weight = 1.0;
+    if (ShadowBudget.w > 0.0) {
+        float boundary = length(ShadowBudget.xyz);
+        weight = 1.0 - smoothstep(max(0.0, boundary - 8.0), boundary, sourceDistance);
+    }
+    if (FarReady != 0 && !matched) {
+        // Extra near sources in dense sections fade before the ring can drop them in a 16-block step.
+        float range = float(CacheWidth / 2) * 16.0;
+        weight *= 1.0 - smoothstep(max(0.0, range - 16.0), range, sourceDistance);
+    }
+    if (weight <= 0.0) return vec3(0.0);
+    vec3 visibility = shadows ? blockVisibility(origin, target) : vec3(1.0);
+    // Ready section lights provide stable RGB; matching near records contribute only the shadow correction.
+    return (FarReady != 0 && matched ? visibility - vec3(1.0) : visibility) * weight;
+}
 
 #moj_import <rayvox:indirect.glsl>
 
@@ -171,15 +211,13 @@ void main() {
             float falloff = max(1.0 - distanceToLight / max(light.w, 0.001), 0.0);
             float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
             if (falloff <= 0.0 || diffuse <= 0.0) continue;
-            vec3 visibility = vec3(1.0);
-            if (ShadowsEnabled != 0 && radiance.w > 0.5) {
-                visibility = distanceToLight > ShadowDistance ? vec3(0.0) : traceTransmission(localPosition + normal * 0.03, light.xyz, false);
-            }
+            vec3 visibility = staticVisibility(localPosition + normal * 0.03, light.xyz, index,
+                    ShadowsEnabled != 0 && radiance.w > 0.5);
             direct += radiance.rgb * (falloff * falloff * diffuse * visibility);
         }
     }
     vec3 farDirect = vec3(0.0);
-    if (!reused && FarReady != 0 && replacement < 1.0) {
+    if (!reused && FarReady != 0) {
         for (int i = 0; i < 8; i++) {
             if (i >= FarLightCount) break;
             vec4 light = FarLightRecords[i * 2];
@@ -190,7 +228,7 @@ void main() {
             float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
             farDirect += FarLightRecords[i * 2 + 1].rgb * (falloff * falloff * diffuse);
         }
-        direct = mix(farDirect, direct, replacement);
+        direct = max(farDirect + direct, vec3(0.0));
     }
     float sunlight = 1.0;
     float sunFade = 0.0;
@@ -209,7 +247,7 @@ void main() {
             }
         } else {
             vec3 origin = localPosition + normal * 0.03;
-            sunTransmission = traceDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
+            sunTransmission = softDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
                     CameraFraction + vec3(CameraInCache), SunShadowDistance);
             sunlight = dot(sunTransmission, vec3(1.0 / 3.0));
             if (AdvancedMaterials != 0 && any(notEqual(sunTransmission, sunTransmission.rrr))) {
@@ -241,8 +279,7 @@ void main() {
         float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
         vec3 visibility = vec3(1.0);
         if (ShadowsEnabled != 0 && radiance.w > 0.5 && falloff * diffuse > 0.0)
-            visibility = distanceToLight > ShadowDistance ? vec3(0.0)
-                    : traceTransmission(localPosition + normal * 0.03, light.xyz + CameraFraction + vec3(CameraInCache), false);
+            visibility = blockVisibility(localPosition + normal * 0.03, light.xyz + CameraFraction + vec3(CameraInCache));
         direct += radiance.rgb * (falloff * falloff * diffuse * visibility);
     }
     if (DebugMode == 6) {
@@ -265,7 +302,8 @@ void main() {
         base *= vec3(1.0) - 0.65 * occlusion * sunFade * SunDirection.w;
     }
 #endif
-    vec3 illumination = max(base, direct) + indirect;
+    // A source's own glow is independent of diffuse normals, occlusion and source-list budgets.
+    vec3 illumination = max(max(base, direct) + indirect, toLinear(sourceLight));
     vec3 lit = toSrgb(clamp(toLinear(albedo.rgb) * illumination, 0.0, 1.0));
     fragColor = linear_fog(vec4(lit, alpha), vertexDistance, FogStart, FogEnd, FogColor);
 }

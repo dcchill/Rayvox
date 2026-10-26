@@ -19,6 +19,7 @@ out float vertexDistance;
 out vec4 vertexColor;
 out vec4 vanillaLight;
 out vec4 skyLight;
+out vec3 sourceLight;
 out vec2 texCoord0;
 out vec3 surfacePosition;
 out vec3 surfaceNormal;
@@ -31,5 +32,7 @@ void main() {
     vertexColor = Color;
     vanillaLight = minecraft_sample_lightmap(Sampler2, UV2);
     skyLight = minecraft_sample_lightmap(Sampler2, ivec2(0, UV2.y));
+    int emission = UV2.x & 15;
+    sourceLight = emission > 0 ? minecraft_sample_lightmap(Sampler2, ivec2(emission * 16, 0)).rgb : vec3(0.0);
     texCoord0 = UV0;
 }

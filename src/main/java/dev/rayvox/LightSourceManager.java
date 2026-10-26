@@ -15,6 +15,8 @@ public final class LightSourceManager {
     public static final int TILE_SIZE = 4;
     public static final int TILES_PER_SECTION = 64;
     public static final int LIST_WIDTH = 9 * TILES_PER_SECTION;
+    private static final Comparator<Light> SOURCE_ORDER = Comparator.comparingDouble(Light::x)
+            .thenComparingDouble(Light::y).thenComparingDouble(Light::z).thenComparing(Light::type);
     public record Light(String type, double x, double y, double z, LightDefinition definition) {
         public double distanceSquared(double px, double py, double pz) {
             return (x - px) * (x - px) + (y - py) * (y - py) + (z - pz) * (z - pz);
@@ -26,6 +28,7 @@ public final class LightSourceManager {
     public List<Light> active = List.of();
     public List<Light> testLights = List.of();
     public Light selected;
+    Light budgetBoundary;
     public int discovered, completeSections, truncatedSections;
     public long buildNanos;
     private final Map<Light, LightDefinition> overrides = new LinkedHashMap<>();
@@ -63,6 +66,15 @@ public final class LightSourceManager {
         eligibleSources = all.size();
         boolean[] included = new boolean[all.size()];
         var selection = selectNearest(all, x, y, z, limit, included);
+        budgetBoundary = null;
+        double boundaryDistance = Double.POSITIVE_INFINITY;
+        for (int i = 0; i < all.size(); i++) {
+            double distance = all.get(i).distanceSquared(x, y, z);
+            if (!included[i] && distance < boundaryDistance) {
+                boundaryDistance = distance;
+                budgetBoundary = all.get(i);
+            }
+        }
         // Camera motion can reorder the same sources. Keep their GPU indices and history stable.
         if (sameInputs && sameSources(active, selection)) return false;
         active = List.copyOf(selection);
@@ -143,7 +155,8 @@ public final class LightSourceManager {
                     relevant++;
                     double score = light.distanceSquared(tx + 2, ty + 2, tz + 2);
                     int position = count;
-                    while (position > 0 && score < distances[position - 1]) position--;
+                    while (position > 0 && (score < distances[position - 1]
+                            || score == distances[position - 1] && SOURCE_ORDER.compare(light, active.get(nearest[position - 1])) < 0)) position--;
                     if (position >= perSection) continue;
                     for (int j = Math.min(count, perSection - 1); j > position; j--) {
                         distances[j] = distances[j - 1];

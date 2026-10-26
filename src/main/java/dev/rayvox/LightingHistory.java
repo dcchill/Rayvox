@@ -29,6 +29,8 @@ final class LightingHistory implements AutoCloseable {
     String status = "Lighting history warming";
 
     void camera(double x, double y, double z, boolean directional) {
+        // Block shadow range and budget fades depend on the camera even when the surface stays in the same pixel.
+        if (cameraKnown && (x != cameraX || y != cameraY || z != cameraZ)) invalidate();
         boolean moving = directional && cameraKnown && (x != cameraX || y != cameraY || z != cameraZ);
         // Sun visibility includes a camera-centered caster fade. Refresh it during motion, then reset
         // both key buffers once on stopping so sparse older surfaces cannot retain a different camera's fade.

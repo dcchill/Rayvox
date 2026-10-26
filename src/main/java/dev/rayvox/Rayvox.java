@@ -25,12 +25,15 @@ public final class Rayvox {
     public static final ModConfigSpec.IntValue LIGHTS_PER_SECTION;
     public static final ModConfigSpec.BooleanValue SHADOWS;
     public static final ModConfigSpec.IntValue SHADOW_DISTANCE;
+    public static final ModConfigSpec.IntValue SHADOW_DRAW_DISTANCE;
     public static final ModConfigSpec.BooleanValue HISTORY;
     public static final ModConfigSpec.BooleanValue DYNAMIC;
     public static final ModConfigSpec.BooleanValue SUNLIGHT;
     public static final ModConfigSpec.IntValue SUN_SHADOW_DISTANCE;
     public static final ModConfigSpec.BooleanValue MATERIALS;
     public static final ModConfigSpec.BooleanValue INDIRECT;
+    public static final ModConfigSpec.BooleanValue ENTITY_SHADOWS;
+    public static final ModConfigSpec.IntValue SHADOW_SOFTNESS;
     public static final KeyMapping DEBUG_KEY = new KeyMapping("key.rayvox.debug", InputConstants.Type.KEYSYM,
             GLFW.GLFW_KEY_F8, "key.categories.rayvox");
 
@@ -43,11 +46,19 @@ public final class Rayvox {
                 .defineInRange("extractSectionsPerTick", 2, 1, 16);
         UPLOAD_BUDGET = builder.comment("Maximum 48 KiB material/albedo/shape section uploads per rendered frame.")
                 .defineInRange("uploadSectionsPerFrame", 4, 1, 16);
-        ACTIVE_LIGHTS = builder.defineInRange("activeLightLimit", 32, 1, LightSourceManager.MAX_LIGHTS);
+        ACTIVE_LIGHTS = builder.comment("Maximum nearby sources receiving detailed shadows; ready sections retain RGB lighting outside this budget.")
+                .defineInRange("activeLightLimit", 32, 1, LightSourceManager.MAX_LIGHTS);
         LIGHTS_PER_SECTION = builder.comment("Maximum point lights/rays per fragment, selected within 4-block cells. Key retained for existing configs.")
                 .defineInRange("lightsPerSection", 4, 1, LightSourceManager.PER_SECTION);
         SHADOWS = builder.define("blockShadows", true);
-        SHADOW_DISTANCE = builder.defineInRange("shadowDistance", 16, 1, 16);
+        ENTITY_SHADOWS = builder.comment("Real-time shadows from up to 16 nearby visible living/solid entities. Uses rounded bounds rather than animated model geometry.")
+                .define("entityShadows", true);
+        SHADOW_SOFTNESS = builder.comment("Shadow edge softness: 0 is sharp; 1..4 use four stable area-light samples. Higher GPU cost than sharp shadows.")
+                .defineInRange("shadowSoftness", 2, 0, 4);
+        SHADOW_DISTANCE = builder.comment("Maximum block-light shadow ray length; independent of camera draw distance.")
+                .defineInRange("shadowDistance", 16, 1, 16);
+        SHADOW_DRAW_DISTANCE = builder.comment("Block shadow draw distance from the camera in blocks. Fades to unshadowed RGB light. Expands the voxel cache while shadows are enabled.")
+                .defineInRange("shadowDrawDistance", 32, 16, 64);
         HISTORY = builder.comment("Reuse matching visible surfaces' static lighting; at most 128 MiB, otherwise bypass.")
                 .define("lightingHistory", true);
         DYNAMIC = builder.comment("Up to four nearby players holding emissive block items; visual only.")

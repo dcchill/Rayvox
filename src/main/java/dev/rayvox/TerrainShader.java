@@ -15,14 +15,18 @@ final class TerrainShader extends ShaderInstance {
     LightingHistory history;
     GpuTimer timer;
     java.util.List<LightSourceManager.Light> dynamic = java.util.List.of();
+    java.util.List<net.minecraft.world.phys.AABB> entityCasters = java.util.List.of();
     double cameraX, cameraY, cameraZ;
     DirectionalLight sun = DirectionalLight.OFF;
+    LightSourceManager.Light budgetBoundary;
     MaterialTable materials;
     private int previousShapes;
     private final float[] moving = new float[32];
     private final SectionLightUniforms sectionUniforms;
-    private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation;
+    private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
     private final int sunLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation;
+    private final int entityCountLocation, entityRecordsLocation, softnessLocation;
+    private final float[] entities = new float[EntityShadows.MAX_CASTERS * 8];
     private final float[] distant = new float[LightSourceManager.PER_SECTION * 8];
     private final int[] locations = new int[4];
     private final int[] previous = new int[4];
@@ -43,6 +47,10 @@ final class TerrainShader extends ShaderInstance {
         dynamicCountLocation = glGetUniformLocation(getId(), "DynamicCount");
         dynamicRecordsLocation = glGetUniformLocation(getId(), "DynamicRecords[0]");
         historyValidLocation = glGetUniformLocation(getId(), "HistoryValid");
+        budgetLocation = glGetUniformLocation(getId(), "ShadowBudget");
+        entityCountLocation = glGetUniformLocation(getId(), "EntityCount");
+        entityRecordsLocation = glGetUniformLocation(getId(), "EntityRecords[0]");
+        softnessLocation = glGetUniformLocation(getId(), "ShadowSoftness");
     }
 
     @Override public void attachToProgram() {
@@ -81,6 +89,27 @@ final class TerrainShader extends ShaderInstance {
             publishedMaterials = materials;
         }
         glUniform4f(sunLocation, sun.x(), sun.y(), sun.z(), sun.strength());
+        glUniform1i(softnessLocation, Rayvox.SHADOW_SOFTNESS.get());
+        int entityCount = Rayvox.ENTITY_SHADOWS.get() ? Math.min(EntityShadows.MAX_CASTERS, entityCasters.size()) : 0;
+        glUniform1i(entityCountLocation, entityCount);
+        var camera = new net.minecraft.world.phys.Vec3(cameraX, cameraY, cameraZ);
+        for (int i = 0; i < entityCount; i++) {
+            var bounds = entityCasters.get(i);
+            var center = bounds.getCenter();
+            int offset = i * 8;
+            entities[offset] = (float)(center.x - cameraX);
+            entities[offset + 1] = (float)(center.y - cameraY);
+            entities[offset + 2] = (float)(center.z - cameraZ);
+            entities[offset + 3] = EntityShadows.weight(bounds, entityCasters, camera);
+            entities[offset + 4] = (float)Math.max(0.025, bounds.getXsize() * 0.5);
+            entities[offset + 5] = (float)Math.max(0.025, bounds.getYsize() * 0.5);
+            entities[offset + 6] = (float)Math.max(0.025, bounds.getZsize() * 0.5);
+            entities[offset + 7] = 0;
+        }
+        if (entityCount > 0) glUniform4fv(entityRecordsLocation, entities);
+        if (budgetBoundary == null) glUniform4f(budgetLocation, 0, 0, 0, 0);
+        else glUniform4f(budgetLocation, (float)(budgetBoundary.x() - cameraX),
+                (float)(budgetBoundary.y() - cameraY), (float)(budgetBoundary.z() - cameraZ), 1);
         glUniform1i(dynamicCountLocation, dynamic.size());
         for (int i = 0; i < dynamic.size(); i++) {
             var source = dynamic.get(i); var def = source.definition(); int offset = i * 8;
@@ -111,7 +140,8 @@ final class TerrainShader extends ShaderInstance {
             distant[offset + 4] = rgb[0];
             distant[offset + 5] = rgb[1];
             distant[offset + 6] = rgb[2];
-            distant[offset + 7] = 0;
+            // Match the stable section light to its optional near-cache shadow record.
+            distant[offset + 7] = manager.active.indexOf(light) + 1;
         }
         sectionUniforms.publish(count, ready, distant);
     }

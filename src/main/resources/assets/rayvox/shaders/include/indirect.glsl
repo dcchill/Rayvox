@@ -19,8 +19,7 @@ vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
         if (falloff * diffuse <= 0.0) continue;
         vec3 visibility = vec3(1.0);
         if (ShadowsEnabled != 0 && radiance.w > 0.5)
-            visibility = distance > ShadowDistance ? vec3(0.0)
-                    : traceTransmission(hit + normal * 0.03, light.xyz, false);
+            visibility = blockVisibility(hit + normal * 0.03, light.xyz);
         result += radiance.rgb * falloff * falloff * diffuse * visibility;
     }
     vec3 reflectance = toLinear(vec3(texelFetch(VoxelData, slot * 16 + cell % 16, 0).gba) / 255.0);
