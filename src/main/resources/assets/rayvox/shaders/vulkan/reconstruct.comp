@@ -11,6 +11,7 @@ layout(std140,set=0,binding=5) uniform Camera {
 layout(rgba16f,set=0,binding=6) uniform image2D historyImage;
 layout(rgba32f,set=0,binding=7) uniform image2D previousGeometry;
 layout(rgba16f,set=0,binding=8) uniform image2D resolvedImage;
+layout(rgba16f,set=0,binding=16) uniform writeonly image2D nextHistoryImage;
 layout(push_constant) uniform Pass { int mode;int stepWidth; } pass;
 float luminance(vec3 c){return dot(c,vec3(.2126,.7152,.0722));}
 vec4 spatialInput(ivec2 p){return pass.mode==2?imageLoad(radianceImage,p):imageLoad(resolvedImage,p);}
@@ -27,7 +28,8 @@ void main() {
                 weight=min(h.a+1,(uint(g.w)&0x00800000u)!=0u?8:64);color=mix(color,h.rgb,(weight-1)/weight);
             }
         }
-        imageStore(resolvedImage,pixel,vec4(color,weight));return;
+        vec4 temporal=vec4(color,weight);
+        imageStore(resolvedImage,pixel,temporal);imageStore(nextHistoryImage,pixel,temporal);return;
     }
     vec4 center=spatialInput(pixel);vec3 sum=vec3(0);float weights=0;
     float localMean=0,secondMoment=0,mean=luminance(center.rgb);

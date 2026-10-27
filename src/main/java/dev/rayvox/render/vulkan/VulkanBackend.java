@@ -19,6 +19,7 @@ public final class VulkanBackend implements RenderBackend {
     private VulkanContext context;
     private final Frame[] frames=new Frame[2];
     private final Map<Scene.Key,GpuMesh> meshes=new LinkedHashMap<>();
+    private final Map<Scene.Key,Scene.Mesh> dynamicSources=new LinkedHashMap<>();
     private final Map<Scene.Key,Scene.Mesh> pending=new LinkedHashMap<>();
     private final Map<Integer,GpuTexture> textures=new LinkedHashMap<>();
     private final ArrayDeque<Integer> freeTextureSlots=new ArrayDeque<>();
@@ -31,13 +32,16 @@ public final class VulkanBackend implements RenderBackend {
     private long textureRevision,imageRevision;
     private ComputeProgram trace,reconstruct,composite,exposureProgram;
     private VulkanContext.Buffer exposure;
-    private VulkanImage radiance,geometry,normals,history,previousGeometry,resolved;
+    private VulkanImage radiance,geometry,normals,history,nextHistory,previousGeometry,resolved;
     private final VulkanImage[] upscale=new VulkanImage[2];
     private GlComposite presenter;
     private int width,height,internalWidth,internalHeight,index;
     private int buildLimit=4,effectiveRadius=Integer.MAX_VALUE;
     private double buildMillis;
     private double waitMillis,recordMillis,presentMillis;
+    private final double[] stageMillis=new double[5];
+    private int lastBuilds,lastUpdates;
+    private long lastUploadBytes;
     private boolean reset=true;
     private boolean memoryPressure;
     private double gpuMillis=Double.NaN;
@@ -60,9 +64,13 @@ public final class VulkanBackend implements RenderBackend {
         long sceneVersion=-1;
         long descriptorScene=-1,descriptorImages=-1,descriptorTextures=-1;
         int uploadOffset;
+        int builds,updates;
+        long uploadedBytes;
         VulkanContext.Buffer camera,table,instances,emitterTable;
         VulkanContext.Buffer uploads;
         Acceleration top;
+        final Map<Scene.Key,GpuMesh> dynamicMeshes=new LinkedHashMap<>();
+        List<Long> accelerationAddresses=List.of();
         SharedSurface surface;
         final List<AutoCloseable> temporary=new ArrayList<>();
         void complete() {
@@ -70,21 +78,23 @@ public final class VulkanBackend implements RenderBackend {
                 try(var stack=MemoryStack.stackPush()) {
                     check(vkWaitForFences(context.device,fence,true,10_000_000_000L),"wait for frame");
                     if(query!=0) {
-                        var stamps=stack.mallocLong(3);
-                        if(vkGetQueryPoolResults(context.device,query,0,3,stamps,Long.BYTES,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS) {
+                        var stamps=stack.mallocLong(7);
+                        if(vkGetQueryPoolResults(context.device,query,0,7,stamps,Long.BYTES,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS) {
                             long mask=context.timestampBits==64 ? -1L : (1L<<context.timestampBits)-1;
-                            gpuMillis=((stamps.get(2)-stamps.get(0))&mask)*context.timestampPeriod/1_000_000.0;
+                            gpuMillis=((stamps.get(6)-stamps.get(0))&mask)*context.timestampPeriod/1_000_000.0;
+                            for(int i=0;i<stageMillis.length;i++)stageMillis[i]=((stamps.get(i+1)-stamps.get(i))&mask)*context.timestampPeriod/1_000_000.0;
                             buildMillis=((stamps.get(1)-stamps.get(0))&mask)*context.timestampPeriod/1_000_000.0;
                             if(buildMillis>2.2)buildLimit=Math.max(1,buildLimit-1);else if(buildMillis<1)buildLimit=Math.min(4,buildLimit+1);
-                            if(referenceSamples==1)resolution.sample(gpuMillis);
+                            if(referenceSamples==1&&!Boolean.getBoolean("rayvox.vulkan.fixedResolution"))resolution.sample(gpuMillis);
                         }
                     }
                 }
                 retired.complete(submission);
+                lastBuilds=builds;lastUpdates=updates;lastUploadBytes=uploadedBytes;
                 submission=0;
             }
             for(var resource:temporary)try{resource.close();}catch(Exception e){throw new IllegalStateException(e);}
-            temporary.clear();uploadOffset=0;
+            temporary.clear();uploadOffset=builds=updates=0;uploadedBytes=0;
         }
         void releaseScene(){
             if(top!=null){top.close();top=null;}
@@ -92,9 +102,11 @@ public final class VulkanBackend implements RenderBackend {
             if(instances!=null){instances.close();instances=null;}
             if(emitterTable!=null){emitterTable.close();emitterTable=null;}
             sceneVersion=-1;
+            accelerationAddresses=List.of();
         }
         @Override public void close() {
             complete();releaseScene();if(surface!=null)surface.close();if(camera!=null)camera.close();if(uploads!=null)uploads.close();
+            for(var mesh:dynamicMeshes.values())mesh.close();dynamicMeshes.clear();
             if(query!=0)vkDestroyQueryPool(context.device,query,null);
             if(fence!=0)vkDestroyFence(context.device,fence,null);
         }
@@ -119,16 +131,16 @@ public final class VulkanBackend implements RenderBackend {
         } catch(RuntimeException|Error failure){close();throw failure;}
     }
     private void descriptors() {try(var stack=MemoryStack.stackPush()) {
-        var bindings=VkDescriptorSetLayoutBinding.calloc(16,stack);
-        for(int i=0;i<16;i++)bindings.get(i).binding(i).descriptorCount(i==9?TEXTURES:1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT)
+        var bindings=VkDescriptorSetLayoutBinding.calloc(17,stack);
+        for(int i=0;i<17;i++)bindings.get(i).binding(i).descriptorCount(i==9?TEXTURES:1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT)
                 .descriptorType(i==0?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:i==4||i==12||i==13?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i==5?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==9?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        var flags=stack.callocInt(16);flags.put(9,VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+        var flags=stack.callocInt(17);flags.put(9,VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
         var flagInfo=VkDescriptorSetLayoutBindingFlagsCreateInfo.calloc(stack).sType$Default().pBindingFlags(flags);
         var out=stack.mallocLong(1);
         check(vkCreateDescriptorSetLayout(context.device,VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings).pNext(flagInfo.address()),null,out),"create descriptor layout");descriptorLayout=out.get(0);
         var sizes=VkDescriptorPoolSize.calloc(5,stack);
         int[] types={VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        int[] counts={2,6,2,20,TEXTURES*2};
+        int[] counts={2,6,2,22,TEXTURES*2};
         for(int i=0;i<5;i++)sizes.get(i).type(types[i]).descriptorCount(counts[i]);
         check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(2).pPoolSizes(sizes),null,out),"create descriptor pool");descriptorPool=out.get(0);
         var push=VkPushConstantRange.calloc(1,stack).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).size(8);
@@ -143,14 +155,23 @@ public final class VulkanBackend implements RenderBackend {
         check(vkAllocateDescriptorSets(context.device,allocate,out),"allocate descriptor set");frame.set=out.get(0);
         frame.camera=context.buffer(512,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,true);
         frame.uploads=context.buffer(16*1048576,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,true);
-        if(context.timestampBits!=0){check(vkCreateQueryPool(context.device,VkQueryPoolCreateInfo.calloc(stack).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(3),null,out),"create timestamp pool");frame.query=out.get(0);}
+        if(context.timestampBits!=0){check(vkCreateQueryPool(context.device,VkQueryPoolCreateInfo.calloc(stack).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(7),null,out),"create timestamp pool");frame.query=out.get(0);}
         return frame;
     }catch(RuntimeException|Error e){frame.close();throw e;} }
     @Override public void update(Scene.Update update) {
         for(var key:update.removed()) {
             pending.remove(key);var old=meshes.remove(key);if(old!=null){sceneRevision++;retired.retire(serial,old::close);}
+            if(dynamicSources.remove(key)!=null)sceneRevision++;
         }
         for(var mesh:update.meshes()) {
+            if(mesh.dynamic()) {
+                var old=dynamicSources.get(mesh.key());
+                if(old==null||mesh.generation()>old.generation()) {
+                    if(old==null&&dynamicSources.size()>=384)throw new IllegalStateException("Vulkan dynamic mesh capacity exceeded");
+                    dynamicSources.put(mesh.key(),mesh);sceneRevision++;
+                }
+                continue;
+            }
             var old=pending.get(mesh.key());var live=meshes.get(mesh.key());
             long generation=old==null?(live==null?-1:live.source().generation()):old.generation();
             if(mesh.generation()>generation) {
@@ -176,15 +197,15 @@ public final class VulkanBackend implements RenderBackend {
     }
     private void resizeInternal() {
         drain();releaseImages();internalWidth=resolution.dimension(width);internalHeight=resolution.dimension(height);
-        long estimate=(long)internalWidth*internalHeight*80+(long)width*height*40;
+        long estimate=(long)internalWidth*internalHeight*88+(long)width*height*40;
         if(estimate>memoryBudget)throw new IllegalStateException("Path tracing image memory exceeds the configured budget");
         radiance=image(VK_FORMAT_R16G16B16A16_SFLOAT);geometry=image(VK_FORMAT_R32G32B32A32_SFLOAT);normals=image(VK_FORMAT_R16G16B16A16_SFLOAT);
-        history=image(VK_FORMAT_R16G16B16A16_SFLOAT);previousGeometry=image(VK_FORMAT_R32G32B32A32_SFLOAT);resolved=image(VK_FORMAT_R16G16B16A16_SFLOAT);reset=true;imageRevision++;
+        history=image(VK_FORMAT_R16G16B16A16_SFLOAT);nextHistory=image(VK_FORMAT_R16G16B16A16_SFLOAT);previousGeometry=image(VK_FORMAT_R32G32B32A32_SFLOAT);resolved=image(VK_FORMAT_R16G16B16A16_SFLOAT);reset=true;imageRevision++;
         for(int i=0;i<2;i++)upscale[i]=new VulkanImage(context,width,height,VK_FORMAT_R16G16B16A16_SFLOAT,VK_IMAGE_USAGE_STORAGE_BIT,false);
     }
-    private VulkanImage image(int format){return new VulkanImage(context,internalWidth,internalHeight,format,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,false);}
+    private VulkanImage image(int format){return new VulkanImage(context,internalWidth,internalHeight,format,VK_IMAGE_USAGE_STORAGE_BIT,false);}
     private void drain(){if(context!=null)for(var frame:frames)if(frame!=null)frame.complete();}
-    private void releaseImages(){for(var image:new VulkanImage[]{radiance,geometry,normals,history,previousGeometry,resolved,upscale[0],upscale[1]})if(image!=null)image.close();radiance=geometry=normals=history=previousGeometry=resolved=null;upscale[0]=upscale[1]=null;}
+    private void releaseImages(){for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})if(image!=null)image.close();radiance=geometry=normals=history=nextHistory=previousGeometry=resolved=null;upscale[0]=upscale[1]=null;}
     @Override public void render(Scene.Camera camera) {
         if(width<=0||height<=0)return;
         long cpuStart=System.nanoTime();Frame frame=frames[index];frame.complete();waitMillis=(System.nanoTime()-cpuStart)/1e6;
@@ -193,20 +214,23 @@ public final class VulkanBackend implements RenderBackend {
         if(nextX!=originX||nextY!=originY||nextZ!=originZ){originX=nextX;originY=nextY;originZ=nextZ;sceneRevision++;reset=true;}
         if(internalWidth!=resolution.dimension(width)||internalHeight!=resolution.dimension(height))resizeInternal();
         context.begin(frame.command);
-        if(frame.query!=0){vkCmdResetQueryPool(frame.command,frame.query,0,3);vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,frame.query,0);}
-        processTextures(frame);processMeshes(frame);
+        VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR|VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+        if(frame.query!=0){vkCmdResetQueryPool(frame.command,frame.query,0,7);vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,frame.query,0);}
+        processTextures(frame);processMeshes(frame);processDynamicMeshes(frame);
         prepareScene(frame,camera);
-        if(frame.query!=0)vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,frame.query,1);
-        for(var image:new VulkanImage[]{radiance,geometry,normals,history,previousGeometry,resolved,upscale[0],upscale[1]})image.general(frame.command);
+        stamp(frame,1);
+        for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})image.general(frame.command);
         frame.surface.acquire(frame.command);
         writeCamera(frame,camera);writeDescriptors(frame);
         vkCmdBindDescriptorSets(frame.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,new long[]{frame.set},null);
+        computeBarrier(frame.command);
         dispatch(frame,trace,internalWidth,internalHeight);
         computeBarrier(frame.command);
+        stamp(frame,2);
         if(referenceSamples==1)try(var stack=MemoryStack.stackPush()) {
             vkCmdPushConstants(frame.command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,stack.ints(0,1));
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
-            copyImage(frame.command,resolved,history);
             vkCmdPushConstants(frame.command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,stack.ints(1,1));
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
             vkCmdPushConstants(frame.command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,stack.ints(2,2));
@@ -215,13 +239,14 @@ public final class VulkanBackend implements RenderBackend {
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
             vkCmdPushConstants(frame.command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,stack.ints(2,8));
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
-            copyImage(frame.command,resolved,radiance);
         }
+        stamp(frame,3);
         dispatch(frame,exposureProgram,1,1);computeBarrier(frame.command);
+        stamp(frame,4);
         dispatch(frame,composite,width,height);computeBarrier(frame.command);
-        copyImage(frame.command,geometry,previousGeometry);
+        stamp(frame,5);
         frame.surface.release(frame.command);
-        if(frame.query!=0)vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,frame.query,2);
+        stamp(frame,6);
         check(vkEndCommandBuffer(frame.command),"end frame");
         try(var stack=MemoryStack.stackPush()) {
             check(vkResetFences(context.device,frame.fence),"reset frame fence");
@@ -232,8 +257,11 @@ public final class VulkanBackend implements RenderBackend {
         recordMillis=(System.nanoTime()-recordStart)/1e6;
         long presentStart=System.nanoTime();presenter.draw(frame.surface,width,height);frame.surface.signalComplete();presentMillis=(System.nanoTime()-presentStart)/1e6;
         previousVP.set(camera.viewProjection());previousX=camera.x();previousY=camera.y();previousZ=camera.z();previousWorld=camera.world();reset=false;index=(index+1)%frames.length;
+        var oldGeometry=previousGeometry;previousGeometry=geometry;geometry=oldGeometry;
+        var oldHistory=history;history=nextHistory;nextHistory=oldHistory;imageRevision++;
     }
-    private static void computeBarrier(VkCommandBuffer cmd){VulkanContext.memoryBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);}
+    private void stamp(Frame frame,int query){if(frame.query!=0)vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,frame.query,query);}
+    private static void computeBarrier(VkCommandBuffer cmd){VulkanContext.memoryBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);}
     private void dispatch(Frame frame,ComputeProgram program,int width,int height){vkCmdBindPipeline(frame.command,VK_PIPELINE_BIND_POINT_COMPUTE,program.pipeline);vkCmdDispatch(frame.command,(width+7)/8,(height+7)/8,1);}
     private void processMeshes(Frame frame) {
         long start=System.nanoTime(),bytes=0;int count=0;
@@ -252,17 +280,41 @@ public final class VulkanBackend implements RenderBackend {
             var vertices=context.buffer(source.vertices().remaining(),VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,false);
             upload(frame,vertices,source.vertices());
             VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR|VK_ACCESS_SHADER_READ_BIT);
-            var acceleration=Acceleration.bottom(context,frame.command,vertices,source.triangles());
+            Acceleration acceleration;
+            try{acceleration=Acceleration.bottom(context,frame.command,vertices,source.triangles());}catch(RuntimeException|Error failure){vertices.close();throw failure;}
+            frame.builds++;
             frame.temporary.add(acceleration.scratch);acceleration.scratch=null;
-            var emitters=new ArrayList<Emitter>();var data=source.vertices();
-            for(int triangle=0;triangle<source.triangles();triangle++)if(data.getFloat(triangle*192+28)>.001f) {
-                int k=triangle*192;
-                var a=new org.joml.Vector3f(data.getFloat(k),data.getFloat(k+4),data.getFloat(k+8));
-                var b=new org.joml.Vector3f(data.getFloat(k+64),data.getFloat(k+68),data.getFloat(k+72)).sub(a);
-                var c=new org.joml.Vector3f(data.getFloat(k+128),data.getFloat(k+132),data.getFloat(k+136)).sub(a);
-                emitters.add(new Emitter(triangle,b.cross(c).length()*.5f));
-            }
-            meshes.put(entry.getKey(),new GpuMesh(source,vertices,acceleration,emitters));sceneRevision++;count++;bytes+=source.vertices().remaining();reset|=!source.dynamic();
+            meshes.put(entry.getKey(),new GpuMesh(source,vertices,acceleration,emitters(source)));sceneRevision++;count++;bytes+=source.vertices().remaining();reset|=!source.dynamic();
+        }
+    }
+    private static List<Emitter> emitters(Scene.Mesh source) {
+        var emitters=new ArrayList<Emitter>();var data=source.vertices();
+        for(int triangle=0;triangle<source.triangles();triangle++)if(data.getFloat(triangle*192+28)>.001f) {
+            int k=triangle*192;
+            var a=new org.joml.Vector3f(data.getFloat(k),data.getFloat(k+4),data.getFloat(k+8));
+            var b=new org.joml.Vector3f(data.getFloat(k+64),data.getFloat(k+68),data.getFloat(k+72)).sub(a);
+            var c=new org.joml.Vector3f(data.getFloat(k+128),data.getFloat(k+132),data.getFloat(k+136)).sub(a);
+            emitters.add(new Emitter(triangle,b.cross(c).length()*.5f));
+        }
+        return emitters;
+    }
+    private void processDynamicMeshes(Frame frame) {
+        // Slot-owned buffers are only written after that slot's fence; no other slot references them.
+        for(var iterator=frame.dynamicMeshes.entrySet().iterator();iterator.hasNext();) {
+            var entry=iterator.next();if(!dynamicSources.containsKey(entry.getKey())){entry.getValue().close();iterator.remove();}
+        }
+        for(var source:dynamicSources.values()) {
+            var previous=frame.dynamicMeshes.get(source.key());
+            if(previous!=null&&previous.source().generation()==source.generation())continue;
+            if(source.triangles()==0){if(previous!=null){previous.close();frame.dynamicMeshes.remove(source.key());}continue;}
+            boolean reuse=previous!=null&&previous.source().triangles()==source.triangles();
+            var vertices=reuse?previous.vertices():context.buffer(source.vertices().remaining(),VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT|VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,false);
+            upload(frame,vertices,source.vertices());
+            VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR|VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR|VK_ACCESS_SHADER_READ_BIT);
+            Acceleration acceleration;
+            try{acceleration=Acceleration.bottom(context,frame.command,vertices,source.triangles(),reuse?previous.acceleration():null,true);}catch(RuntimeException|Error failure){if(!reuse)vertices.close();throw failure;}
+            if(reuse)frame.updates++;else{frame.builds++;if(previous!=null)previous.close();}
+            frame.dynamicMeshes.put(source.key(),new GpuMesh(source,vertices,acceleration,emitters(source)));
         }
     }
     private void upload(Frame frame,VulkanContext.Buffer destination,ByteBuffer source) {
@@ -272,6 +324,7 @@ public final class VulkanBackend implements RenderBackend {
     private record Upload(VulkanContext.Buffer buffer,int offset){}
     private Upload staging(Frame frame,ByteBuffer source) {
         int size=source.remaining(),offset=frame.uploadOffset;
+        frame.uploadedBytes+=size;
         var buffer=frame.uploads;
         if(offset+size>buffer.mapped.capacity()){buffer=context.buffer(size,VK_BUFFER_USAGE_TRANSFER_SRC_BIT,true);frame.temporary.add(buffer);offset=0;}
         else frame.uploadOffset=(offset+size+3)&~3;
@@ -280,6 +333,7 @@ public final class VulkanBackend implements RenderBackend {
     private void processTextures(Frame frame) {
         for(var iterator=pendingTextures.iterator();iterator.hasNext();) {
             var source=iterator.next();var old=textures.get(source.id());
+            if(source.mipLevel()!=0){iterator.remove();continue;}
             if(source.width()==0) {
                 if(old!=null){textures.remove(source.id());freeTextureSlots.add(old.slot());retired.retire(serial,old::close);sceneRevision++;textureRevision++;reset=true;}
                 iterator.remove();continue;
@@ -306,15 +360,16 @@ public final class VulkanBackend implements RenderBackend {
     }
     private void prepareScene(Frame frame,Scene.Camera camera) {
         if(frame.sceneVersion==sceneRevision)return;
-        frame.releaseScene();
-        int count=meshes.size();
-        frame.instances=context.buffer(Math.max(1,count)*VkAccelerationStructureInstanceKHR.SIZEOF,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,true);
-        frame.table=context.buffer(Math.max(1,count)*16L,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,true);
-        int emitterCount=meshes.values().stream().mapToInt(m->m.emitters().size()).sum();
-        frame.emitterTable=context.buffer(16L+32L*emitterCount,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,true);
+        var visible=new LinkedHashMap<>(meshes);visible.putAll(frame.dynamicMeshes);
+        int count=visible.size();
+        frame.instances=resizeBuffer(frame.instances,Math.max(1,count)*VkAccelerationStructureInstanceKHR.SIZEOF,VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        frame.table=resizeBuffer(frame.table,Math.max(1,count)*16L,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        int emitterCount=visible.values().stream().mapToInt(m->m.emitters().size()).sum();
+        frame.emitterTable=resizeBuffer(frame.emitterTable,16L+32L*emitterCount,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        frame.table.mapped.clear();frame.emitterTable.mapped.clear();
         frame.emitterTable.mapped.putInt(emitterCount).putInt(0).putInt(0).putInt(0);
         int i=0;
-        for(var entry:meshes.entrySet()) {
+        for(var entry:visible.entrySet()) {
             var mesh=entry.getValue();var source=mesh.source();
             var instance=VkAccelerationStructureInstanceKHR.create(MemoryUtil.memAddress(frame.instances.mapped)+(long)i*VkAccelerationStructureInstanceKHR.SIZEOF);
             instance.clear();
@@ -328,10 +383,19 @@ public final class VulkanBackend implements RenderBackend {
             }
         }
         frame.instances.flush();frame.table.flush();frame.emitterTable.flush();
-        VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
-        frame.top=Acceleration.top(context,frame.command,frame.instances,count);
+        VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR|VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+        var addresses=visible.values().stream().map(mesh->mesh.acceleration().address).toList();
+        if(!addresses.equals(frame.accelerationAddresses)&&frame.top!=null){frame.top.close();frame.top=null;}
+        frame.accelerationAddresses=addresses;
+        boolean update=frame.top!=null&&Acceleration.canRefit(frame.top.updateable,frame.top.primitives,count);
+        frame.top=Acceleration.top(context,frame.command,frame.instances,count,frame.top);
+        if(update)frame.updates++;else frame.builds++;
         VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
         frame.sceneVersion=sceneRevision;
+    }
+    private VulkanContext.Buffer resizeBuffer(VulkanContext.Buffer old,long bytes,int usage) {
+        if(old!=null&&old.mapped.capacity()>=bytes)return old;
+        var replacement=context.buffer(bytes,usage,true);if(old!=null)old.close();return replacement;
     }
     private void writeCamera(Frame frame,Scene.Camera camera) {
         var bytes=frame.camera.mapped;bytes.clear();camera.inverseViewProjection().get(0,bytes);
@@ -340,7 +404,7 @@ public final class VulkanBackend implements RenderBackend {
         bytes.putFloat((float)(camera.x()-originX)).putFloat((float)(camera.y()-originY)).putFloat((float)(camera.z()-originZ)).putFloat((float)serial);
         put(bytes,camera.sunDirection(),0);put(bytes,camera.sunRadiance(),0);
         boolean cut=reset||camera.cut()||camera.world()!=previousWorld||Math.abs(previousX-camera.x())+Math.abs(previousY-camera.y())+Math.abs(previousZ-camera.z())>8;
-        put(bytes,camera.sky(),cut?1:0);bytes.putFloat(width).putFloat(height).putFloat(referenceSamples).putFloat(meshes.values().stream().anyMatch(m->m.source().dynamic())?1:0);
+        put(bytes,camera.sky(),cut?1:0);bytes.putFloat(width).putFloat(height).putFloat(referenceSamples).putFloat(dynamicSources.isEmpty()?0:1);
         for(int i=0;i<4;i++){var light=i<camera.lights().size()?camera.lights().get(i):null;bytes.putFloat(light==null?0:(float)(light.x()-originX)).putFloat(light==null?0:(float)(light.y()-originY)).putFloat(light==null?0:(float)(light.z()-originZ)).putFloat(0);}
         for(int i=0;i<4;i++){var light=i<camera.lights().size()?camera.lights().get(i):null;bytes.putFloat(light==null?0:light.red()).putFloat(light==null?0:light.green()).putFloat(light==null?0:light.blue()).putFloat(light==null?0:light.radius());}
         put(bytes,camera.fogColor(),camera.fogStart());bytes.putFloat(camera.fogEnd()).putFloat(0).putFloat(0).putFloat(0);
@@ -349,8 +413,8 @@ public final class VulkanBackend implements RenderBackend {
     private static void put(ByteBuffer bytes,org.joml.Vector3f value,float w){bytes.putFloat(value.x).putFloat(value.y).putFloat(value.z).putFloat(w);}
     private void writeDescriptors(Frame frame) {try(var stack=MemoryStack.stackPush()) {
         if(frame.descriptorScene!=frame.sceneVersion||frame.descriptorImages!=imageRevision) {
-        var writes=VkWriteDescriptorSet.calloc(15,stack);
-        for(int i=0;i<15;i++)writes.get(i).sType$Default().dstSet(frame.set).dstBinding(i<9?i:i+1).descriptorCount(1);
+        var writes=VkWriteDescriptorSet.calloc(16,stack);
+        for(int i=0;i<16;i++)writes.get(i).sType$Default().dstSet(frame.set).dstBinding(i<9?i:i+1).descriptorCount(1);
         var acceleration=VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack).sType$Default().pAccelerationStructures(stack.longs(frame.top.handle));
         writes.get(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).pNext(acceleration.address());
         VulkanImage[] images={null,radiance,geometry,normals,null,null,history,previousGeometry,resolved,null,frame.surface.color,frame.surface.depth};
@@ -362,6 +426,7 @@ public final class VulkanBackend implements RenderBackend {
         writes.get(12).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(VkDescriptorBufferInfo.calloc(1,stack).buffer(exposure.handle).range(VK_WHOLE_SIZE));
         writes.get(13).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(upscale[1-frame.slot].view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
         writes.get(14).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(upscale[frame.slot].view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
+        writes.get(15).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(nextHistory.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
         vkUpdateDescriptorSets(context.device,writes,null);frame.descriptorScene=frame.sceneVersion;frame.descriptorImages=imageRevision;
         }
         if(frame.descriptorTextures==textureRevision)return;
@@ -373,13 +438,7 @@ public final class VulkanBackend implements RenderBackend {
         vkUpdateDescriptorSets(context.device,writes,null);
         frame.descriptorTextures=textureRevision;
     } }
-    private void copyImage(VkCommandBuffer cmd,VulkanImage source,VulkanImage destination) {try(var stack=MemoryStack.stackPush()) {
-        VulkanContext.memoryBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT|VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT);
-        var region=VkImageCopy.calloc(1,stack);region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);region.extent().set(internalWidth,internalHeight,1);
-        vkCmdCopyImage(cmd,source.image,VK_IMAGE_LAYOUT_GENERAL,destination.image,VK_IMAGE_LAYOUT_GENERAL,region);
-        VulkanContext.memoryBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
-    } }
-    public void clearScene() {drain();for(var frame:frames)if(frame!=null)frame.releaseScene();for(var mesh:meshes.values())mesh.close();meshes.clear();pending.clear();sceneRevision++;reset=true;}
+    public void clearScene() {drain();for(var frame:frames)if(frame!=null){frame.releaseScene();for(var mesh:frame.dynamicMeshes.values())mesh.close();frame.dynamicMeshes.clear();}for(var mesh:meshes.values())mesh.close();meshes.clear();dynamicSources.clear();pending.clear();sceneRevision++;reset=true;}
     public void clearTextures(){
         drain();for(var frame:frames)if(frame!=null)frame.releaseScene();
         for(var texture:textures.values())texture.close();textures.clear();pendingTextures.clear();freeTextureSlots.clear();nextTextureSlot=0;
@@ -391,17 +450,18 @@ public final class VulkanBackend implements RenderBackend {
         return effectiveRadius;
     }
     public int availableMeshSlots(){return Math.max(0,256-pending.size());}
-    public int dynamicMeshCount(){return (int)meshes.values().stream().filter(mesh->mesh.source().dynamic()).count();}
-    @Override public Diagnostics diagnostics(){return new Diagnostics("Vulkan path tracing",context==null?"uninitialized":context.name,reason,internalWidth,internalHeight,gpuMillis,context==null?0:context.allocated,meshes.size(),pending.size());}
-    public List<String> validationMessages(){return context==null?List.of():List.copyOf(context.validationMessages);}
-    public record Timings(double fenceWaitMs,double recordingMs,double presentationMs,double gpuBuildMs){}
-    public Timings timings(){return new Timings(waitMillis,recordMillis,presentMillis,buildMillis);}
+    public int dynamicMeshCount(){return dynamicSources.size();}
+    @Override public Diagnostics diagnostics(){return new Diagnostics("Vulkan path tracing",context==null?"uninitialized":context.name,reason,internalWidth,internalHeight,gpuMillis,context==null?0:context.allocated,meshes.size()+dynamicSources.size(),pending.size());}
+    public List<String> validationMessages(){if(context==null)return List.of();synchronized(context.validationMessages){return List.copyOf(context.validationMessages);}}
+    public record Timings(double fenceWaitMs,double recordingMs,double presentationMs,double gpuBuildMs,double gpuTraceMs,double gpuReconstructMs,double gpuExposureMs,double gpuCompositeMs,int accelerationBuilds,int accelerationUpdates,long uploadBytes){}
+    public Timings timings(){return new Timings(waitMillis,recordMillis,presentMillis,buildMillis,stageMillis[1],stageMillis[2],stageMillis[3],stageMillis[4],lastBuilds,lastUpdates,lastUploadBytes);}
     @Override public void close() {
         if(context==null)return;
         drain();org.lwjgl.opengl.GL11.glFinish();retired.complete(Long.MAX_VALUE);
         for(var frame:frames)if(frame!=null)frame.close();releaseImages();
         for(var mesh:meshes.values())mesh.close();meshes.clear();
         for(var texture:textures.values())texture.close();textures.clear();
+        dynamicSources.clear();pending.clear();pendingTextures.clear();
         if(presenter!=null)presenter.close();if(trace!=null)trace.close();if(reconstruct!=null)reconstruct.close();if(composite!=null)composite.close();if(exposureProgram!=null)exposureProgram.close();if(exposure!=null)exposure.close();
         if(sampler!=0)vkDestroySampler(context.device,sampler,null);if(pipelineLayout!=0)vkDestroyPipelineLayout(context.device,pipelineLayout,null);
         if(descriptorPool!=0)vkDestroyDescriptorPool(context.device,descriptorPool,null);if(descriptorLayout!=0)vkDestroyDescriptorSetLayout(context.device,descriptorLayout,null);

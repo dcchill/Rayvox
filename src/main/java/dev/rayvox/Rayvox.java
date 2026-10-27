@@ -52,11 +52,11 @@ public final class Rayvox {
 
     static {
         var builder = new ModConfigSpec.Builder();
-        RENDER_BACKEND = builder.comment("Renderer selection; restart required. AUTO retains OpenGL until Vulkan playable acceptance is complete. Explicit Vulkan is a development preview.")
+        RENDER_BACKEND = builder.comment("Renderer selection; applies between frames. AUTO retains OpenGL until Vulkan playable acceptance is complete. VULKAN_VANILLA preserves Minecraft lighting; VULKAN_PATH_TRACING uses realistic lighting.")
                 .defineEnum("renderBackend",dev.rayvox.render.BackendMode.AUTO);
-        VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; restart required.")
+        VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; applies when a Vulkan renderer initializes.")
                 .defineInRange("vulkanMemoryMiB",2048,512,8192);
-        ENABLED = builder.comment("Enable Rayvox world-surface RGB lighting.").define("enabled", true);
+        ENABLED = builder.comment("Enable the selected Rayvox renderer/lighting. OFF uses native vanilla rendering.").define("enabled", true);
         CACHE_RADIUS = builder.comment("Voxel radius in 16-block sections; one resolution level.")
                 .defineInRange("cacheRadiusSections", 2, 1, 4);
         EXTRACT_BUDGET = builder.comment("Maximum sections extracted per tick, also bounded by a soft 2 ms limit.")

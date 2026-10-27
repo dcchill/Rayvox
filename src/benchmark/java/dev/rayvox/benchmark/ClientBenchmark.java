@@ -43,20 +43,39 @@ public final class ClientBenchmark {
     private static ClientBenchmark instance;
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
     private static final boolean VULKAN = SCENE.startsWith("vulkan-");
+    private static final boolean VANILLA_VULKAN = SCENE.startsWith("vulkan-vanilla");
     private static final boolean TEMPORAL = SCENE.equals("temporal");
     private static final boolean WORLD_CACHE = SCENE.equals("world-cache");
     private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi") || WORLD_CACHE;
     private static final boolean GOVERNOR_PIPELINE = SCENE.equals("pipeline-governor");
     private static final boolean HELD_PIPELINE = SCENE.equals("pipeline-held");
     private static final boolean PIPELINE = SCENE.equals("pipeline") || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
-    private static final boolean ENTITIES = SCENE.equals("entities") || SCENE.equals("vulkan-entities");
+    private static final boolean ENTITIES = SCENE.equals("entities") || SCENE.equals("vulkan-entities") || SCENE.equals("vulkan-vanilla-entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
-    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor");
+    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor") || SCENE.equals("vulkan-vanilla-outdoor");
     private static final boolean DIRECTIONAL_MATERIALS = !SCENE.equals("directional-basic");
     private static final String WORLD = ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
-    private final List<Phase> phases = SCENE.equals("vulkan-lifecycle") ? List.of(
+    private final List<Phase> phases = SCENE.equals("vulkan-vanilla-lifecycle") ? List.of(
+            new Phase("native-static",false,false,false,false,8,3),
+            new Phase("vanilla-vulkan-static",true,false,false,false,10,3),
+            new Phase("vulkan-edited",true,false,false,false,4,3),
+            new Phase("vulkan-reloaded",true,false,false,false,6,3),
+            new Phase("vulkan-resized",true,false,false,false,4,3),
+            new Phase("vulkan-night",true,false,false,false,4,3),
+            new Phase("vulkan-nightvision",true,false,false,false,4,3),
+            new Phase("vulkan-rejected",true,false,false,false,4,3),
+            new Phase("native-moving",false,false,false,true,4,3),
+            new Phase("vanilla-vulkan-return",true,false,false,false,8,3),
+            new Phase("vulkan-nether",true,false,false,false,15,3),
+            new Phase("native-nether",false,false,false,false,4,3),
+            new Phase("vanilla-nether",true,false,false,false,8,3)) : VANILLA_VULKAN ? List.of(
+            new Phase("native-static",false,false,false,false,8,4),
+            new Phase("vanilla-vulkan-static",true,false,false,false,12,5),
+            new Phase("vanilla-vulkan-moving",true,false,false,true,8,5),
+            new Phase("native-moving",false,false,false,true,4,4),
+            new Phase("vanilla-vulkan-return",true,false,false,false,8,4)) : SCENE.equals("vulkan-lifecycle") ? List.of(
             new Phase("vulkan-static",true,true,true,false,45,5),
             new Phase("vulkan-edited",true,true,true,false,10,5),
             new Phase("vulkan-reloaded",true,true,true,false,15,5),
@@ -173,6 +192,7 @@ public final class ClientBenchmark {
                         villager.moveTo(-4, 65, 5, 180, 0);
                         world.addFreshEntity(villager);
                         shadowEntityId = villager.getId();
+                        if(VANILLA_VULKAN)world.setBlock(new BlockPos(0,65,6),Blocks.CHEST.defaultBlockState(),3);
                     }
                     var player = server.getPlayerList().getPlayer(mc.player.getUUID());
                     if (player == null) throw new IllegalStateException("Integrated server player missing");
@@ -191,6 +211,7 @@ public final class ClientBenchmark {
                 beginPhase(0);
             }
             var current = phases.get(phase);
+            if(VANILLA_VULKAN&&ENTITIES)mc.level.addParticle(net.minecraft.core.particles.ParticleTypes.FLAME,.5,66,8,0,.01,0);
             double x = .5 + (current.moving ? Math.sin((ticks - phaseTick) * .035) * (DIRECTIONAL ? 24 : 6) : 0);
             mc.player.setPos(x, DIRECTIONAL ? 68 : 66, DIRECTIONAL ? 28 : 13.5);
             mc.player.setYRot(180); mc.player.setXRot(DIRECTIONAL ? 25 : 12);
@@ -206,6 +227,8 @@ public final class ClientBenchmark {
     }
 
     private static void configure(Minecraft mc) {
+        if(Boolean.getBoolean("rayvox.benchmark.requirePackaged")&&!Rayvox.class.getResource("Rayvox.class").toString().contains("rayvox-packaged.jar"))throw new IllegalStateException("Packaged benchmark loaded development Rayvox classes");
+        if(VULKAN)Rayvox.RENDER_BACKEND.set(VANILLA_VULKAN?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.VULKAN_PATH_TRACING);
         if (GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) != GLFW.GLFW_FALSE)
             throw new IllegalStateException("Benchmark window must be hidden");
         mc.options.pauseOnLostFocus = false;
@@ -268,11 +291,15 @@ public final class ClientBenchmark {
         phaseCompositionDraws = RayvoxEngine.compositionPassDraws();
         phaseDynamicDraws = RayvoxEngine.dynamicPassDraws();
         var config = phases.get(index);
+        if(VANILLA_VULKAN)dev.rayvox.RenderBackends.requestMode(config.enabled?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.OPENGL);
         if(VULKAN) {
             var client=Minecraft.getInstance();var server=client.getSingleplayerServer();
             if(config.name.equals("vulkan-edited"))setup=CompletableFuture.runAsync(()->server.overworld().setBlock(new BlockPos(0,65,6),Blocks.OBSIDIAN.defaultBlockState(),3),server);
             if(config.name.equals("vulkan-reloaded"))setup=client.reloadResourcePacks();
             if(config.name.equals("vulkan-resized"))GLFW.glfwSetWindowSize(client.getWindow().getWindow(),1920,1080);
+            if(config.name.equals("vulkan-night"))setup=CompletableFuture.runAsync(()->server.overworld().setDayTime(18000),server);
+            if(config.name.equals("vulkan-nightvision"))setup=CompletableFuture.runAsync(()->server.getPlayerList().getPlayer(client.player.getUUID()).addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.NIGHT_VISION,1200)),server);
+            if(config.name.equals("vulkan-rejected")&&dev.rayvox.RenderBackends.raster()!=null&&!dev.rayvox.RenderBackends.raster().rayTracingSupported())dev.rayvox.RenderBackends.requestMode(dev.rayvox.render.BackendMode.VULKAN_PATH_TRACING);
             if(config.name.equals("vulkan-nether"))setup=CompletableFuture.runAsync(()-> {
                 var nether=server.getLevel(net.minecraft.world.level.Level.NETHER);prepareWorld(nether);
                 server.getPlayerList().getPlayer(client.player.getUUID()).teleportTo(nether,.5,66,13.5,180,12);
@@ -338,7 +365,7 @@ public final class ClientBenchmark {
             for(int x=-6;x<=6;x++)for(int z=-4;z<=6;z++)world.setBlock(position.set(x,64,z),
                     (x<0?Blocks.GOLD_BLOCK:Blocks.IRON_BLOCK).defaultBlockState(),18);
         }
-        if(SCENE.equals("vulkan-glass-water")) {
+        if(SCENE.equals("vulkan-glass-water")||SCENE.equals("vulkan-vanilla-glass-water")) {
             for(int x=-7;x<=7;x++)for(int z=-5;z<=5;z++)world.setBlock(position.set(x,64,z),Blocks.WATER.defaultBlockState(),18);
             for(int x=-5;x<=5;x++)for(int y=65;y<=68;y++)world.setBlock(position.set(x,y,4),
                     (x<0?Blocks.RED_STAINED_GLASS:Blocks.GLASS).defaultBlockState(),18);
@@ -372,7 +399,7 @@ public final class ClientBenchmark {
     private void start() {
         framePhase = -1; renderStart = 0;
         if (finished || phase < 0) return;
-        if (!VULKAN && frameFences[frameFence] != 0) {
+        if (frameFences[frameFence] != 0) {
             int result;
             long deadline = System.nanoTime() + 10_000_000_000L;
             do {
@@ -438,6 +465,11 @@ public final class ClientBenchmark {
                     phases.get(phase).qualityFrames[level]++;
                     double cpuMs = RayvoxEngine.cpuWorkMillis();
                     if (Double.isFinite(cpuMs) && cpuMs >= 0) phases.get(phase).cpuWork.add((long)(cpuMs * 1_000_000));
+                    if(dev.rayvox.RenderBackends.active()) {
+                        var raster=dev.rayvox.RenderBackends.rasterTimings();var trace=dev.rayvox.RenderBackends.timings();var samples=phases.get(phase);
+                        if(raster!=null)samples.gpuSample("raster",raster.gpuMs());
+                        if(trace!=null){samples.gpuSample("uploadsAndBuilds",trace.gpuBuildMs());samples.gpuSample("trace",trace.gpuTraceMs());samples.gpuSample("reconstruction",trace.gpuReconstructMs());samples.gpuSample("exposure",trace.gpuExposureMs());samples.gpuSample("composite",trace.gpuCompositeMs());}
+                    }
                 }
                 var current = phases.get(phase);
                 // Driver compilation can consume the warmup frame; measure a full window afterwards.
@@ -449,7 +481,7 @@ public final class ClientBenchmark {
                         throw new IllegalStateException("Moving entity was not published to the terrain shader");
                     if (ENTITIES && !VULKAN && RayvoxEngine.entityLightingDraws() == 0)
                         throw new IllegalStateException("Moving entity did not use the RGB lighting shader");
-                    if(ENTITIES&&VULKAN&&dev.rayvox.RenderBackends.dynamicMeshCount()==0)
+                    if(ENTITIES&&VULKAN&&!VANILLA_VULKAN&&dev.rayvox.RenderBackends.dynamicMeshCount()==0)
                         throw new IllegalStateException("Animated entity geometry was not captured by Vulkan");
                     if (PIPELINE && configDeferred(current) != RayvoxEngine.deferredActive())
                         throw new IllegalStateException("Unexpected pipeline: " + RayvoxEngine.pipelineStats());
@@ -484,9 +516,13 @@ public final class ClientBenchmark {
                     report.put("phase", current.name); report.put("engine", RayvoxEngine.status());
                     report.put("renderer",dev.rayvox.RenderBackends.status());
                     if(VULKAN)report.put("vulkan",dev.rayvox.RenderBackends.diagnostics());
-                    if(VULKAN)report.put("vulkanTimings",dev.rayvox.RenderBackends.timings());
+                    if(VULKAN)report.put("vulkanTimings",VANILLA_VULKAN?dev.rayvox.RenderBackends.rasterTimings():dev.rayvox.RenderBackends.timings());
                     if(VULKAN)report.put("vulkanDynamicMeshes",dev.rayvox.RenderBackends.dynamicMeshCount());
-                    if(VULKAN&&!dev.rayvox.RenderBackends.active())throw new IllegalStateException("Vulkan benchmark fell back: "+dev.rayvox.RenderBackends.status());
+                    if(VULKAN&&current.enabled&&!dev.rayvox.RenderBackends.active())throw new IllegalStateException("Vulkan benchmark fell back: "+dev.rayvox.RenderBackends.status());
+                    if(VANILLA_VULKAN&&current.enabled&&(dev.rayvox.RenderBackends.rasterTimings()==null||dev.rayvox.RenderBackends.rasterTimings().terrainDraws()==0))throw new IllegalStateException("Vulkan vanilla did not draw terrain");
+                    if(VANILLA_VULKAN&&current.enabled&&ENTITIES&&(dev.rayvox.RenderBackends.rasterTimings().entityDraws()==0||dev.rayvox.RenderBackends.rasterTimings().particleDraws()==0))throw new IllegalStateException("Vulkan vanilla missed entity or particle draws");
+                    if(VANILLA_VULKAN&&current.name.equals("vanilla-vulkan-static")&&!ENTITIES)report.put("nativeImageDifference",compareImages(mc.gameDirectory.toPath().resolve("native-static.png"),screenshot));
+                    if(VANILLA_VULKAN&&dev.rayvox.RenderBackends.raster()!=null&&!dev.rayvox.RenderBackends.raster().validationMessages().isEmpty())throw new IllegalStateException("Vulkan validation errors: "+dev.rayvox.RenderBackends.raster().validationMessages());
                     report.put("activeLightLimit", current.limit); report.put("lightsPerTile", current.perTile);
                     if (ENTITIES) report.put("entityCasters", RayvoxEngine.entityShadowCount());
                     if (ENTITIES) report.put("entityLightingDraws", RayvoxEngine.entityLightingDraws());
@@ -521,7 +557,7 @@ public final class ClientBenchmark {
         if (!finished && phase >= 0) {
             // Vulkan already bounds submissions to two slots using native fences.
             // A second GL limiter measures Windows park/timer latency as frame time.
-            if(!VULKAN) {
+            if(!dev.rayvox.RenderBackends.active()) {
                 frameFences[frameFence] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
                 if (frameFences[frameFence] == 0) fail(new IllegalStateException("Cannot allocate benchmark frame fence"));
                 frameFence = (frameFence + 1) % frameFences.length;
@@ -559,6 +595,9 @@ public final class ClientBenchmark {
         result.put("maxFramesInFlight", frameFences.length);
         result.put("createdAt", java.time.Instant.now().toString());
         result.put("build", JsonParser.parseString(Files.readString(mc.gameDirectory.toPath().resolve("benchmark-meta.json"))));
+        result.put("rayvoxArtifact",Rayvox.class.getResource("Rayvox.class").toString());
+        if(VULKAN)result.put("vulkanBindingArtifact",Class.forName("org.lwjgl.vulkan.VK").getResource("VK.class").toString());
+        result.put("vulkanFixedResolution",Boolean.getBoolean("rayvox.vulkan.fixedResolution"));
         write(result); finished = true; mc.stop();
     }
 
@@ -573,12 +612,28 @@ public final class ClientBenchmark {
         report.put("p99", sorted[(int)((sorted.length - 1) * .99)] / 1e6);
         return report;
     }
+    private static Map<String,Object> compareImages(Path nativeCapture,Path vulkanCapture)throws Exception {
+        try(var nativeStream=Files.newInputStream(nativeCapture);var vulkanStream=Files.newInputStream(vulkanCapture);
+                var original=com.mojang.blaze3d.platform.NativeImage.read(nativeStream);var actual=com.mojang.blaze3d.platform.NativeImage.read(vulkanStream)) {
+            if(original.getWidth()!=actual.getWidth()||original.getHeight()!=actual.getHeight())throw new IllegalStateException("Image comparison size mismatch");
+            long total=0,large=0,pixels=(long)actual.getWidth()*actual.getHeight();
+            for(int y=0;y<actual.getHeight();y++)for(int x=0;x<actual.getWidth();x++) {
+                int expected=original.getPixelRGBA(x,y),value=actual.getPixelRGBA(x,y),maximum=0;
+                for(int channel=0;channel<3;channel++){int difference=Math.abs((expected>>(channel*8)&255)-(value>>(channel*8)&255));total+=difference;maximum=Math.max(maximum,difference);}
+                if(maximum>32)large++;
+            }
+            double mean=total/(pixels*3.0*255),fraction=large/(double)pixels;
+            if(mean>.02||fraction>.01)throw new IllegalStateException("Vulkan vanilla image differs from native: mean="+mean+", large fraction="+fraction);
+            return Map.of("meanAbsoluteRgb",mean,"pixelsOver32Fraction",fraction,"toleranceNote","Allows lightmap flicker and animated particles between captures");
+        }
+    }
 
     private static void measurements(Phase phase, Map<String, Object> report) {
         if (phase.wall.isEmpty()) throw new IllegalStateException("No measured frames for " + phase.name);
         var wall = stats(phase.wall);
         report.put("frameMs", wall); report.put("renderThreadMs", stats(phase.cpu)); report.put("gpuRenderMs", stats(phase.gpu));
         report.put("cpuWorkMs", stats(phase.cpuWork));
+        var gpuStages=new LinkedHashMap<String,Object>();phase.gpuStages.forEach((name,samples)->gpuStages.put(name,stats(samples)));report.put("vulkanStageMs",gpuStages);
         report.put("meanFps", 1000.0 / ((Number)wall.get("mean")).doubleValue());
     }
 
@@ -603,7 +658,8 @@ public final class ClientBenchmark {
 
     private static void write(Map<String, ?> result) throws Exception {
         Path path = Minecraft.getInstance().gameDirectory.toPath().resolve("benchmark-result.json");
-        Files.writeString(path, new GsonBuilder().setPrettyPrinting().create().toJson(result));
+        com.google.gson.JsonSerializer<Double> finite=(value,type,context)->Double.isFinite(value)?new com.google.gson.JsonPrimitive(value):com.google.gson.JsonNull.INSTANCE;
+        Files.writeString(path, new GsonBuilder().registerTypeAdapter(Double.class,finite).registerTypeAdapter(double.class,finite).setPrettyPrinting().create().toJson(result));
     }
 
     private static final class Phase {
@@ -612,6 +668,8 @@ public final class ClientBenchmark {
         final int warm, seconds, limit, perTile, expectedLights;
         final LongArrayList wall = new LongArrayList(16384), cpu = new LongArrayList(16384), gpu = new LongArrayList(16384);
         final LongArrayList cpuWork = new LongArrayList(16384);
+        final Map<String,LongArrayList> gpuStages=new LinkedHashMap<>();
+        void gpuSample(String stage,double millis){if(Double.isFinite(millis)&&millis>=0)gpuStages.computeIfAbsent(stage,ignored->new LongArrayList()).add((long)(millis*1_000_000));}
         final int[] qualityFrames = new int[5];
         final List<String> qualityDecisions = new ArrayList<>();
         int lastQualityLevel;

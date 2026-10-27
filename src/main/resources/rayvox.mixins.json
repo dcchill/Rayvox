@@ -2,6 +2,6 @@
   "required": true,
   "package": "dev.rayvox.mixin",
   "compatibilityLevel": "JAVA_21",
-  "client": ["LevelRendererMixin", "ClientLevelMixin", "GameRendererMixin", "ModelBlockRendererMixin", "BufferUploaderMixin", "RenderTypeMixin", "NativeImageMixin", "AbstractTextureMixin", "GlStateManagerMixin"],
+  "client": ["LevelRendererMixin", "ClientLevelMixin", "GameRendererMixin", "ModelBlockRendererMixin", "BufferUploaderMixin", "RenderTypeMixin", "NativeImageMixin", "AbstractTextureMixin", "GlStateManagerMixin", "VertexBufferMixin", "ShaderInstanceMixin", "RenderTargetMixin", "RenderTargetAccess"],
   "injectors": {"defaultRequire": 1}
 }

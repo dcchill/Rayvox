@@ -33,12 +33,15 @@ final class ComputeProgram implements AutoCloseable {
             if(in==null)throw new IOException("Missing shader "+path);
             source=new String(in.readAllBytes(),StandardCharsets.UTF_8);
         }catch(IOException e){throw new IllegalStateException(e);}
+        return compile(asset,source,shaderc_compute_shader);
+    }
+    static ByteBuffer compile(String asset,String source,int kind) {
         long compiler=shaderc_compiler_initialize(),options=shaderc_compile_options_initialize();
         try {
             shaderc_compile_options_set_target_env(options,shaderc_target_env_vulkan,shaderc_env_version_vulkan_1_3);
             shaderc_compile_options_set_target_spirv(options,shaderc_spirv_version_1_5);
             shaderc_compile_options_set_optimization_level(options,shaderc_optimization_level_performance);
-            long result=shaderc_compile_into_spv(compiler,source,shaderc_compute_shader,asset,"main",options);
+            long result=shaderc_compile_into_spv(compiler,source,kind,asset,"main",options);
             if(result==0)throw new IllegalStateException("Shader compiler returned no result");
             try {
                 if(shaderc_result_get_compilation_status(result)!=shaderc_compilation_status_success)

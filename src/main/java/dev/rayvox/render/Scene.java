@@ -23,8 +23,9 @@ public final class Scene {
         public int triangles() { return vertices.remaining() / (3 * VERTEX_BYTES); }
     }
     public record Texture(int id, long generation, int width, int height, ByteBuffer rgba,
-                          int x,int y,int fullWidth,int fullHeight) {
-        public Texture(int id,long generation,int width,int height,ByteBuffer rgba) {this(id,generation,width,height,rgba,0,0,width,height);}
+                          int x,int y,int fullWidth,int fullHeight,int mipLevel) {
+        public Texture(int id,long generation,int width,int height,ByteBuffer rgba) {this(id,generation,width,height,rgba,0,0,width,height,0);}
+        public Texture(int id,long generation,int width,int height,ByteBuffer rgba,int x,int y,int fullWidth,int fullHeight) {this(id,generation,width,height,rgba,x,y,fullWidth,fullHeight,0);}
     }
     public record Light(double x, double y, double z, float red, float green, float blue, float radius) {}
     public record Update(List<Mesh> meshes, List<Key> removed, List<Texture> textures, boolean resetHistory) {

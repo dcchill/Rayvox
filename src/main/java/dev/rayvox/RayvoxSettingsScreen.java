@@ -12,6 +12,7 @@ final class RayvoxSettingsScreen extends Screen {
     private final Screen parent;
     private boolean performance;
     private int next, columnWidth, left,rowSpacing;
+    private dev.rayvox.render.BackendMode shownMode;
 
     RayvoxSettingsScreen(Screen parent) {
         super(Component.literal("Rayvox rendering settings"));
@@ -19,19 +20,23 @@ final class RayvoxSettingsScreen extends Screen {
     }
 
     @Override protected void init() {
+        shownMode=RenderBackends.requestedMode();
         next = 0;
         rowSpacing=Math.max(20,Math.min(24,(height-68)/8));
         columnWidth = Math.min(220, (width - 32) / 2);
         left = (width - columnWidth * 2 - 8) / 2;
-        boolean vulkan=RenderBackends.active();
+        boolean vanilla=RenderBackends.requestedMode()==dev.rayvox.render.BackendMode.VULKAN_VANILLA;
+        boolean vulkan=RenderBackends.active()||vanilla;
         if(vulkan) {
             renderer();
             toggle("Rayvox rendering",Rayvox.ENABLED,"Enable the selected renderer.");
-            toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable directional sun and moon illumination.");
-            toggle("Held item lights",Rayvox.DYNAMIC,"Emissive held blocks illuminate the path-traced world.");
-            slider("GPU memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Renderer memory budget. Restart required.");
+            if(!vanilla) {
+                toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable directional sun and moon illumination.");
+                toggle("Held item lights",Rayvox.DYNAMIC,"Emissive held blocks illuminate the path-traced world.");
+            }
+            slider("GPU memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Budget for the next Vulkan initialization. Switching away and back reapplies it.");
         } else if (performance) {
-            slider("Vulkan memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Vulkan GPU memory budget. Restart required.");
+            slider("Vulkan memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Budget for the next Vulkan initialization.");
             toggle("Lighting culling", Rayvox.CULLING,
                     "Skip lighting and shadow work outside the view or fully blocked by opaque geometry. Disable to compare performance.");
             slider("History memory", Rayvox.HISTORY_MEMORY, 64, 2048, " MiB",
@@ -103,10 +108,11 @@ final class RayvoxSettingsScreen extends Screen {
     private int y() { return 40 + (next++ / 2) * rowSpacing; }
 
     private void renderer() {
-        cycle("Renderer",()->Rayvox.RENDER_BACKEND.get().name(),()->{
+        cycle("Renderer",()->RenderBackends.requestedMode().name(),()->{
             var modes=dev.rayvox.render.BackendMode.values();
-            Rayvox.RENDER_BACKEND.set(modes[(Rayvox.RENDER_BACKEND.get().ordinal()+1)%modes.length]);Rayvox.RENDER_BACKEND.save();
-        },"Restart required. AUTO chooses a validated available backend. Vulkan requires a compatible ray-tracing GPU and Fast/Fancy graphics.");
+            RenderBackends.requestMode(modes[(RenderBackends.requestedMode().ordinal()+1)%modes.length]);
+            rebuildWidgets();
+        },"Applies next frame. Vanilla Vulkan uses Minecraft lighting without ray tracing. Realistic Vulkan requires a ray-capable GPU. Fast/Fancy graphics required; failed switches retain the working mode.");
     }
 
     private void toggle(String label, ModConfigSpec.BooleanValue setting, String help) {
@@ -150,11 +156,12 @@ final class RayvoxSettingsScreen extends Screen {
         // Persist sliders once when leaving; dragging must not write the config every frame.
         Rayvox.ENABLED.save();
     }
+    @Override public void tick(){if(shownMode!=RenderBackends.requestedMode())rebuildWidgets();}
 
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         super.render(graphics, mouseX, mouseY, partialTick);
         graphics.drawCenteredString(font, title, width / 2, 12, 0xffffff);
-        graphics.drawCenteredString(font, RenderBackends.active()?"Vulkan path tracing":performance ? "OpenGL performance" : "OpenGL lighting", width / 2, 26, 0xaaaaaa);
+        graphics.drawCenteredString(font, Rayvox.RENDER_BACKEND.get()==dev.rayvox.render.BackendMode.VULKAN_VANILLA?"Vulkan vanilla lighting":RenderBackends.pathTracing()?"Vulkan realistic lighting":performance ? "OpenGL performance" : "OpenGL lighting", width / 2, 26, 0xaaaaaa);
     }
 
     @Override public void onClose() { minecraft.setScreen(parent); }

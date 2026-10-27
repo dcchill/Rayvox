@@ -14,6 +14,7 @@ abstract class NativeImageMixin {
     @Shadow @Final private NativeImage.Format format;
     @Inject(method="_upload",at=@At("HEAD"))
     private void rayvox$capturePixels(int level,int x,int y,int sx,int sy,int w,int h,boolean blur,boolean clamp,boolean mipmap,boolean close,CallbackInfo ci) {
+        dev.rayvox.render.RasterHooks.nativeBoundary();
         if(!TextureSnapshots.interested())return;
         TextureSnapshots.upload(TextureSnapshots.bound(),level,x,y,sx,sy,w,h,width,format.components(),pixels);
     }

@@ -1,6 +1,7 @@
 #version 460
 layout(local_size_x=8,local_size_y=8) in;
 layout(rgba16f,set=0,binding=1) uniform image2D radianceImage;
+layout(rgba16f,set=0,binding=8) uniform readonly image2D resolvedImage;
 layout(rgba32f,set=0,binding=2) uniform image2D geometryImage;
 layout(rgba16f,set=0,binding=3) uniform image2D normalImage;
 layout(rgba32f,set=0,binding=7) uniform image2D previousGeometry;
@@ -14,6 +15,7 @@ layout(r32f,set=0,binding=11) uniform image2D outputDepth;
 layout(std430,set=0,binding=13) readonly buffer Exposure {float exposure;};
 layout(rgba16f,set=0,binding=14) uniform image2D previousUpscale;
 layout(rgba16f,set=0,binding=15) uniform image2D nextUpscale;
+vec3 filtered(ivec2 p){return camera.outputSize.z==1?imageLoad(resolvedImage,p).rgb:imageLoad(radianceImage,p).rgb;}
 void main() {
     ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(outputColor);if(any(greaterThanEqual(pixel,size)))return;
     vec2 source=(vec2(pixel)+.5)*vec2(imageSize(radianceImage))/vec2(size)-.5;
@@ -24,11 +26,11 @@ void main() {
     for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
         ivec2 q=clamp(ivec2(floor(source))+ivec2(x,y),ivec2(0),lowSize-1);
         vec4 sampleGeometry=imageLoad(geometryImage,q);if(sampleGeometry.w!=g.w)continue;
-        vec3 c=imageLoad(radianceImage,q).rgb;
+        vec3 c=filtered(q);
         float w=max(.001,(1-abs(source.x-q.x))*(1-abs(source.y-q.y)));
         color+=c*w;weights+=w;minimum=min(minimum,c);maximum=max(maximum,c);
     }
-    if(weights>0)color/=weights;else{color=imageLoad(radianceImage,p).rgb;minimum=maximum=color;}
+    if(weights>0)color/=weights;else{color=filtered(p);minimum=maximum=color;}
     // Intersect the full-resolution camera ray with the reconstructed surface
     // plane, preserving subpixel positions rather than repeating low-res pixels.
     vec2 uv=(vec2(pixel)+.5)/vec2(size);

@@ -9,14 +9,21 @@ import static dev.rayvox.render.vulkan.VulkanContext.check;
 final class VulkanImage implements AutoCloseable {
     final VulkanContext context;
     final int width,height,format;
+    final int aspect;
+    final int levels;
     long image,memory,view,size;
     boolean initialized;
     VulkanImage(VulkanContext context,int width,int height,int format,int usage,boolean shared) {
+        this(context,width,height,format,usage,shared,1);
+    }
+    VulkanImage(VulkanContext context,int width,int height,int format,int usage,boolean shared,int levels) {
         this.context=context;this.width=width;this.height=height;this.format=format;
+        this.levels=levels;
+        aspect=format==VK_FORMAT_D32_SFLOAT?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT;
         try(var stack=MemoryStack.stackPush()) {
             var external=VkExternalMemoryImageCreateInfo.calloc(stack).sType$Default().handleTypes(VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
             var info=VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(format)
-                    .extent(e->e.set(width,height,1)).mipLevels(1).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
+                    .extent(e->e.set(width,height,1)).mipLevels(levels).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                     .tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
             if(shared) info.pNext(external.address());
             var out=stack.mallocLong(1);check(vkCreateImage(context.device,info,null,out),"create image");image=out.get(0);
@@ -35,7 +42,7 @@ final class VulkanImage implements AutoCloseable {
             check(vkAllocateMemory(context.device,allocation,null,out),"allocate image");memory=out.get(0);context.allocated+=size;
             check(vkBindImageMemory(context.device,image,memory,0),"bind image");
             var viewInfo=VkImageViewCreateInfo.calloc(stack).sType$Default().image(image).viewType(VK_IMAGE_VIEW_TYPE_2D).format(format);
-            viewInfo.subresourceRange().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+            viewInfo.subresourceRange().aspectMask(aspect).levelCount(levels).layerCount(1);
             check(vkCreateImageView(context.device,viewInfo,null,out),"create image view");view=out.get(0);
         } catch(RuntimeException|Error failure) {close();throw failure;}
     }
@@ -47,7 +54,7 @@ final class VulkanImage implements AutoCloseable {
         try(var stack=MemoryStack.stackPush()) {
             var barriers=VkImageMemoryBarrier.calloc(1,stack).sType$Default().image(image).oldLayout(oldLayout).newLayout(newLayout)
                     .srcAccessMask(sourceAccess).dstAccessMask(targetAccess).srcQueueFamilyIndex(sourceFamily).dstQueueFamilyIndex(targetFamily);
-            barriers.subresourceRange().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+            barriers.subresourceRange().aspectMask(aspect).levelCount(levels).layerCount(1);
             vkCmdPipelineBarrier(cmd,sourceStage,targetStage,0,null,null,barriers);
         }
     }

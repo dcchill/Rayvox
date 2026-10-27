@@ -26,6 +26,8 @@ public final class VulkanContext implements AutoCloseable {
     long allocator, pool, allocated;
     long budget=Long.MAX_VALUE;
     int family, timestampBits;
+    int scratchAlignment=256;
+    boolean rayTracingSupported;
     float timestampPeriod;
     String name="";
     private long debugMessenger;
@@ -36,11 +38,14 @@ public final class VulkanContext implements AutoCloseable {
         if (result != VK_SUCCESS) throw new IllegalStateException(action+" failed (VkResult "+result+")");
     }
     public VulkanContext(byte[] glDeviceUuid, boolean validation) {
+        this(glDeviceUuid, validation, true);
+    }
+    public VulkanContext(byte[] glDeviceUuid, boolean validation, boolean rayTracing) {
         // LWJGL 3.3.3 enumerates all driver extensions on its thread-local stack.
         // Modern drivers exceed its 64 KiB default. Bootstrap on a fresh thread so
         // an already-created Minecraft render-thread stack cannot constrain it.
         var result=new java.util.concurrent.CompletableFuture<Void>();
-        var bootstrap=new Thread(()->{try{bootstrapStack();initialize(glDeviceUuid,validation);result.complete(null);}catch(Throwable failure){result.completeExceptionally(failure);}},"Rayvox Vulkan bootstrap");
+        var bootstrap=new Thread(()->{try{bootstrapStack();initialize(glDeviceUuid,validation,rayTracing);result.complete(null);}catch(Throwable failure){result.completeExceptionally(failure);}},"Rayvox Vulkan bootstrap");
         bootstrap.setDaemon(true);bootstrap.start();
         try { result.join(); }
         catch(java.util.concurrent.CompletionException failure) {
@@ -59,7 +64,8 @@ public final class VulkanContext implements AutoCloseable {
         var field=MemoryStack.class.getDeclaredField("TLS");field.setAccessible(true);
         var local=(ThreadLocal<MemoryStack>)field.get(null);local.set(MemoryStack.create(1024*1024));
     }
-    private void initialize(byte[] uuid, boolean validation) {
+    private void initialize(byte[] uuid, boolean validation, boolean rayTracing) {
+        var required=rayTracing?EXTENSIONS:List.of(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
         try (var stack=MemoryStack.stackPush()) {
             var app=VkApplicationInfo.calloc(stack).sType$Default().pApplicationName(stack.UTF8("Rayvox"))
                     .apiVersion(VK_API_VERSION_1_3);
@@ -106,42 +112,51 @@ public final class VulkanContext implements AutoCloseable {
                 var extensions=VkExtensionProperties.calloc(count.get(0),stack);
                 check(vkEnumerateDeviceExtensionProperties(candidate,(ByteBuffer)null,count,extensions),"enumerate extensions");
                 var supported=new HashSet<String>(); for(var extension:extensions) supported.add(extension.extensionNameString());
-                if(!supported.containsAll(EXTENSIONS)) { rejection="Missing Vulkan ray-query or Windows interoperability extensions"; continue; }
+                if(!supported.containsAll(required)) { rejection="Missing Vulkan "+(rayTracing?"ray-query or ":"")+"Windows interoperability extensions"; continue; }
                 var ray=VkPhysicalDeviceRayQueryFeaturesKHR.calloc(stack).sType$Default();
                 var accel=VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack).sType$Default().pNext(ray.address());
                 var f12=VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().pNext(accel.address());
                 var f13=VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().pNext(f12.address());
                 var features=VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(f13.address());
                 vkGetPhysicalDeviceFeatures2(candidate,features);
-                if(!ray.rayQuery() || !accel.accelerationStructure() || !f12.bufferDeviceAddress()
+                if(rayTracing && (!ray.rayQuery() || !accel.accelerationStructure() || !f12.bufferDeviceAddress()
                         || !f12.shaderSampledImageArrayNonUniformIndexing() || !f12.descriptorBindingPartiallyBound()
-                        || !f13.synchronization2() || !features.features().shaderInt64()) {
+                        || !f13.synchronization2() || !features.features().shaderInt64())) {
                     rejection="Missing ray-query, descriptor indexing, shaderInt64 or synchronization2 features"; continue;
                 }
+                if(!rayTracing&&!f13.dynamicRendering()){rejection="Vulkan dynamic rendering is unavailable";continue;}
                 vkGetPhysicalDeviceQueueFamilyProperties(candidate,count,null);
                 var families=VkQueueFamilyProperties.calloc(count.get(0),stack);
                 vkGetPhysicalDeviceQueueFamilyProperties(candidate,count,families);
-                for(int q=0;q<families.remaining();q++) if((families.get(q).queueFlags()&VK_QUEUE_COMPUTE_BIT)!=0) {
+                int queueFlags=rayTracing?VK_QUEUE_COMPUTE_BIT:VK_QUEUE_GRAPHICS_BIT;
+                for(int q=0;q<families.remaining();q++) if((families.get(q).queueFlags()&queueFlags)!=0) {
                     physical=candidate; family=q; timestampBits=families.get(q).timestampValidBits();
+                    rayTracingSupported=ray.rayQuery()&&accel.accelerationStructure()&&f12.bufferDeviceAddress()&&f12.shaderSampledImageArrayNonUniformIndexing()&&f12.descriptorBindingPartiallyBound()&&f13.synchronization2()&&features.features().shaderInt64();
                     name=props.properties().deviceNameString(); timestampPeriod=props.properties().limits().timestampPeriod(); break;
                 }
                 if(physical!=null) break;
             }
             if(physical==null) throw new IllegalStateException(rejection);
+            if(rayTracing) {
+                var properties=VkPhysicalDeviceAccelerationStructurePropertiesKHR.calloc(stack).sType$Default();
+                vkGetPhysicalDeviceProperties2(physical,VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(properties.address()));
+                scratchAlignment=properties.minAccelerationStructureScratchOffsetAlignment();
+            }
             var ray=VkPhysicalDeviceRayQueryFeaturesKHR.calloc(stack).sType$Default().rayQuery(true);
             var accel=VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack).sType$Default().accelerationStructure(true).pNext(ray.address());
             var f12=VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default().bufferDeviceAddress(true)
                     .shaderSampledImageArrayNonUniformIndexing(true).descriptorBindingPartiallyBound(true).pNext(accel.address());
-            var f13=VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().synchronization2(true).pNext(f12.address());
+            var f13=VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().synchronization2(rayTracing).dynamicRendering(!rayTracing);
+            if(rayTracing)f13.pNext(f12.address());
             var queues=VkDeviceQueueCreateInfo.calloc(1,stack); queues.get(0).sType$Default().queueFamilyIndex(family).pQueuePriorities(stack.floats(1));
-            var names=stack.mallocPointer(EXTENSIONS.size()); for(String extension:EXTENSIONS) names.put(stack.UTF8(extension)); names.flip();
+            var names=stack.mallocPointer(required.size()); for(String extension:required) names.put(stack.UTF8(extension)); names.flip();
             var deviceInfo=VkDeviceCreateInfo.calloc(stack).sType$Default().pNext(f13.address()).pQueueCreateInfos(queues)
-                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(true));
+                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(rayTracing));
             check(vkCreateDevice(physical,deviceInfo,null,out),"create device"); device=new VkDevice(out.get(0),physical,deviceInfo);
             vkGetDeviceQueue(device,family,0,out); queue=new VkQueue(out.get(0),device);
             var functions=VmaVulkanFunctions.calloc(stack).set(instance,device);
             var allocatorInfo=VmaAllocatorCreateInfo.calloc(stack).instance(instance).physicalDevice(physical).device(device)
-                    .vulkanApiVersion(VK_API_VERSION_1_3).pVulkanFunctions(functions).flags(VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT);
+                    .vulkanApiVersion(VK_API_VERSION_1_3).pVulkanFunctions(functions).flags(rayTracing?VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT:0);
             check(vmaCreateAllocator(allocatorInfo,out),"create allocator"); allocator=out.get(0);
             var h=stack.mallocLong(1);
             check(vkCreateCommandPool(device,VkCommandPoolCreateInfo.calloc(stack).sType$Default()

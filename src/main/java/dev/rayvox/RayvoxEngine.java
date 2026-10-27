@@ -185,7 +185,7 @@ public final class RayvoxEngine {
 
     public static void tickCache() {
         if(RenderBackends.active())return;
-        if (level == null || terrain == null || !Rayvox.ENABLED.get()) {
+        if (level == null || terrain == null || !RenderBackends.realisticLighting()) {
             if (worldCache != null) distant = new DistantLightCache();
             worldCache = null;
             closeGpuCache();
@@ -221,7 +221,7 @@ public final class RayvoxEngine {
 
     public static void renderStage(RenderLevelStageEvent event) {
         RenderBackends.renderStage(event);
-        if(RenderBackends.active())return;
+        if(RenderBackends.active()||!RenderBackends.realisticLighting())return;
         if (event.getStage() == RenderLevelStageEvent.Stage.AFTER_LEVEL && worldCache != null && Rayvox.ENABLED.get()) {
             renderSunlightVolume(event);
             LightDebugView.render(event, lights, worldCache.grid, debugMode);
@@ -479,7 +479,7 @@ public final class RayvoxEngine {
 
     public static ShaderInstance terrainShader(ShaderInstance vanilla, RenderType layer,
             double cameraX, double cameraY, double cameraZ) {
-        if(RenderBackends.active())return vanilla;
+        if(RenderBackends.active()||!RenderBackends.realisticLighting())return vanilla;
         RenderSystem.assertOnRenderThread();
         updateLevel(Minecraft.getInstance().level);
         if (terrain == null || level == null || !Rayvox.ENABLED.get() || gpuCache == null || gpuLights == null || worldCache == null) return vanilla;
@@ -494,9 +494,11 @@ public final class RayvoxEngine {
     }
 
     public static void renderingWorld(boolean active) { renderingWorld = active; }
+    static void rendererChanged(){closeGpuCache();worldCache=null;distant=new DistantLightCache();dynamic=List.of();entityCasters=List.of();frozen=false;}
     static LightColors lightColors(){return colors;}
 
     public static ShaderInstance entityShader(ShaderInstance vanilla) {
+        if(RenderBackends.active()||!RenderBackends.realisticLighting())return vanilla;
         if (!renderingWorld || vanilla == null || entityShader == null || terrain == null || level == null
                 || !Rayvox.ENABLED.get() || gpuCache == null || gpuLights == null || worldCache == null) return vanilla;
         // Keep emissive eyes, outlines, glints, beams, and custom mod shaders on their original paths.

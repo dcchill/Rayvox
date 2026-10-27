@@ -15,13 +15,18 @@ final class SharedSurface implements AutoCloseable {
     long ready,complete;
     int colorMemory,depthMemory,colorTexture,depthTexture,glReady,glComplete;
     boolean consumed;
+    final boolean raster;
     SharedSurface(VulkanContext context,int width,int height) {
+        this(context,width,height,false);
+    }
+    SharedSurface(VulkanContext context,int width,int height,boolean raster) {
         this.context=context;
+        this.raster=raster;
         try {
-            color=new VulkanImage(context,width,height,VK_FORMAT_R16G16B16A16_SFLOAT,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,true);
-            depth=new VulkanImage(context,width,height,VK_FORMAT_R32_SFLOAT,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,true);
+            color=new VulkanImage(context,width,height,raster?VK_FORMAT_R8G8B8A8_UNORM:VK_FORMAT_R16G16B16A16_SFLOAT,(raster?VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT:VK_IMAGE_USAGE_STORAGE_BIT)|VK_IMAGE_USAGE_SAMPLED_BIT,true);
+            depth=new VulkanImage(context,width,height,raster?VK_FORMAT_D32_SFLOAT:VK_FORMAT_R32_SFLOAT,(raster?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:VK_IMAGE_USAGE_STORAGE_BIT)|VK_IMAGE_USAGE_SAMPLED_BIT,true);
             colorMemory=importMemory(color);depthMemory=importMemory(depth);
-            colorTexture=texture(color,colorMemory,GL_RGBA16F);depthTexture=texture(depth,depthMemory,GL_R32F);
+            colorTexture=texture(color,colorMemory,raster?GL_RGBA8:GL_RGBA16F);depthTexture=texture(depth,depthMemory,raster?GL_DEPTH_COMPONENT32F:GL_R32F);
             ready=semaphore();complete=semaphore();glReady=importSemaphore(ready);glComplete=importSemaphore(complete);
         } catch(RuntimeException|Error failure) {close();throw failure;}
     }
@@ -74,10 +79,12 @@ final class SharedSurface implements AutoCloseable {
     void acquire(VkCommandBuffer cmd) {
         for(var image:new VulkanImage[]{color,depth}) {
             if(consumed) image.transition(cmd,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,0,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_QUEUE_FAMILY_EXTERNAL,context.family);
+                    stage(),access(),VK_QUEUE_FAMILY_EXTERNAL,context.family);
             else image.general(cmd);
         }
     }
+    private int stage(){return raster?VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT:VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;}
+    private int access(){return raster?VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT:VK_ACCESS_SHADER_WRITE_BIT;}
     private static final class WindowsHandles {
         static final org.lwjgl.system.SharedLibrary LIBRARY=org.lwjgl.system.Library.loadNative(SharedSurface.class,"org.lwjgl","kernel32");
         static final long CLOSE=LIBRARY.getFunctionAddress("CloseHandle");
@@ -86,7 +93,17 @@ final class SharedSurface implements AutoCloseable {
     private static void glCheck(String action){int error=glGetError();if(error!=GL_NO_ERROR)throw new IllegalStateException(action+" GL error "+error);}
     void release(VkCommandBuffer cmd) {
         for(var image:new VulkanImage[]{color,depth}) image.transition(cmd,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,context.family,VK_QUEUE_FAMILY_EXTERNAL);
+                stage(),access(),VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,context.family,VK_QUEUE_FAMILY_EXTERNAL);
+    }
+    void initializeRaster() {
+        var command=context.commandBuffer();context.begin(command);
+        for(var image:new VulkanImage[]{color,depth})image.transition(command,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,0,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,context.family,VK_QUEUE_FAMILY_EXTERNAL);
+        check(vkEndCommandBuffer(command),"initialize shared raster images");
+        try(var stack=MemoryStack.stackPush()) {
+            check(vkQueueSubmit(context.queue,VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address())).pSignalSemaphores(stack.longs(ready)),0),"release raster images to GL");
+            waitForVulkan();glFlush();check(vkQueueWaitIdle(context.queue),"initialize raster sharing");
+            vkFreeCommandBuffers(context.device,context.pool,command);
+        }
     }
     void waitForVulkan() {EXTSemaphore.glWaitSemaphoreEXT(glReady,new int[0],new int[]{colorTexture,depthTexture},new int[]{EXTSemaphore.GL_LAYOUT_GENERAL_EXT,EXTSemaphore.GL_LAYOUT_GENERAL_EXT});}
     void signalComplete() {

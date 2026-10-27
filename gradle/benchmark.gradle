@@ -7,9 +7,18 @@ sourceSets {
 }
 
 def benchmarkDirectory = layout.projectDirectory.dir('run/benchmark-client').asFile
+def packagedBenchmark = providers.gradleProperty('rayvoxPackagedBenchmark').isPresent()
 
 tasks.register('prepareBenchmarkClient') {
+    if (packagedBenchmark) dependsOn tasks.named('jar')
     doLast {
+        def packagedMod = new File(benchmarkDirectory, 'mods/rayvox-packaged.jar')
+        if (packagedBenchmark) {
+            packagedMod.parentFile.mkdirs()
+            packagedMod.bytes = tasks.named('jar').get().archiveFile.get().asFile.bytes
+        } else if (packagedMod.isFile() && !packagedMod.delete()) {
+            throw new GradleException('Cannot remove the previous isolated packaged benchmark mod')
+        }
         new File(benchmarkDirectory, 'config').mkdirs()
         new File(benchmarkDirectory, 'config/fml.toml').text = 'earlyWindowControl=false\n'
         new File(benchmarkDirectory, 'options.txt').text = '''enableVsync:false
@@ -47,10 +56,12 @@ neoForge {
         benchmarkClient {
             client()
             sourceSet = sourceSets.benchmark
-            loadedMods = [mods.rayvox, mods.rayvox_benchmark]
+            loadedMods = packagedBenchmark ? [mods.rayvox_benchmark] : [mods.rayvox, mods.rayvox_benchmark]
             gameDirectory = benchmarkDirectory
             systemProperty 'rayvox.benchmark', 'true'
+            systemProperty 'rayvox.benchmark.requirePackaged', packagedBenchmark.toString()
             systemProperty 'rayvox.benchmark.scene', providers.gradleProperty('rayvoxBenchmarkScene').orElse('room').get()
+            systemProperty 'rayvox.vulkan.fixedResolution', providers.gradleProperty('rayvoxBenchmarkFixedResolution').orElse('false').get()
             programArguments.addAll('--username', 'RayvoxBench', '--width', '1280', '--height', '720')
             taskBefore tasks.named('prepareBenchmarkClient')
         }

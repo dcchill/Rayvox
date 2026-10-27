@@ -22,13 +22,35 @@ neoForge {
     }
 }
 
+repositories { mavenCentral() }
+configurations { vulkanNatives }
 dependencies {
+    for (module in ['lwjgl-vulkan', 'lwjgl-vma', 'lwjgl-shaderc']) {
+        jarJar(implementation("org.lwjgl:${module}:3.3.3") { transitive = false }) { version { strictly '3.3.3' } }
+        if (!providers.gradleProperty('rayvoxPackagedBenchmark').isPresent()) {
+            additionalRuntimeClasspath("org.lwjgl:${module}:3.3.3") { transitive = false }
+        }
+    }
+    for (module in ['lwjgl-vma', 'lwjgl-shaderc']) {
+        runtimeOnly "org.lwjgl:${module}:3.3.3:natives-windows"
+        if (!providers.gradleProperty('rayvoxPackagedBenchmark').isPresent()) {
+            additionalRuntimeClasspath "org.lwjgl:${module}:3.3.3:natives-windows"
+        }
+        vulkanNatives "org.lwjgl:${module}:3.3.3:natives-windows"
+    }
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// Keep native resources alongside the mod; JarJar selects one artifact per module.
+tasks.named('jar') {
+    from({ configurations.vulkanNatives.collect { zipTree(it) } }) { include '**/*.dll' }
+}
+
 tasks.named('test') {
     useJUnitPlatform()
+    exclude 'dev/rayvox/render/**'
+    dependsOn 'vulkanTest'
     if (providers.gradleProperty('rayvoxColorBenchmark').isPresent()) {
         systemProperty 'rayvox.colorBenchmark', 'true'
         testLogging.showStandardStreams = true
@@ -41,6 +63,15 @@ tasks.named('test') {
     }
 }
 
+// Native bindings must share one loader; NeoForge's transformed test launcher has a second LWJGL loader.
+tasks.register('vulkanTest', Test) {
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath.filter { !it.name.startsWith('junit-fml-') }
+    useJUnitPlatform()
+    include 'dev/rayvox/render/**'
+    dependsOn testClasses
+}
+
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
 tasks.withType(JavaExec).configureEach {
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) }
@@ -49,17 +80,20 @@ tasks.withType(JavaExec).configureEach {
 sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
 sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
 
-tasks.register('cacheCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.rayvox.VoxelGridCheck'
+// The unit-test runtime omits client assets; compile production GLSL against the real vanilla includes.
+tasks.named('processTestResources') {
+    dependsOn tasks.named('createMinecraftArtifacts')
+    from({ zipTree(fileTree(layout.buildDirectory.dir('moddev/artifacts')).matching {
+        include '*-client-extra-aka-minecraft-resources.jar'
+    }.singleFile) }) {
+        include 'assets/minecraft/shaders/include/**'
+        include 'assets/minecraft/shaders/core/**'
+    }
 }
+
+tasks.register('cacheCheck') { dependsOn test }
 tasks.named('check') { dependsOn cacheCheck }
-tasks.register('lightingCheck', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'dev.rayvox.LightingCheck'
-}
+tasks.register('lightingCheck') { dependsOn test }
 tasks.named('check') { dependsOn lightingCheck }
 
 tasks.register('materialCheck') { dependsOn test }
