@@ -23,6 +23,9 @@ public final class VulkanRasterBackend implements RenderBackend {
     private int framebuffer;
     private RenderTarget target;
     private int originalFramebuffer,originalColor,originalDepth;
+    private int originalWidth,originalHeight,originalViewWidth,originalViewHeight,outputWidth,outputHeight;
+    private int internalWidth,internalHeight;
+    private GlWorldResolve worldResolve;
     private long descriptorLayout,pipelineLayout,serial;
     private int uniformAlignment=256,slot;
     private final Frame[] frames=new Frame[2];
@@ -116,6 +119,7 @@ public final class VulkanRasterBackend implements RenderBackend {
             }
             textures=new RasterTextures(context,retired);
             depthCopy=new GlDepthCopy();
+            worldResolve=new GlWorldResolve();
             for(int i=0;i<frames.length;i++)frames[i]=new Frame();
             var main=Minecraft.getInstance().getMainRenderTarget();
             if(main.isStencilEnabled())throw new IllegalStateException("Vulkan vanilla requires a main target without stencil");
@@ -123,10 +127,13 @@ public final class VulkanRasterBackend implements RenderBackend {
         }catch(RuntimeException|Error failure){close();throw failure;}
     }
     public void beginFrame() {
-        long start=System.nanoTime();frame=frames[slot];frame.complete();waitMillis=(System.nanoTime()-start)/1e6;serial++;
+        if(frame!=null)endFrame();
         var main=Minecraft.getInstance().getMainRenderTarget();
         if(main.isStencilEnabled())throw new IllegalStateException("Vulkan vanilla requires a main target without stencil");
-        resize(main.width,main.height);attach(main);
+        // Resolve/detach restores native dimensions before any next-frame sizing decisions.
+        detach();resize(main.width,main.height);
+        long start=System.nanoTime();frame=frames[slot];frame.complete();waitMillis=(System.nanoTime()-start)/1e6;serial++;
+        attach(main);
     }
     public void endFrame() {
         if(frame==null)return;
@@ -136,6 +143,10 @@ public final class VulkanRasterBackend implements RenderBackend {
             check(vkQueueSubmit(context.queue,VkSubmitInfo.calloc(stack).sType$Default(),frame.fence),"finish raster frame");frame.submission=serial;
         }
         lastDraws=frame.drawCount;lastBatches=frame.batches;lastEntityDraws=frame.entityDraws;lastParticleDraws=frame.particleDraws;frame=null;slot=(slot+1)%frames.length;
+    }
+    /** Native auxiliary targets (notably outlines) change the viewport before bindWrite(false). */
+    public void boundTarget(RenderTarget bound) {
+        if(!internal&&bound==target)glViewport(0,0,internalWidth,internalHeight);
     }
     public static boolean supports(String name) {
         return Set.of("rendertype_solid","rendertype_cutout","rendertype_cutout_mipped","rendertype_translucent","rendertype_tripwire","rendertype_eyes","particle",
@@ -255,43 +266,61 @@ public final class VulkanRasterBackend implements RenderBackend {
         vkCmdDrawIndexed(command,draw.geometry().count(),1,0,0,0);
     }}
     public void resize(int width,int height) {
-        if(width<1||height<1||surface!=null&&surface.color.width==width&&surface.color.height==height)return;
+        var mode=dev.rayvox.Rayvox.UPSCALING.get();
+        int nextWidth=mode.dimension(width),nextHeight=mode.dimension(height);
+        if(width<1||height<1||surface!=null&&internalWidth==nextWidth&&internalHeight==nextHeight&&outputWidth==width&&outputHeight==height)return;
         detach();drain();internal=true;
         try {
             if(surface!=null){surface.close();surface=null;}if(framebuffer!=0){glDeleteFramebuffers(framebuffer);framebuffer=0;}
-            surface=new SharedSurface(context,width,height,true);surface.initializeRaster();framebuffer=glGenFramebuffers();
-            int old=glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
+            outputWidth=width;outputHeight=height;
+            internalWidth=nextWidth;internalHeight=nextHeight;
+            // Keep external-image tile row pitches identical across the two drivers. Logical
+            // viewports stay exact; padding is excluded from every color/depth sample.
+            surface=new SharedSurface(context,(internalWidth+63)&~63,(internalHeight+63)&~63,true);surface.initializeRaster();framebuffer=glGenFramebuffers();
+            int read=glGetInteger(GL_READ_FRAMEBUFFER_BINDING),draw=glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
             glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,surface.colorTexture,0);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,surface.depthTexture,0);
-            int status=glCheckFramebufferStatus(GL_FRAMEBUFFER);glBindFramebuffer(GL_FRAMEBUFFER,old);
+            int status=glCheckFramebufferStatus(GL_FRAMEBUFFER);glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);
             if(status!=GL_FRAMEBUFFER_COMPLETE)throw new IllegalStateException("Shared vanilla framebuffer incomplete: "+status);
         }finally{internal=false;}
     }
     private void attach(RenderTarget main) {
         if(target==main)return;
         target=main;originalFramebuffer=main.frameBufferId;originalColor=main.getColorTextureId();originalDepth=main.getDepthTextureId();
+        originalWidth=main.width;originalHeight=main.height;originalViewWidth=main.viewWidth;originalViewHeight=main.viewHeight;
         internal=true;
-        try{blit(originalFramebuffer,framebuffer,originalDepth);main.frameBufferId=framebuffer;((RenderTargetAccess)main).rayvox$color(surface.colorTexture);((RenderTargetAccess)main).rayvox$depth(surface.depthTexture);main.bindWrite(false);}finally{internal=false;}
+        try {
+            blit(originalFramebuffer,framebuffer,originalDepth,originalWidth,originalHeight,internalWidth,internalHeight,false);
+            main.frameBufferId=framebuffer;((RenderTargetAccess)main).rayvox$color(surface.colorTexture);((RenderTargetAccess)main).rayvox$depth(surface.depthTexture);
+            main.width=main.viewWidth=internalWidth;main.height=main.viewHeight=internalHeight;main.bindWrite(true);
+        }finally{internal=false;}
     }
     public void beforeTargetChange(RenderTarget changed){if(changed==target)detach();}
     public void detach() {
         if(target==null)return;
         flush();internal=true;
         try {
-            blit(framebuffer,originalFramebuffer,surface.depthTexture);var main=target;target=null;
+            var main=target;target=null;
             main.frameBufferId=originalFramebuffer;((RenderTargetAccess)main).rayvox$color(originalColor);((RenderTargetAccess)main).rayvox$depth(originalDepth);main.bindWrite(false);
+            main.width=originalWidth;main.height=originalHeight;main.viewWidth=originalViewWidth;main.viewHeight=originalViewHeight;
+            blit(framebuffer,originalFramebuffer,surface.depthTexture,internalWidth,internalHeight,originalWidth,originalHeight,true);
+            main.bindWrite(true);
         }finally{internal=false;}
     }
-    private void blit(int source,int destination,int sourceDepth) {
+    private void blit(int source,int destination,int sourceDepth,int sourceWidth,int sourceHeight,int destinationWidth,int destinationHeight,boolean resolve) {
         int read=glGetInteger(GL_READ_FRAMEBUFFER_BINDING),draw=glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);boolean scissor=glIsEnabled(GL_SCISSOR_TEST);glDisable(GL_SCISSOR_TEST);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER,source);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,destination);
-        glBlitFramebuffer(0,0,surface.color.width,surface.color.height,0,0,surface.color.width,surface.color.height,GL_COLOR_BUFFER_BIT,GL_NEAREST);
-        depthCopy.draw(sourceDepth,surface.color.width,surface.color.height);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);if(scissor)glEnable(GL_SCISSOR_TEST);
+        try {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,source);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,destination);
+            boolean scaled=sourceWidth!=destinationWidth||sourceHeight!=destinationHeight;
+            boolean fxaa=dev.rayvox.Rayvox.ANTI_ALIASING.get()==AntiAliasing.FXAA;
+            if(resolve&&(scaled||fxaa))worldResolve.resolve(surface.colorTexture,destination,destinationWidth,destinationHeight,scaled,fxaa,dev.rayvox.Rayvox.UPSCALE_SHARPNESS.get()/100f,internalWidth,internalHeight);
+            else glBlitFramebuffer(0,0,sourceWidth,sourceHeight,0,0,destinationWidth,destinationHeight,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            depthCopy.draw(sourceDepth,destinationWidth,destinationHeight,resolve?(float)internalWidth/surface.depth.width:1,resolve?(float)internalHeight/surface.depth.height:1);
+        } finally {glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);if(scissor)glEnable(GL_SCISSOR_TEST);}
     }
     public boolean copyDepth(RenderTarget destination,RenderTarget source) {
         if(internal||target==null||source!=target&&destination!=target)return false;
         flush();internal=true;int old=glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
-        try{glBindFramebuffer(GL_DRAW_FRAMEBUFFER,destination.frameBufferId);depthCopy.draw(source.getDepthTextureId(),destination.width,destination.height);return true;}
+        try{glBindFramebuffer(GL_DRAW_FRAMEBUFFER,destination.frameBufferId);depthCopy.draw(source.getDepthTextureId(),destination.width,destination.height,source==target?(float)internalWidth/surface.depth.width:1,source==target?(float)internalHeight/surface.depth.height:1);return true;}
         finally{glBindFramebuffer(GL_DRAW_FRAMEBUFFER,old);internal=false;}
     }
     private void drain(){if(context==null)return;if(frame!=null)endFrame();for(var slot:frames)if(slot!=null)slot.complete();glFinish();}
@@ -305,13 +334,13 @@ public final class VulkanRasterBackend implements RenderBackend {
     public List<String> validationMessages(){synchronized(context.validationMessages){return List.copyOf(context.validationMessages);}}
     public void update(Scene.Update update){}
     public void render(Scene.Camera camera){}
-    public Diagnostics diagnostics(){return new Diagnostics("Vulkan vanilla",context==null?"uninitialized":context.name,reason,surface==null?0:surface.color.width,surface==null?0:surface.color.height,gpuMillis,context==null?0:context.allocated,geometry.size(),draws.size());}
+    public Diagnostics diagnostics(){return new Diagnostics("Vulkan vanilla",context==null?"uninitialized":context.name,reason,surface==null?0:internalWidth,surface==null?0:internalHeight,gpuMillis,context==null?0:context.allocated,geometry.size(),draws.size());}
     public void close() {
         if(context==null)return;
         detach();drain();retired.complete(Long.MAX_VALUE);
         for(var gpu:geometry.values()){gpu.vertices().buffer().close();gpu.indices().buffer().close();}geometry.clear();
         for(var slot:frames)if(slot!=null)slot.close();for(var pipeline:pipelines.values())pipeline.close();pipelines.clear();
-        if(textures!=null)textures.close();if(depthCopy!=null)depthCopy.close();if(framebuffer!=0){glDeleteFramebuffers(framebuffer);framebuffer=0;}if(surface!=null){surface.close();surface=null;}
+        if(textures!=null)textures.close();if(depthCopy!=null)depthCopy.close();if(worldResolve!=null)worldResolve.close();if(framebuffer!=0){glDeleteFramebuffers(framebuffer);framebuffer=0;}if(surface!=null){surface.close();surface=null;}
         if(pipelineLayout!=0)vkDestroyPipelineLayout(context.device,pipelineLayout,null);if(descriptorLayout!=0)vkDestroyDescriptorSetLayout(context.device,descriptorLayout,null);
         context.close();context=null;
     }

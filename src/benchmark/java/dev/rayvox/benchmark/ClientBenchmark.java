@@ -5,15 +5,24 @@ import com.google.gson.JsonParser;
 import com.mojang.logging.LogUtils;
 import dev.rayvox.Rayvox;
 import dev.rayvox.RayvoxEngine;
+import dev.rayvox.RenderBackends;
+import dev.rayvox.render.AntiAliasing;
+import dev.rayvox.render.BackendMode;
+import dev.rayvox.render.UpscalingMode;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import java.awt.image.BufferedImage;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import javax.imageio.ImageIO;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
 import net.minecraft.core.BlockPos;
@@ -33,8 +42,11 @@ import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.RenderGuiEvent;
+import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.glfw.GLFW;
+import org.lwjgl.system.MemoryUtil;
 import static org.lwjgl.opengl.GL33C.*;
 
 /** Real client, world, mixins and renderer; loaded only by runBenchmarkClient. */
@@ -44,6 +56,7 @@ public final class ClientBenchmark {
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
     private static final boolean VULKAN = SCENE.startsWith("vulkan-");
     private static final boolean VANILLA_VULKAN = SCENE.startsWith("vulkan-vanilla");
+    private static final boolean VANILLA_UPSCALING = SCENE.equals("vulkan-vanilla-upscaling");
     private static final boolean TEMPORAL = SCENE.equals("temporal");
     private static final boolean WORLD_CACHE = SCENE.equals("world-cache");
     private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi") || WORLD_CACHE;
@@ -52,12 +65,28 @@ public final class ClientBenchmark {
     private static final boolean PIPELINE = SCENE.equals("pipeline") || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
     private static final boolean ENTITIES = SCENE.equals("entities") || SCENE.equals("vulkan-entities") || SCENE.equals("vulkan-vanilla-entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
-    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor") || SCENE.equals("vulkan-vanilla-outdoor");
+    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor") || SCENE.equals("vulkan-vanilla-outdoor") || VANILLA_UPSCALING;
     private static final boolean DIRECTIONAL_MATERIALS = !SCENE.equals("directional-basic");
-    private static final String WORLD = ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
+    private static final String WORLD = VANILLA_UPSCALING ? "rayvox-benchmark-upscaling-v1" : ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
-    private final List<Phase> phases = SCENE.equals("vulkan-vanilla-lifecycle") ? List.of(
+    // Opt-in captures with coarse native-reference quality checks. 103 seconds of planned phases.
+    private final List<Phase> phases = VANILLA_UPSCALING ? List.of(
+            new Phase("native-static", false, 8, UpscalingMode.NATIVE, AntiAliasing.OFF, 0),
+            new Phase("upscale-native-off", true, 6, UpscalingMode.NATIVE, AntiAliasing.OFF, 0),
+            new Phase("upscale-native-fxaa", true, 3, UpscalingMode.NATIVE, AntiAliasing.FXAA, 0),
+            new Phase("upscale-quality-off", true, 3, UpscalingMode.QUALITY, AntiAliasing.OFF, 20),
+            new Phase("upscale-quality-fxaa", true, 3, UpscalingMode.QUALITY, AntiAliasing.FXAA, 20),
+            new Phase("upscale-balanced-off", true, 3, UpscalingMode.BALANCED, AntiAliasing.OFF, 50),
+            new Phase("upscale-balanced-fxaa", true, 3, UpscalingMode.BALANCED, AntiAliasing.FXAA, 50),
+            new Phase("upscale-performance-off", true, 3, UpscalingMode.PERFORMANCE, AntiAliasing.OFF, 100),
+            new Phase("upscale-performance-fxaa", true, 3, UpscalingMode.PERFORMANCE, AntiAliasing.FXAA, 100),
+            new Phase("upscale-adaptive-fxaa", true, 3, UpscalingMode.ADAPTIVE, AntiAliasing.FXAA, 20),
+            new Phase("upscale-resized", true, 4, UpscalingMode.PERFORMANCE, AntiAliasing.FXAA, 100),
+            new Phase("upscale-backend-off", false, 3, UpscalingMode.QUALITY, AntiAliasing.FXAA, 20),
+            new Phase("upscale-backend-return", true, 5, UpscalingMode.QUALITY, AntiAliasing.FXAA, 20),
+            new Phase("upscale-reloaded", true, 5, UpscalingMode.QUALITY, AntiAliasing.FXAA, 20),
+            new Phase("upscale-native-return", true, 3, UpscalingMode.NATIVE, AntiAliasing.OFF, 0)) : SCENE.equals("vulkan-vanilla-lifecycle") ? List.of(
             new Phase("native-static",false,false,false,false,8,3),
             new Phase("vanilla-vulkan-static",true,false,false,false,10,3),
             new Phase("vulkan-edited",true,false,false,false,4,3),
@@ -130,6 +159,11 @@ public final class ClientBenchmark {
     private final long[] frameFences = new long[2];
     private int frameFence;
     private int phase = -1, framePhase = -1, activeQuery = -1, nextQuery, ticks, phaseTick;
+    private int upscalingOutputWidth = 1280, upscalingOutputHeight = 720;
+    private boolean upscalingWorldObserved, upscalingGuiObserved;
+    private BufferedImage upscalingNativeReference;
+    private String upscalingNativeImageHash;
+    private final Map<UpscalingSettings, String> upscalingOffImageHashes = new LinkedHashMap<>();
     private long phaseStart, measuredStart, lastFrame, renderStart, phasePassDraws, phaseIndirectDraws, phaseCompositionDraws, phaseDynamicDraws;
     private boolean opening, preparing, finished, timers;
     private int shadowEntityId;
@@ -140,6 +174,10 @@ public final class ClientBenchmark {
         if (!Boolean.getBoolean("rayvox.benchmark")) throw new IllegalStateException("Benchmark run property missing");
         instance = this;
         NeoForge.EVENT_BUS.addListener(this::tick);
+        if (VANILLA_UPSCALING) {
+            NeoForge.EVENT_BUS.addListener(this::observeUpscalingWorld);
+            NeoForge.EVENT_BUS.addListener(this::observeUpscalingGui);
+        }
     }
 
     private void tick(ClientTickEvent.Post event) {
@@ -228,6 +266,12 @@ public final class ClientBenchmark {
 
     private static void configure(Minecraft mc) {
         if(Boolean.getBoolean("rayvox.benchmark.requirePackaged")&&!Rayvox.class.getResource("Rayvox.class").toString().contains("rayvox-packaged.jar"))throw new IllegalStateException("Packaged benchmark loaded development Rayvox classes");
+        // Saved interactive settings (or an interrupted upscaling run) must not contaminate native parity scenes.
+        if (VANILLA_VULKAN) {
+            Rayvox.ANTI_ALIASING.set(AntiAliasing.OFF);
+            Rayvox.UPSCALING.set(UpscalingMode.NATIVE);
+            Rayvox.UPSCALE_SHARPNESS.set(0);
+        }
         if(VULKAN)Rayvox.RENDER_BACKEND.set(VANILLA_VULKAN?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.VULKAN_PATH_TRACING);
         if (GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) != GLFW.GLFW_FALSE)
             throw new IllegalStateException("Benchmark window must be hidden");
@@ -291,6 +335,11 @@ public final class ClientBenchmark {
         phaseCompositionDraws = RayvoxEngine.compositionPassDraws();
         phaseDynamicDraws = RayvoxEngine.dynamicPassDraws();
         var config = phases.get(index);
+        if (VANILLA_UPSCALING) {
+            Rayvox.ANTI_ALIASING.set(config.upscaling.antiAliasing());
+            Rayvox.UPSCALING.set(config.upscaling.mode());
+            Rayvox.UPSCALE_SHARPNESS.set(config.upscaling.sharpness());
+        }
         if(VANILLA_VULKAN)dev.rayvox.RenderBackends.requestMode(config.enabled?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.OPENGL);
         if(VULKAN) {
             var client=Minecraft.getInstance();var server=client.getSingleplayerServer();
@@ -335,7 +384,7 @@ public final class ClientBenchmark {
             Rayvox.SHADOW_SOFTNESS.set(config.name.equals("entity-sharp") ? 0 : 2);
         }
         Rayvox.CACHE_RADIUS.set(2); Rayvox.ACTIVE_LIGHTS.set(config.limit); Rayvox.LIGHTS_PER_SECTION.set(config.perTile);
-        if (DIRECTIONAL) {
+        if (DIRECTIONAL && !VANILLA_UPSCALING) {
             var server = Minecraft.getInstance().getSingleplayerServer();
             setup = CompletableFuture.runAsync(() -> server.overworld().setDayTime(config.name.startsWith("moon-") ? 18000 : 6000), server);
         } else if (config.expectedLights == 64) {
@@ -344,6 +393,16 @@ public final class ClientBenchmark {
                 prepareDense(server.overworld());
                 if (config.name.startsWith("partial-")) preparePartial(server.overworld());
             }, server);
+        }
+        if (VANILLA_UPSCALING) {
+            var client = Minecraft.getInstance();
+            if (config.name.equals("upscale-resized") || config.name.equals("upscale-native-return")) {
+                boolean odd = config.name.equals("upscale-resized");
+                upscalingOutputWidth = odd ? 1279 : 1280;
+                upscalingOutputHeight = odd ? 719 : 720;
+                GLFW.glfwSetWindowSize(client.getWindow().getWindow(), upscalingOutputWidth, upscalingOutputHeight);
+            }
+            if (config.name.equals("upscale-reloaded")) setup = client.reloadResourcePacks();
         }
         while (glGetError() != GL_NO_ERROR) { }
         LogUtils.getLogger().info("Rayvox benchmark phase {}", config.name);
@@ -365,7 +424,7 @@ public final class ClientBenchmark {
             for(int x=-6;x<=6;x++)for(int z=-4;z<=6;z++)world.setBlock(position.set(x,64,z),
                     (x<0?Blocks.GOLD_BLOCK:Blocks.IRON_BLOCK).defaultBlockState(),18);
         }
-        if(SCENE.equals("vulkan-glass-water")||SCENE.equals("vulkan-vanilla-glass-water")) {
+        if(SCENE.equals("vulkan-glass-water")||SCENE.equals("vulkan-vanilla-glass-water")||VANILLA_UPSCALING) {
             for(int x=-7;x<=7;x++)for(int z=-5;z<=5;z++)world.setBlock(position.set(x,64,z),Blocks.WATER.defaultBlockState(),18);
             for(int x=-5;x<=5;x++)for(int y=65;y<=68;y++)world.setBlock(position.set(x,y,4),
                     (x<0?Blocks.RED_STAINED_GLASS:Blocks.GLASS).defaultBlockState(),18);
@@ -398,6 +457,7 @@ public final class ClientBenchmark {
 
     private void start() {
         framePhase = -1; renderStart = 0;
+        upscalingWorldObserved = upscalingGuiObserved = false;
         if (finished || phase < 0) return;
         if (frameFences[frameFence] != 0) {
             int result;
@@ -415,6 +475,7 @@ public final class ClientBenchmark {
         }
         poll();
         if (System.nanoTime() - phaseStart < phases.get(phase).warm * 1_000_000_000L) return;
+        if (VANILLA_UPSCALING && (!setup.isDone() || Minecraft.getInstance().getOverlay() != null)) return;
         // Keep initial chunk residency out of steady-state timing. The recorded
         // warm-up duration and source/artifact hashes identify the measured run.
         if(VULKAN&&dev.rayvox.RenderBackends.pendingSections()>0)return;
@@ -457,6 +518,13 @@ public final class ClientBenchmark {
         long now = System.nanoTime();
         try {
             if (!finished && phase >= 0) {
+                if (VANILLA_UPSCALING && framePhase == phase) {
+                    var current = phases.get(phase);
+                    if (!upscalingWorldObserved || !upscalingGuiObserved)
+                        throw new IllegalStateException("Missing world/GUI resolution observations in " + current.name);
+                    current.framebufferStatus = assertNativeUpscalingTarget(current);
+                    current.nativeTargetChecks++;
+                }
                 if (framePhase == phase && lastFrame != 0) {
                     phases.get(phase).wall.add(now - lastFrame);
                     int level = RayvoxEngine.governorLevel();
@@ -511,17 +579,24 @@ public final class ClientBenchmark {
                         throw new IllegalStateException("Disabled world probes remained active");
                     if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error in " + current.name + ": " + error);
                     Path screenshot = mc.gameDirectory.toPath().resolve(current.name + ".png");
-                    try (var image = Screenshot.takeScreenshot(mc.getMainRenderTarget())) { image.writeToFile(screenshot); }
                     var report = new LinkedHashMap<String, Object>();
+                    if (VANILLA_UPSCALING) report.put("imageStats", captureUpscaling(current, screenshot));
+                    else try (var image = Screenshot.takeScreenshot(mc.getMainRenderTarget())) { image.writeToFile(screenshot); }
                     report.put("phase", current.name); report.put("engine", RayvoxEngine.status());
                     report.put("renderer",dev.rayvox.RenderBackends.status());
                     if(VULKAN)report.put("vulkan",dev.rayvox.RenderBackends.diagnostics());
+                    if(VULKAN) {
+                        report.put("antiAliasing", Rayvox.ANTI_ALIASING.get().name());
+                        report.put("upscaling", Rayvox.UPSCALING.get().name());
+                        report.put("upscaleSharpness", Rayvox.UPSCALE_SHARPNESS.get());
+                    }
+                    if(VANILLA_UPSCALING)reportUpscaling(current, report);
                     if(VULKAN)report.put("vulkanTimings",VANILLA_VULKAN?dev.rayvox.RenderBackends.rasterTimings():dev.rayvox.RenderBackends.timings());
                     if(VULKAN)report.put("vulkanDynamicMeshes",dev.rayvox.RenderBackends.dynamicMeshCount());
                     if(VULKAN&&current.enabled&&!dev.rayvox.RenderBackends.active())throw new IllegalStateException("Vulkan benchmark fell back: "+dev.rayvox.RenderBackends.status());
                     if(VANILLA_VULKAN&&current.enabled&&(dev.rayvox.RenderBackends.rasterTimings()==null||dev.rayvox.RenderBackends.rasterTimings().terrainDraws()==0))throw new IllegalStateException("Vulkan vanilla did not draw terrain");
                     if(VANILLA_VULKAN&&current.enabled&&ENTITIES&&(dev.rayvox.RenderBackends.rasterTimings().entityDraws()==0||dev.rayvox.RenderBackends.rasterTimings().particleDraws()==0))throw new IllegalStateException("Vulkan vanilla missed entity or particle draws");
-                    if(VANILLA_VULKAN&&current.name.equals("vanilla-vulkan-static")&&!ENTITIES)report.put("nativeImageDifference",compareImages(mc.gameDirectory.toPath().resolve("native-static.png"),screenshot));
+                    if(VANILLA_VULKAN&&!VANILLA_UPSCALING&&current.name.equals("vanilla-vulkan-static")&&!ENTITIES)report.put("nativeImageDifference",compareImages(mc.gameDirectory.toPath().resolve("native-static.png"),screenshot));
                     if(VANILLA_VULKAN&&dev.rayvox.RenderBackends.raster()!=null&&!dev.rayvox.RenderBackends.raster().validationMessages().isEmpty())throw new IllegalStateException("Vulkan validation errors: "+dev.rayvox.RenderBackends.raster().validationMessages());
                     report.put("activeLightLimit", current.limit); report.put("lightsPerTile", current.perTile);
                     if (ENTITIES) report.put("entityCasters", RayvoxEngine.entityShadowCount());
@@ -567,6 +642,216 @@ public final class ClientBenchmark {
         lastFrame = now;
     }
 
+    private void observeUpscalingWorld(RenderLevelStageEvent event) {
+        if (finished || phase < 0 || framePhase != phase || event.getStage() != RenderLevelStageEvent.Stage.AFTER_LEVEL) return;
+        try {
+            var current = phases.get(phase);
+            var settings = current.upscaling;
+            var expectedBackend = current.enabled ? BackendMode.VULKAN_VANILLA : BackendMode.OPENGL;
+            if (RenderBackends.selected() != expectedBackend || RenderBackends.requestedMode() != expectedBackend
+                    || RenderBackends.active() != current.enabled || (RenderBackends.raster() != null) != current.enabled)
+                throw new IllegalStateException("Unexpected backend in " + current.name + ": " + RenderBackends.status());
+            if (Rayvox.ANTI_ALIASING.get() != settings.antiAliasing() || Rayvox.UPSCALING.get() != settings.mode()
+                    || Rayvox.UPSCALE_SHARPNESS.get() != settings.sharpness())
+                throw new IllegalStateException("AA/upscaling settings changed in " + current.name);
+            var main = Minecraft.getInstance().getMainRenderTarget();
+            int expectedWidth = current.enabled ? settings.mode().dimension(upscalingOutputWidth) : upscalingOutputWidth;
+            int expectedHeight = current.enabled ? settings.mode().dimension(upscalingOutputHeight) : upscalingOutputHeight;
+            if (main.width != expectedWidth || main.height != expectedHeight
+                    || main.viewWidth != expectedWidth || main.viewHeight != expectedHeight)
+                throw new IllegalStateException("Wrong world resolution in " + current.name + ": " + main.width + "x" + main.height
+                        + ", expected " + expectedWidth + "x" + expectedHeight);
+            int[] viewport = new int[4];
+            glGetIntegerv(GL_VIEWPORT, viewport);
+            if (viewport[0] != 0 || viewport[1] != 0 || viewport[2] != expectedWidth || viewport[3] != expectedHeight)
+                throw new IllegalStateException("Wrong world viewport in " + current.name + ": " + Arrays.toString(viewport)
+                        + ", expected [0, 0, " + expectedWidth + ", " + expectedHeight + "]");
+            if (current.enabled) {
+                var diagnostics = RenderBackends.diagnostics();
+                if (diagnostics == null || diagnostics.width() != expectedWidth || diagnostics.height() != expectedHeight)
+                    throw new IllegalStateException("Internal Vulkan dimensions disagree with world target in " + current.name);
+            }
+            current.worldWidth = main.width; current.worldHeight = main.height;
+            current.worldViewport = viewport;
+            current.worldTargetChecks++;
+            upscalingWorldObserved = true;
+        } catch (Throwable error) { fail(error); }
+    }
+
+    // AFTER_LEVEL still sees the internal target. The production GameRenderer hook resolves after
+    // those listeners, so check restoration here (before any GUI layers), not in AFTER_LEVEL itself.
+    private void observeUpscalingGui(RenderGuiEvent.Pre event) {
+        if (finished || phase < 0 || framePhase != phase) return;
+        try {
+            var current = phases.get(phase);
+            if (!upscalingWorldObserved) throw new IllegalStateException("GUI rendered before world observation in " + current.name);
+            current.framebufferStatus = assertNativeUpscalingTarget(current);
+            current.guiTargetChecks++;
+            upscalingGuiObserved = true;
+        } catch (Throwable error) { fail(error); }
+    }
+
+    private int assertNativeUpscalingTarget(Phase current) {
+        var mc = Minecraft.getInstance();
+        var main = mc.getMainRenderTarget();
+        if (mc.getWindow().getWidth() != upscalingOutputWidth || mc.getWindow().getHeight() != upscalingOutputHeight
+                || main.width != upscalingOutputWidth || main.height != upscalingOutputHeight
+                || main.viewWidth != upscalingOutputWidth || main.viewHeight != upscalingOutputHeight)
+            throw new IllegalStateException("Native target was not restored in " + current.name + ": " + main.width + "x" + main.height
+                    + ", window " + mc.getWindow().getWidth() + "x" + mc.getWindow().getHeight()
+                    + ", expected " + upscalingOutputWidth + "x" + upscalingOutputHeight);
+        if (main.frameBufferId <= 0) throw new IllegalStateException("Missing main framebuffer in " + current.name);
+        int previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
+        try {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, main.frameBufferId);
+            int status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+            if (status != GL_FRAMEBUFFER_COMPLETE)
+                throw new IllegalStateException("Incomplete main framebuffer in " + current.name + ": " + status);
+            return status;
+        } finally { glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous); }
+    }
+
+    private void reportUpscaling(Phase current, Map<String, Object> report) {
+        setup.join();
+        if (current.worldTargetChecks == 0 || current.guiTargetChecks == 0 || current.nativeTargetChecks == 0)
+            throw new IllegalStateException("No measured resolution checks in " + current.name);
+        var main = Minecraft.getInstance().getMainRenderTarget();
+        report.put("backend", RenderBackends.selected().name());
+        report.put("internalWidth", current.worldWidth); report.put("internalHeight", current.worldHeight);
+        report.put("worldViewport", current.worldViewport);
+        report.put("nativeWidth", main.width); report.put("nativeHeight", main.height);
+        report.put("nativeViewWidth", main.viewWidth); report.put("nativeViewHeight", main.viewHeight);
+        report.put("mainFramebufferStatus", current.framebufferStatus);
+        report.put("mainFramebufferComplete", current.framebufferStatus == GL_FRAMEBUFFER_COMPLETE);
+        report.put("resolutionAssertions", Map.of("worldFrames", current.worldTargetChecks,
+                "preGuiFrames", current.guiTargetChecks, "postRenderFrames", current.nativeTargetChecks));
+        report.put("nativeImageParitySkipped", false);
+        report.put("warmupSeconds", current.warm); report.put("measurementSeconds", current.seconds);
+    }
+
+    private Map<String, Object> captureUpscaling(Phase current, Path screenshot) throws Exception {
+        var main = Minecraft.getInstance().getMainRenderTarget();
+        if (main.frameBufferId <= 0) throw new IllegalStateException("Missing capture framebuffer in " + current.name);
+        int width = main.width, height = main.height;
+        int previousRead = glGetInteger(GL_READ_FRAMEBUFFER_BINDING), previousReadBuffer = glGetInteger(GL_READ_BUFFER);
+        int alignment = glGetInteger(GL_PACK_ALIGNMENT), rowLength = glGetInteger(GL_PACK_ROW_LENGTH);
+        int skipPixels = glGetInteger(GL_PACK_SKIP_PIXELS), skipRows = glGetInteger(GL_PACK_SKIP_ROWS);
+        int packBuffer = glGetInteger(GL_PIXEL_PACK_BUFFER_BINDING);
+        var image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        ByteBuffer pixels = MemoryUtil.memAlloc(Math.multiplyExact(Math.multiplyExact(width, height), 3));
+        int mainReadBuffer = -1;
+        try {
+            // Bypass RenderSystem's cached texture binding: read the actual main framebuffer, not a stale texture.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, main.frameBufferId);
+            mainReadBuffer = glGetInteger(GL_READ_BUFFER);
+            if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                throw new IllegalStateException("Incomplete capture framebuffer in " + current.name);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+            glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+            glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+            int error = glGetError();
+            if (error != GL_NO_ERROR) throw new IllegalStateException("Framebuffer read failed in " + current.name + ": " + error);
+            int[] row = new int[width];
+            for (int y = 0; y < height; y++) {
+                for (int x = 0; x < width; x++) {
+                    int offset = (y * width + x) * 3;
+                    row[x] = (pixels.get(offset) & 255) << 16 | (pixels.get(offset + 1) & 255) << 8
+                            | (pixels.get(offset + 2) & 255);
+                }
+                image.setRGB(0, height - 1 - y, width, 1, row, 0, width);
+            }
+        } finally {
+            // Read-buffer selection belongs to each FBO; restore both FBOs as well as every affected pack state.
+            if (mainReadBuffer != -1) {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, main.frameBufferId);
+                glReadBuffer(mainReadBuffer);
+            }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
+            glReadBuffer(previousReadBuffer);
+            glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+            glPixelStorei(GL_PACK_ROW_LENGTH, rowLength);
+            glPixelStorei(GL_PACK_SKIP_PIXELS, skipPixels);
+            glPixelStorei(GL_PACK_SKIP_ROWS, skipRows);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, packBuffer);
+            MemoryUtil.memFree(pixels);
+        }
+        if (!ImageIO.write(image, "png", screenshot.toFile())) throw new IllegalStateException("PNG writer unavailable");
+        var digest = MessageDigest.getInstance("SHA-256");
+        byte[] rgbRow = new byte[width * 3];
+        double minimum = 1, maximum = 0, total = 0, squares = 0;
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int rgb = image.getRGB(x, y), r = rgb >> 16 & 255, g = rgb >> 8 & 255, b = rgb & 255;
+                rgbRow[x * 3] = (byte) r; rgbRow[x * 3 + 1] = (byte) g; rgbRow[x * 3 + 2] = (byte) b;
+                double luminance = (.2126 * r + .7152 * g + .0722 * b) / 255;
+                minimum = Math.min(minimum, luminance); maximum = Math.max(maximum, luminance);
+                total += luminance; squares += luminance * luminance;
+            }
+            digest.update(rgbRow);
+        }
+        double count = (double) width * height, mean = total / count;
+        double variance = Math.max(0, squares / count - mean * mean);
+        String hash = HexFormat.of().formatHex(digest.digest());
+        var stats = new LinkedHashMap<String, Object>();
+        stats.put("capture", "glReadPixels RGB from main GL_READ_FRAMEBUFFER / GL_COLOR_ATTACHMENT0");
+        stats.put("width", width); stats.put("height", height);
+        stats.put("luminanceMin", minimum); stats.put("luminanceMax", maximum);
+        stats.put("luminanceMean", mean); stats.put("luminanceSpatialVariance", variance);
+        stats.put("luminanceLimits", Map.of("minMean", .02, "maxMean", .98, "minSpatialVariance", .0005));
+        stats.put("sha256RgbTopDown", hash);
+        if (mean < .02 || mean > .98 || variance < .0005)
+            throw new IllegalStateException("Blank/corrupt capture in " + current.name + ": " + stats);
+        if (current.name.equals("native-static")) {
+            upscalingNativeReference = image;
+            upscalingNativeImageHash = hash;
+        }
+        if (upscalingNativeReference == null) throw new IllegalStateException("Missing fixed native capture in " + current.name);
+        stats.put("nativeReference", "native-static.png");
+        stats.put("nativeReferenceSha256", upscalingNativeImageHash);
+        stats.put("nativeImageDifference", compareUpscalingImages(upscalingNativeReference, image, current.name));
+        stats.put("differsFromNativeReference", !hash.equals(upscalingNativeImageHash));
+        if (current.enabled && current.upscaling.antiAliasing() == AntiAliasing.OFF)
+            upscalingOffImageHashes.put(current.upscaling, hash);
+        if (current.upscaling.antiAliasing() == AntiAliasing.FXAA) {
+            if (hash.equals(upscalingNativeImageHash))
+                throw new IllegalStateException("FXAA capture is identical to the native reference in " + current.name + ": " + hash);
+            var off = new UpscalingSettings(current.upscaling.mode(), AntiAliasing.OFF, current.upscaling.sharpness());
+            String offHash = upscalingOffImageHashes.get(off);
+            if (offHash != null) {
+                stats.put("aaOffSha256", offHash);
+                stats.put("differsFromAaOff", !hash.equals(offHash));
+                if (hash.equals(offHash)) throw new IllegalStateException("OFF/FXAA captures are identical in " + current.name + ": " + hash);
+            }
+        }
+        return stats;
+    }
+
+    private static Map<String, Object> compareUpscalingImages(BufferedImage reference, BufferedImage actual, String phase) {
+        long total = 0, large = 0, pixels = (long) actual.getWidth() * actual.getHeight();
+        for (int y = 0; y < actual.getHeight(); y++) for (int x = 0; x < actual.getWidth(); x++) {
+            // Compare the same normalized view even in the odd-sized resize phases.
+            int referenceX = (int) ((2L * x + 1) * reference.getWidth() / (2L * actual.getWidth()));
+            int referenceY = (int) ((2L * y + 1) * reference.getHeight() / (2L * actual.getHeight()));
+            int expected = reference.getRGB(referenceX, referenceY), value = actual.getRGB(x, y), maximum = 0;
+            for (int channel = 0; channel < 3; channel++) {
+                int difference = Math.abs((expected >> (channel * 8) & 255) - (value >> (channel * 8) & 255));
+                total += difference; maximum = Math.max(maximum, difference);
+            }
+            if (maximum > 32) large++;
+        }
+        double mean = total / (pixels * 3.0 * 255), fraction = large / (double) pixels;
+        if (mean > .07 || fraction > .20)
+            throw new IllegalStateException("AA/upscaling image differs excessively from fixed native reference in " + phase
+                    + ": mean=" + mean + ", pixels over 32 fraction=" + fraction);
+        return Map.of("meanAbsoluteRgb", mean, "pixelsOver32Fraction", fraction,
+                "maxMeanAbsoluteRgb", .07, "maxPixelsOver32Fraction", .20,
+                "toleranceNote", "Coarse spatial quality only; allows half-resolution filtering, sharpening and animated water; resized views use normalized coordinates");
+    }
+
     private void poll() {
         if (!timers) return;
         for (int i = 0; i < pending.length; i++) if (pending[i]
@@ -589,8 +874,13 @@ public final class ClientBenchmark {
         result.put("success", true); result.put("gpu", RayvoxEngine.gpu());
         result.put("width", mc.getMainRenderTarget().width); result.put("height", mc.getMainRenderTarget().height);
         result.put("renderDistance", mc.options.renderDistance().get()); result.put("phases", reports);
-        result.put("scene", WORLD_CACHE ? "world-cache-v1" : HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
+        result.put("scene", VANILLA_UPSCALING ? "vulkan-vanilla-upscaling-v1" : WORLD_CACHE ? "world-cache-v1" : HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
                 : DIRECTIONAL ? (DIRECTIONAL_MATERIALS ? "directional-v1" : "directional-basic-v1") : "fixed-room-v3"); result.put("seed", 42);
+        if (VANILLA_UPSCALING) {
+            result.put("plannedPhaseSeconds", phases.stream().mapToInt(p -> p.warm + p.seconds).sum());
+            result.put("nativeImageParity", "Coarse fixed native-static reference: mean absolute RGB <= 0.07 and pixels with any channel difference > 32 <= 0.20; not exact pixel parity");
+            result.put("aaCaptureDifference", "FXAA hashes must differ from native reference and matching OFF captures; animated water can also change hashes, so this is not proof of AA quality");
+        }
         result.put("hidden", GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) == GLFW.GLFW_FALSE);
         result.put("maxFramesInFlight", frameFences.length);
         result.put("createdAt", java.time.Instant.now().toString());
@@ -662,10 +952,16 @@ public final class ClientBenchmark {
         Files.writeString(path, new GsonBuilder().registerTypeAdapter(Double.class,finite).registerTypeAdapter(double.class,finite).setPrettyPrinting().create().toJson(result));
     }
 
+    private record UpscalingSettings(UpscalingMode mode, AntiAliasing antiAliasing, int sharpness) { }
+
     private static final class Phase {
         final String name;
         final boolean enabled, materials, indirect, moving;
         final int warm, seconds, limit, perTile, expectedLights;
+        final UpscalingSettings upscaling;
+        int worldWidth, worldHeight, framebufferStatus;
+        int[] worldViewport;
+        long worldTargetChecks, guiTargetChecks, nativeTargetChecks;
         final LongArrayList wall = new LongArrayList(16384), cpu = new LongArrayList(16384), gpu = new LongArrayList(16384);
         final LongArrayList cpuWork = new LongArrayList(16384);
         final Map<String,LongArrayList> gpuStages=new LinkedHashMap<>();
@@ -673,14 +969,22 @@ public final class ClientBenchmark {
         final int[] qualityFrames = new int[5];
         final List<String> qualityDecisions = new ArrayList<>();
         int lastQualityLevel;
+        Phase(String name, boolean enabled, int warm, UpscalingMode mode, AntiAliasing antiAliasing, int sharpness) {
+            this(name, enabled, false, false, false, warm, 3, 32, 4, 10, new UpscalingSettings(mode, antiAliasing, sharpness));
+        }
         Phase(String name, boolean enabled, boolean materials, boolean indirect, boolean moving, int warm, int seconds) {
             this(name, enabled, materials, indirect, moving, warm, seconds, 32, 4, 10);
         }
         Phase(String name, boolean enabled, boolean materials, boolean indirect, boolean moving, int warm, int seconds,
                 int limit, int perTile, int expectedLights) {
+            this(name, enabled, materials, indirect, moving, warm, seconds, limit, perTile, expectedLights, null);
+        }
+        Phase(String name, boolean enabled, boolean materials, boolean indirect, boolean moving, int warm, int seconds,
+                int limit, int perTile, int expectedLights, UpscalingSettings upscaling) {
             this.name = name; this.enabled = enabled; this.materials = materials; this.indirect = indirect;
             this.moving = moving; this.warm = warm; this.seconds = seconds;
             this.limit = limit; this.perTile = perTile; this.expectedLights = expectedLights;
+            this.upscaling = upscaling;
         }
     }
 }

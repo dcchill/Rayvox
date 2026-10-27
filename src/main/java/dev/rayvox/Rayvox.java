@@ -1,6 +1,8 @@
 package dev.rayvox;
 
 import com.mojang.blaze3d.platform.InputConstants;
+import dev.rayvox.render.AntiAliasing;
+import dev.rayvox.render.UpscalingMode;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
@@ -18,6 +20,9 @@ import org.lwjgl.glfw.GLFW;
 public final class Rayvox {
     public static final ModConfigSpec.EnumValue<dev.rayvox.render.BackendMode> RENDER_BACKEND;
     public static final ModConfigSpec.IntValue VULKAN_MEMORY;
+        public static final ModConfigSpec.EnumValue<AntiAliasing> ANTI_ALIASING;
+        public static final ModConfigSpec.EnumValue<UpscalingMode> UPSCALING;
+        public static final ModConfigSpec.IntValue UPSCALE_SHARPNESS;
     private static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue ENABLED;
     public static final ModConfigSpec.IntValue CACHE_RADIUS;
@@ -56,6 +61,12 @@ public final class Rayvox {
                 .defineEnum("renderBackend",dev.rayvox.render.BackendMode.AUTO);
         VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; applies when a Vulkan renderer initializes.")
                 .defineInRange("vulkanMemoryMiB",2048,512,8192);
+        ANTI_ALIASING = builder.comment("World-only post-process anti-aliasing; OFF or FXAA. Does not filter the HUD or replace path-traced temporal reconstruction.")
+                .defineEnum("antiAliasing", AntiAliasing.OFF);
+        UPSCALING = builder.comment("Internal render resolution. Vanilla uses spatial upscaling; path tracing retains temporal reconstruction. ADAPTIVE uses delayed GPU timings on the path tracer only and stays native in vanilla.")
+                .defineEnum("upscaling", UpscalingMode.ADAPTIVE);
+        UPSCALE_SHARPNESS = builder.comment("World-only upscaling sharpness, 0..100; 0 disables sharpening. Does not sharpen the HUD.")
+                .defineInRange("upscaleSharpness", 20, 0, 100);
         ENABLED = builder.comment("Enable the selected Rayvox renderer/lighting. OFF uses native vanilla rendering.").define("enabled", true);
         CACHE_RADIUS = builder.comment("Voxel radius in 16-block sections; one resolution level.")
                 .defineInRange("cacheRadiusSections", 2, 1, 4);

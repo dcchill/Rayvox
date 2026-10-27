@@ -37,6 +37,7 @@ public final class RasterHooks {
     }
     public static void samplerChanged(){var raster=RenderBackends.raster();if(raster!=null)raster.samplerChanged();}
     public static void targetChanged(RenderTarget target){var raster=RenderBackends.raster();if(raster!=null)raster.beforeTargetChange(target);}
+    public static void targetBound(RenderTarget target){var raster=RenderBackends.raster();if(raster!=null)raster.boundTarget(target);}
     public static boolean copyDepth(RenderTarget destination,RenderTarget source){var raster=RenderBackends.raster();return raster!=null&&raster.copyDepth(destination,source);}
     private static void removeSnapshot(VertexBuffer buffer){var old=meshes.remove(buffer);if(old!=null)bytes-=old.bytes();}
     public static void close(VertexBuffer buffer){removeSnapshot(buffer);var raster=RenderBackends.raster();if(raster!=null)raster.remove(buffer);}

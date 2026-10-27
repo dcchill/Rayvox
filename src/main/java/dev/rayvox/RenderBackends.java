@@ -19,6 +19,7 @@ public final class RenderBackends {
     // Promotion requires the documented complete playable/hardware acceptance matrix.
     public static final boolean PLAYABLE_ACCEPTED=false;
     private static RenderBackend backend;
+    private static dev.rayvox.render.vulkan.GlWorldResolve worldResolve;
     private static BackendMode selected;
     private static BackendMode pendingMode;
     private static TerrainScene terrain;
@@ -91,6 +92,18 @@ public final class RenderBackends {
         if(backend instanceof VulkanRasterBackend raster)try{raster.endFrame();}catch(RuntimeException|LinkageError failure){fallback("Vulkan vanilla frame failed",failure);}
         capturing=false;renderingWorld=false;
     }
+    /** Called after AFTER_LEVEL listeners, before the hand depth clear and any GUI rendering. */
+    public static void resolveWorld() {
+        if(!active())return;
+        try {
+            if(backend instanceof VulkanRasterBackend raster){raster.detach();return;}
+            if(Rayvox.ANTI_ALIASING.get()!=AntiAliasing.FXAA)return;
+            var main=Minecraft.getInstance().getMainRenderTarget();
+            if(main.width<1||main.height<1)return;
+            if(worldResolve==null)worldResolve=new dev.rayvox.render.vulkan.GlWorldResolve();
+            worldResolve.antiAlias(main.frameBufferId,main.getColorTextureId(),main.width,main.height);
+        }catch(RuntimeException|LinkageError failure){fallback("Vulkan world resolve failed",failure);}
+    }
     public static boolean capture(MeshData mesh,RenderType type) {
         if(!pathTracing()||!capturing)return false;
         String name=RenderTypePolicy.name(type.toString());
@@ -162,5 +175,5 @@ public final class RenderBackends {
         if(Minecraft.getInstance().level!=null)Minecraft.getInstance().levelRenderer.allChanged();
     }
     public static void failed(String reason,Throwable failure){fallback(reason,failure);}
-    public static void close(){if(terrain!=null){terrain.close();terrain=null;}if(backend!=null){backend.close();backend=null;}captured.clear();previousDynamic=Set.of();RasterHooks.clear();TextureSnapshots.clear();level=null;pendingMode=null;}
+    public static void close(){if(terrain!=null){terrain.close();terrain=null;}if(backend!=null){backend.close();backend=null;}if(worldResolve!=null){worldResolve.close();worldResolve=null;}captured.clear();previousDynamic=Set.of();RasterHooks.clear();TextureSnapshots.clear();level=null;pendingMode=null;}
 }

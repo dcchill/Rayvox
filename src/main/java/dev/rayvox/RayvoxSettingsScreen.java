@@ -1,5 +1,7 @@
 package dev.rayvox;
 
+import dev.rayvox.render.AntiAliasing;
+import dev.rayvox.render.UpscalingMode;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
@@ -30,6 +32,20 @@ final class RayvoxSettingsScreen extends Screen {
         if(vulkan) {
             renderer();
             toggle("Rayvox rendering",Rayvox.ENABLED,"Enable the selected renderer.");
+            cycle("Anti-aliasing", () -> Rayvox.ANTI_ALIASING.get().name(), () -> {
+                var modes = AntiAliasing.values();
+                Rayvox.ANTI_ALIASING.set(modes[(Rayvox.ANTI_ALIASING.get().ordinal() + 1) % modes.length]);
+                Rayvox.PRESET.set(QualityPreset.CUSTOM);
+                Rayvox.ANTI_ALIASING.save();
+            }, "OFF or FXAA. Filters only the rendered world, never the HUD. FXAA is spatial anti-aliasing, not temporal AA; path tracing keeps its existing temporal reconstruction.");
+            cycle("Upscaling", () -> Rayvox.UPSCALING.get().name(), () -> {
+                var modes = UpscalingMode.values();
+                Rayvox.UPSCALING.set(modes[(Rayvox.UPSCALING.get().ordinal() + 1) % modes.length]);
+                Rayvox.PRESET.set(QualityPreset.CUSTOM);
+                Rayvox.UPSCALING.save();
+            }, "NATIVE: 100%. QUALITY: 67%. BALANCED: 59%. PERFORMANCE: 50%. Vanilla uses a spatial upscaler; path tracing retains its temporal path. ADAPTIVE adjusts path-traced resolution using GPU timings only; vanilla stays native until adaptive timing is supported.");
+                if(vanilla)slider("Upscale sharpness", Rayvox.UPSCALE_SHARPNESS, 0, 100, "%",
+                    "Vanilla Vulkan spatial-upscaling sharpness; 0 disables sharpening. Only applies below native resolution. The hand and HUD stay untouched.");
             if(!vanilla) {
                 toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable directional sun and moon illumination.");
                 toggle("Held item lights",Rayvox.DYNAMIC,"Emissive held blocks illuminate the path-traced world.");

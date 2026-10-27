@@ -186,6 +186,7 @@ public final class VulkanBackend implements RenderBackend {
         reset|=update.resetHistory();
     }
     @Override public void resize(int width,int height) {
+        configureResolution();
         if(width<=0||height<=0)return;
         if(this.width==width&&this.height==height)return;
         drain();
@@ -206,7 +207,13 @@ public final class VulkanBackend implements RenderBackend {
     private VulkanImage image(int format){return new VulkanImage(context,internalWidth,internalHeight,format,VK_IMAGE_USAGE_STORAGE_BIT,false);}
     private void drain(){if(context!=null)for(var frame:frames)if(frame!=null)frame.complete();}
     private void releaseImages(){for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})if(image!=null)image.close();radiance=geometry=normals=history=nextHistory=previousGeometry=resolved=null;upscale[0]=upscale[1]=null;}
+    private void configureResolution() {
+        // Apply mode changes before completed frames can contribute timings or resize images.
+        resolution.configure(referenceSamples>1||Boolean.getBoolean("rayvox.vulkan.fixedResolution")
+                ? UpscalingMode.NATIVE : dev.rayvox.Rayvox.UPSCALING.get());
+    }
     @Override public void render(Scene.Camera camera) {
+        configureResolution();
         if(width<=0||height<=0)return;
         long cpuStart=System.nanoTime();Frame frame=frames[index];frame.complete();waitMillis=(System.nanoTime()-cpuStart)/1e6;
         long recordStart=System.nanoTime();

@@ -25,7 +25,18 @@ final class VulkanImage implements AutoCloseable {
             var info=VkImageCreateInfo.calloc(stack).sType$Default().imageType(VK_IMAGE_TYPE_2D).format(format)
                     .extent(e->e.set(width,height,1)).mipLevels(levels).arrayLayers(1).samples(VK_SAMPLE_COUNT_1_BIT)
                     .tiling(VK_IMAGE_TILING_OPTIMAL).usage(usage).sharingMode(VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
-            if(shared) info.pNext(external.address());
+            if(shared) {
+                // EXT_memory_object texture storage requires matching all supported usages,
+                // including transfers, and mutable-format images for GL texture views.
+                var properties=VkFormatProperties.calloc(stack);vkGetPhysicalDeviceFormatProperties(context.physical,format,properties);
+                int features=properties.optimalTilingFeatures();
+                int sharedUsage=usage|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                if((features&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)!=0)sharedUsage|=VK_IMAGE_USAGE_SAMPLED_BIT;
+                if((features&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)!=0)sharedUsage|=VK_IMAGE_USAGE_STORAGE_BIT;
+                if((features&VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)!=0)sharedUsage|=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                if((features&VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)!=0)sharedUsage|=VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+                info.pNext(external.address()).flags(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT).usage(sharedUsage);
+            }
             var out=stack.mallocLong(1);check(vkCreateImage(context.device,info,null,out),"create image");image=out.get(0);
             var requirements=VkMemoryRequirements.calloc(stack);vkGetImageMemoryRequirements(context.device,image,requirements);
             size=requirements.size();
