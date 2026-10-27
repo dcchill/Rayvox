@@ -119,3 +119,4 @@ tasks.register('gpuBenchmark', JavaExec) {
 }
 
 apply from: 'gradle/benchmark.gradle'
+apply from: 'gradle/dlss.gradle'

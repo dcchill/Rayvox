@@ -22,6 +22,7 @@ public final class Rayvox {
     public static final ModConfigSpec.IntValue VULKAN_MEMORY;
         public static final ModConfigSpec.EnumValue<AntiAliasing> ANTI_ALIASING;
         public static final ModConfigSpec.EnumValue<UpscalingMode> UPSCALING;
+    public static final ModConfigSpec.EnumValue<dev.rayvox.render.Upscaler> UPSCALER;
         public static final ModConfigSpec.IntValue UPSCALE_SHARPNESS;
     private static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue ENABLED;
@@ -61,10 +62,12 @@ public final class Rayvox {
                 .defineEnum("renderBackend",dev.rayvox.render.BackendMode.AUTO);
         VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; applies when a Vulkan renderer initializes.")
                 .defineInRange("vulkanMemoryMiB",2048,512,8192);
-        ANTI_ALIASING = builder.comment("World-only post-process anti-aliasing; OFF or FXAA. Does not filter the HUD or replace path-traced temporal reconstruction.")
+        ANTI_ALIASING = builder.comment("World-only anti-aliasing; OFF, FXAA, or path-tracing-only TAA. Does not filter the HUD.")
                 .defineEnum("antiAliasing", AntiAliasing.OFF);
         UPSCALING = builder.comment("Internal render resolution. Vanilla uses spatial upscaling; path tracing retains temporal reconstruction. ADAPTIVE uses delayed GPU timings on the path tracer only and stays native in vanilla.")
                 .defineEnum("upscaling", UpscalingMode.ADAPTIVE);
+        UPSCALER = builder.comment("Path-tracing upscaler: RECONSTRUCTION or optional NVIDIA DLSS. DLSS includes AA; unavailable DLSS falls back to reconstruction and FXAA (or selected TAA). Requires an NGX-enabled build and supported NVIDIA GPU/driver.")
+                .defineEnum("upscaler", dev.rayvox.render.Upscaler.RECONSTRUCTION);
         UPSCALE_SHARPNESS = builder.comment("World-only upscaling sharpness, 0..100; 0 disables sharpening. Does not sharpen the HUD.")
                 .defineInRange("upscaleSharpness", 20, 0, 100);
         ENABLED = builder.comment("Enable the selected Rayvox renderer/lighting. OFF uses native vanilla rendering.").define("enabled", true);

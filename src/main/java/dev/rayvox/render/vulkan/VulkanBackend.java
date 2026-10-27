@@ -27,6 +27,15 @@ public final class VulkanBackend implements RenderBackend {
     private final ArrayDeque<Scene.Texture> pendingTextures=new ArrayDeque<>();
     private final RetirementQueue retired=new RetirementQueue();
     private final ResolutionController resolution=new ResolutionController();
+    private DlssUpscaler dlss;
+    private Upscaler configuredUpscaler=Upscaler.RECONSTRUCTION;
+    private UpscalingMode configuredScale=UpscalingMode.ADAPTIVE;
+    private ComputeProgram dlssPrepare;
+    private VulkanImage dlssDepth,dlssMotion,dlssBias,dlssOutput;
+    private boolean dlssActive;
+    private float jitterX,jitterY,frameMillis=16.667f;
+    private long previousFrameNanos;
+    private dev.rayvox.render.AntiAliasing configuredAntiAliasing=dev.rayvox.render.AntiAliasing.OFF;
     private long descriptorLayout,descriptorPool,pipelineLayout,sampler,serial;
     private long sceneRevision;
     private long textureRevision,imageRevision;
@@ -131,16 +140,16 @@ public final class VulkanBackend implements RenderBackend {
         } catch(RuntimeException|Error failure){close();throw failure;}
     }
     private void descriptors() {try(var stack=MemoryStack.stackPush()) {
-        var bindings=VkDescriptorSetLayoutBinding.calloc(17,stack);
-        for(int i=0;i<17;i++)bindings.get(i).binding(i).descriptorCount(i==9?TEXTURES:1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT)
+        var bindings=VkDescriptorSetLayoutBinding.calloc(21,stack);
+        for(int i=0;i<21;i++)bindings.get(i).binding(i).descriptorCount(i==9?TEXTURES:1).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT)
                 .descriptorType(i==0?VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:i==4||i==12||i==13?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:i==5?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:i==9?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        var flags=stack.callocInt(17);flags.put(9,VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+        var flags=stack.callocInt(21);flags.put(9,VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
         var flagInfo=VkDescriptorSetLayoutBindingFlagsCreateInfo.calloc(stack).sType$Default().pBindingFlags(flags);
         var out=stack.mallocLong(1);
         check(vkCreateDescriptorSetLayout(context.device,VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(bindings).pNext(flagInfo.address()),null,out),"create descriptor layout");descriptorLayout=out.get(0);
         var sizes=VkDescriptorPoolSize.calloc(5,stack);
         int[] types={VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        int[] counts={2,6,2,22,TEXTURES*2};
+        int[] counts={2,6,2,30,TEXTURES*2};
         for(int i=0;i<5;i++)sizes.get(i).type(types[i]).descriptorCount(counts[i]);
         check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(2).pPoolSizes(sizes),null,out),"create descriptor pool");descriptorPool=out.get(0);
         var push=VkPushConstantRange.calloc(1,stack).stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).size(8);
@@ -197,30 +206,64 @@ public final class VulkanBackend implements RenderBackend {
         resizeInternal();
     }
     private void resizeInternal() {
-        drain();releaseImages();internalWidth=resolution.dimension(width);internalHeight=resolution.dimension(height);
+        drain();dlssActive=false;if(dlss!=null)dlss.release();releaseImages();internalWidth=resolution.dimension(width);internalHeight=resolution.dimension(height);
         long estimate=(long)internalWidth*internalHeight*88+(long)width*height*40;
         if(estimate>memoryBudget)throw new IllegalStateException("Path tracing image memory exceeds the configured budget");
         radiance=image(VK_FORMAT_R16G16B16A16_SFLOAT);geometry=image(VK_FORMAT_R32G32B32A32_SFLOAT);normals=image(VK_FORMAT_R16G16B16A16_SFLOAT);
         history=image(VK_FORMAT_R16G16B16A16_SFLOAT);nextHistory=image(VK_FORMAT_R16G16B16A16_SFLOAT);previousGeometry=image(VK_FORMAT_R32G32B32A32_SFLOAT);resolved=image(VK_FORMAT_R16G16B16A16_SFLOAT);reset=true;imageRevision++;
         for(int i=0;i<2;i++)upscale[i]=new VulkanImage(context,width,height,VK_FORMAT_R16G16B16A16_SFLOAT,VK_IMAGE_USAGE_STORAGE_BIT,false);
+        if(dlss!=null&&dlss.available()) {
+            try {
+                dlssDepth=dlssImage(internalWidth,internalHeight,VK_FORMAT_R32_SFLOAT);
+                dlssMotion=dlssImage(internalWidth,internalHeight,VK_FORMAT_R16G16_SFLOAT);
+                dlssBias=dlssImage(internalWidth,internalHeight,VK_FORMAT_R32_SFLOAT);
+                dlssOutput=dlssImage(width,height,VK_FORMAT_R16G16B16A16_SFLOAT);
+            }catch(RuntimeException failure){dlss.fail(failure);releaseDlssImages();}
+        }
     }
-    private VulkanImage image(int format){return new VulkanImage(context,internalWidth,internalHeight,format,VK_IMAGE_USAGE_STORAGE_BIT,false);}
+    private VulkanImage image(int format){return new VulkanImage(context,internalWidth,internalHeight,format,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,false);}
+    private VulkanImage dlssImage(int width,int height,int format){return new VulkanImage(context,width,height,format,VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT,false);}
     private void drain(){if(context!=null)for(var frame:frames)if(frame!=null)frame.complete();}
-    private void releaseImages(){for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})if(image!=null)image.close();radiance=geometry=normals=history=nextHistory=previousGeometry=resolved=null;upscale[0]=upscale[1]=null;}
+    private void releaseImages(){releaseDlssImages();for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})if(image!=null)image.close();radiance=geometry=normals=history=nextHistory=previousGeometry=resolved=null;upscale[0]=upscale[1]=null;}
+    private void releaseDlssImages(){for(var image:new VulkanImage[]{dlssDepth,dlssMotion,dlssBias,dlssOutput})if(image!=null)image.close();dlssDepth=dlssMotion=dlssBias=dlssOutput=null;}
     private void configureResolution() {
         // Apply mode changes before completed frames can contribute timings or resize images.
+        var antiAliasing=dev.rayvox.Rayvox.ANTI_ALIASING.get();
+        if(configuredAntiAliasing!=antiAliasing){configuredAntiAliasing=antiAliasing;reset=true;}
         resolution.configure(referenceSamples>1||Boolean.getBoolean("rayvox.vulkan.fixedResolution")
                 ? UpscalingMode.NATIVE : dev.rayvox.Rayvox.UPSCALING.get());
+    }
+    private void configureDlss() {
+        var selected=referenceSamples==1?dev.rayvox.Rayvox.UPSCALER.get():Upscaler.RECONSTRUCTION;
+        var scale=dev.rayvox.Rayvox.UPSCALING.get();
+        if(selected!=configuredUpscaler) {
+            drain();if(dlss!=null){dlss.close();dlss=null;}
+            configuredUpscaler=selected;reset=true;
+            if(selected==Upscaler.DLSS) {
+                dlss=new DlssUpscaler(context);
+                if(dlss.available()&&dlssPrepare==null)try{dlssPrepare=new ComputeProgram(context,pipelineLayout,"dlss_prepare.comp");}catch(RuntimeException failure){dlss.fail(failure);}
+            }
+            if(width>0&&height>0)resizeInternal();
+        }else if(scale!=configuredScale&&dlss!=null) {
+            drain();dlss.release();reset=true;
+        }
+        configuredScale=scale;
+        if(dlss!=null&&!dlss.available()&&dlssOutput!=null){drain();dlss.release();releaseDlssImages();imageRevision++;}
     }
     @Override public void render(Scene.Camera camera) {
         configureResolution();
         if(width<=0||height<=0)return;
+        configureDlss();
         long cpuStart=System.nanoTime();Frame frame=frames[index];frame.complete();waitMillis=(System.nanoTime()-cpuStart)/1e6;
         long recordStart=System.nanoTime();
         double nextX=Math.floor(camera.x()/256)*256,nextY=Math.floor(camera.y()/256)*256,nextZ=Math.floor(camera.z()/256)*256;
         if(nextX!=originX||nextY!=originY||nextZ!=originZ){originX=nextX;originY=nextY;originZ=nextZ;sceneRevision++;reset=true;}
         if(internalWidth!=resolution.dimension(width)||internalHeight!=resolution.dimension(height))resizeInternal();
         context.begin(frame.command);
+        dlssActive=false;
+        if(dlss!=null&&dlss.available()&&dlssOutput!=null)dlssActive=dlss.ready()||dlss.create(frame.command,internalWidth,internalHeight,width,height,configuredScale);
+        jitterX=dlssActive?DlssUpscaler.jitter(serial,2):0;jitterY=dlssActive?DlssUpscaler.jitter(serial,3):0;
+        long now=System.nanoTime();if(previousFrameNanos!=0)frameMillis=(float)Math.clamp((now-previousFrameNanos)/1e6,1,1000);previousFrameNanos=now;
         VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
                 VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR|VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
         if(frame.query!=0){vkCmdResetQueryPool(frame.command,frame.query,0,7);vkCmdWriteTimestamp(frame.command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,frame.query,0);}
@@ -228,6 +271,7 @@ public final class VulkanBackend implements RenderBackend {
         prepareScene(frame,camera);
         stamp(frame,1);
         for(var image:new VulkanImage[]{radiance,geometry,normals,history,nextHistory,previousGeometry,resolved,upscale[0],upscale[1]})image.general(frame.command);
+        if(dlssOutput!=null)for(var image:new VulkanImage[]{dlssDepth,dlssMotion,dlssBias,dlssOutput})image.general(frame.command);
         frame.surface.acquire(frame.command);
         writeCamera(frame,camera);writeDescriptors(frame);
         vkCmdBindDescriptorSets(frame.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,new long[]{frame.set},null);
@@ -246,6 +290,17 @@ public final class VulkanBackend implements RenderBackend {
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
             vkCmdPushConstants(frame.command,pipelineLayout,VK_SHADER_STAGE_COMPUTE_BIT,0,stack.ints(2,8));
             dispatch(frame,reconstruct,internalWidth,internalHeight);computeBarrier(frame.command);
+        }
+        if(dlssActive) {
+            dispatch(frame,dlssPrepare,internalWidth,internalHeight);computeBarrier(frame.command);
+            for(var image:new VulkanImage[]{resolved,dlssDepth,dlssMotion,dlssBias})image.transition(frame.command,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_SHADER_READ_BIT,VK_QUEUE_FAMILY_IGNORED,VK_QUEUE_FAMILY_IGNORED);
+            // Ray sample offsets move the projected image in the opposite direction.
+            dlssActive=dlss.evaluate(frame.command,resolved,dlssDepth,dlssMotion,dlssOutput,dlssBias,-jitterX,-jitterY,historyCut(camera),frameMillis);
+            for(var image:new VulkanImage[]{resolved,dlssDepth,dlssMotion,dlssBias})image.transition(frame.command,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,VK_QUEUE_FAMILY_IGNORED,VK_QUEUE_FAMILY_IGNORED);
+            VulkanContext.memoryBarrier(frame.command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT);
+            // NGX owns pipeline/descriptor bindings during evaluation.
+            vkCmdBindDescriptorSets(frame.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,new long[]{frame.set},null);
+            if(!dlssActive){reset=true;writeCamera(frame,camera);}
         }
         stamp(frame,3);
         dispatch(frame,exposureProgram,1,1);computeBarrier(frame.command);
@@ -410,17 +465,18 @@ public final class VulkanBackend implements RenderBackend {
         camera.viewProjection().get(128,bytes);bytes.position(192);
         bytes.putFloat((float)(camera.x()-originX)).putFloat((float)(camera.y()-originY)).putFloat((float)(camera.z()-originZ)).putFloat((float)serial);
         put(bytes,camera.sunDirection(),0);put(bytes,camera.sunRadiance(),0);
-        boolean cut=reset||camera.cut()||camera.world()!=previousWorld||Math.abs(previousX-camera.x())+Math.abs(previousY-camera.y())+Math.abs(previousZ-camera.z())>8;
-        put(bytes,camera.sky(),cut?1:0);bytes.putFloat(width).putFloat(height).putFloat(referenceSamples).putFloat(dynamicSources.isEmpty()?0:1);
+        boolean cut=historyCut(camera);
+        put(bytes,camera.sky(),cut?1:0);bytes.putFloat(width).putFloat(height).putFloat(referenceSamples).putFloat(dev.rayvox.Rayvox.ANTI_ALIASING.get()==dev.rayvox.render.AntiAliasing.TAA?1:0);
         for(int i=0;i<4;i++){var light=i<camera.lights().size()?camera.lights().get(i):null;bytes.putFloat(light==null?0:(float)(light.x()-originX)).putFloat(light==null?0:(float)(light.y()-originY)).putFloat(light==null?0:(float)(light.z()-originZ)).putFloat(0);}
         for(int i=0;i<4;i++){var light=i<camera.lights().size()?camera.lights().get(i):null;bytes.putFloat(light==null?0:light.red()).putFloat(light==null?0:light.green()).putFloat(light==null?0:light.blue()).putFloat(light==null?0:light.radius());}
-        put(bytes,camera.fogColor(),camera.fogStart());bytes.putFloat(camera.fogEnd()).putFloat(0).putFloat(0).putFloat(0);
+        put(bytes,camera.fogColor(),camera.fogStart());bytes.putFloat(camera.fogEnd()).putFloat(jitterX).putFloat(jitterY).putFloat(dlssActive?1:0);
         frame.camera.flush();
     }
+    private boolean historyCut(Scene.Camera camera){return reset||camera.cut()||camera.world()!=previousWorld||Math.abs(previousX-camera.x())+Math.abs(previousY-camera.y())+Math.abs(previousZ-camera.z())>8;}
     private static void put(ByteBuffer bytes,org.joml.Vector3f value,float w){bytes.putFloat(value.x).putFloat(value.y).putFloat(value.z).putFloat(w);}
     private void writeDescriptors(Frame frame) {try(var stack=MemoryStack.stackPush()) {
         if(frame.descriptorScene!=frame.sceneVersion||frame.descriptorImages!=imageRevision) {
-        var writes=VkWriteDescriptorSet.calloc(16,stack);
+        var writes=VkWriteDescriptorSet.calloc(20,stack);
         for(int i=0;i<16;i++)writes.get(i).sType$Default().dstSet(frame.set).dstBinding(i<9?i:i+1).descriptorCount(1);
         var acceleration=VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack).sType$Default().pAccelerationStructures(stack.longs(frame.top.handle));
         writes.get(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).pNext(acceleration.address());
@@ -434,6 +490,9 @@ public final class VulkanBackend implements RenderBackend {
         writes.get(13).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(upscale[1-frame.slot].view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
         writes.get(14).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(upscale[frame.slot].view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
         writes.get(15).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(nextHistory.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
+        VulkanImage[] dlssImages={dlssDepth,dlssMotion,dlssBias,dlssOutput};
+        for(int i=0;i<4;i++)writes.get(16+i).sType$Default().dstSet(frame.set).dstBinding(17+i).descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .pImageInfo(VkDescriptorImageInfo.calloc(1,stack).imageView(dlssImages[i]==null?resolved.view:dlssImages[i].view).imageLayout(VK_IMAGE_LAYOUT_GENERAL));
         vkUpdateDescriptorSets(context.device,writes,null);frame.descriptorScene=frame.sceneVersion;frame.descriptorImages=imageRevision;
         }
         if(frame.descriptorTextures==textureRevision)return;
@@ -458,18 +517,23 @@ public final class VulkanBackend implements RenderBackend {
     }
     public int availableMeshSlots(){return Math.max(0,256-pending.size());}
     public int dynamicMeshCount(){return dynamicSources.size();}
-    @Override public Diagnostics diagnostics(){return new Diagnostics("Vulkan path tracing",context==null?"uninitialized":context.name,reason,internalWidth,internalHeight,gpuMillis,context==null?0:context.allocated,meshes.size()+dynamicSources.size(),pending.size());}
+    public boolean dlssActive(){return dlssActive;}
+    public boolean dlssFallbackFxaa(){return configuredUpscaler==Upscaler.DLSS&&!dlssActive&&configuredAntiAliasing!=AntiAliasing.TAA;}
+    @Override public Diagnostics diagnostics(){return new Diagnostics("Vulkan path tracing",context==null?"uninitialized":context.name,reason+(configuredUpscaler==Upscaler.DLSS?(reason.isEmpty()?"":"; ")+(dlss==null?"DLSS not initialized":dlss.status())+(dlssActive?"":"; reconstruction fallback"):""),internalWidth,internalHeight,gpuMillis,context==null?0:context.allocated,meshes.size()+dynamicSources.size(),pending.size());}
     public List<String> validationMessages(){if(context==null)return List.of();synchronized(context.validationMessages){return List.copyOf(context.validationMessages);}}
     public record Timings(double fenceWaitMs,double recordingMs,double presentationMs,double gpuBuildMs,double gpuTraceMs,double gpuReconstructMs,double gpuExposureMs,double gpuCompositeMs,int accelerationBuilds,int accelerationUpdates,long uploadBytes){}
     public Timings timings(){return new Timings(waitMillis,recordMillis,presentMillis,buildMillis,stageMillis[1],stageMillis[2],stageMillis[3],stageMillis[4],lastBuilds,lastUpdates,lastUploadBytes);}
     @Override public void close() {
         if(context==null)return;
+        dlssActive=false;
         drain();org.lwjgl.opengl.GL11.glFinish();retired.complete(Long.MAX_VALUE);
+        if(dlss!=null){dlss.close();dlss=null;}
         for(var frame:frames)if(frame!=null)frame.close();releaseImages();
         for(var mesh:meshes.values())mesh.close();meshes.clear();
         for(var texture:textures.values())texture.close();textures.clear();
         dynamicSources.clear();pending.clear();pendingTextures.clear();
         if(presenter!=null)presenter.close();if(trace!=null)trace.close();if(reconstruct!=null)reconstruct.close();if(composite!=null)composite.close();if(exposureProgram!=null)exposureProgram.close();if(exposure!=null)exposure.close();
+        if(dlssPrepare!=null)dlssPrepare.close();
         if(sampler!=0)vkDestroySampler(context.device,sampler,null);if(pipelineLayout!=0)vkDestroyPipelineLayout(context.device,pipelineLayout,null);
         if(descriptorPool!=0)vkDestroyDescriptorPool(context.device,descriptorPool,null);if(descriptorLayout!=0)vkDestroyDescriptorSetLayout(context.device,descriptorLayout,null);
         context.close();context=null;

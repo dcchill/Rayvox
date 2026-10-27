@@ -28,6 +28,8 @@ public final class VulkanContext implements AutoCloseable {
     int family, timestampBits;
     int scratchAlignment=256;
     boolean rayTracingSupported;
+    boolean dlssExtensions;
+    String dlssUnavailable="DLSS was not enabled on this Vulkan device";
     float timestampPeriod;
     String name="";
     private long debugMessenger;
@@ -65,11 +67,24 @@ public final class VulkanContext implements AutoCloseable {
         var local=(ThreadLocal<MemoryStack>)field.get(null);local.set(MemoryStack.create(1024*1024));
     }
     private void initialize(byte[] uuid, boolean validation, boolean rayTracing) {
-        var required=rayTracing?EXTENSIONS:List.of(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+        var required=new LinkedHashSet<>(rayTracing?EXTENSIONS:List.of(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME));
         try (var stack=MemoryStack.stackPush()) {
             var app=VkApplicationInfo.calloc(stack).sType$Default().pApplicationName(stack.UTF8("Rayvox"))
                     .apiVersion(VK_API_VERSION_1_3);
             var info=VkInstanceCreateInfo.calloc(stack).sType$Default().pApplicationInfo(app);
+            var instanceExtensions=new LinkedHashSet<String>();
+            boolean dlssCandidate=false;
+            if(rayTracing&&DlssUpscaler.load()) {
+                try {
+                    var requested=DlssUpscaler.instanceExtensions();
+                    var count=stack.ints(0);check(vkEnumerateInstanceExtensionProperties((ByteBuffer)null,count,null),"enumerate instance extensions");
+                    var properties=VkExtensionProperties.calloc(count.get(0),stack);
+                    check(vkEnumerateInstanceExtensionProperties((ByteBuffer)null,count,properties),"enumerate instance extensions");
+                    var supported=new HashSet<String>();for(var property:properties)supported.add(property.extensionNameString());
+                    if(!supported.containsAll(requested))dlssUnavailable="DLSS instance extensions are unavailable";
+                    else {instanceExtensions.addAll(requested);dlssCandidate=true;}
+                }catch(RuntimeException|LinkageError failure){dlssUnavailable="DLSS extension query: "+failure.getMessage();}
+            }else if(rayTracing)dlssUnavailable=DlssUpscaler.loadFailure();
             if (validation) {
                 var count=stack.ints(0); check(vkEnumerateInstanceLayerProperties(count,null),"enumerate layers");
                 var layers=VkLayerProperties.calloc(count.get(0),stack);
@@ -78,7 +93,11 @@ public final class VulkanContext implements AutoCloseable {
                 for(var layer:layers) if(layer.layerNameString().equals("VK_LAYER_KHRONOS_validation")) found=true;
                 if(!found) throw new IllegalStateException("VK_LAYER_KHRONOS_validation is not installed");
                 info.ppEnabledLayerNames(stack.pointers(stack.UTF8("VK_LAYER_KHRONOS_validation")));
-                info.ppEnabledExtensionNames(stack.pointers(stack.UTF8(EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME)));
+                instanceExtensions.add(EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            }
+            if(!instanceExtensions.isEmpty()) {
+                var names=stack.mallocPointer(instanceExtensions.size());for(var extension:instanceExtensions)names.put(stack.UTF8(extension));names.flip();
+                info.ppEnabledExtensionNames(names);
             }
             var out=stack.mallocPointer(1); check(vkCreateInstance(info,null,out),"create instance");
             instance=new VkInstance(out.get(0),info);
@@ -134,7 +153,17 @@ public final class VulkanContext implements AutoCloseable {
                     rayTracingSupported=ray.rayQuery()&&accel.accelerationStructure()&&f12.bufferDeviceAddress()&&f12.shaderSampledImageArrayNonUniformIndexing()&&f12.descriptorBindingPartiallyBound()&&f13.synchronization2()&&features.features().shaderInt64();
                     name=props.properties().deviceNameString(); timestampPeriod=props.properties().limits().timestampPeriod(); break;
                 }
-                if(physical!=null) break;
+                if(physical!=null) {
+                    if(dlssCandidate&&props.properties().vendorID()==0x10de) {
+                        try {
+                            var requested=DlssUpscaler.deviceExtensions(instance,physical);
+                            if(!features.features().shaderStorageImageExtendedFormats())dlssUnavailable="DLSS motion-vector image format is unsupported";
+                            else if(!supported.containsAll(requested))dlssUnavailable="DLSS device extensions are unavailable";
+                            else {required.addAll(requested);dlssExtensions=true;}
+                        }catch(RuntimeException|LinkageError failure){dlssUnavailable="DLSS extension query: "+failure.getMessage();}
+                    }else if(dlssCandidate)dlssUnavailable="DLSS requires a supported NVIDIA GPU";
+                    break;
+                }
             }
             if(physical==null) throw new IllegalStateException(rejection);
             if(rayTracing) {
@@ -151,8 +180,15 @@ public final class VulkanContext implements AutoCloseable {
             var queues=VkDeviceQueueCreateInfo.calloc(1,stack); queues.get(0).sType$Default().queueFamilyIndex(family).pQueuePriorities(stack.floats(1));
             var names=stack.mallocPointer(required.size()); for(String extension:required) names.put(stack.UTF8(extension)); names.flip();
             var deviceInfo=VkDeviceCreateInfo.calloc(stack).sType$Default().pNext(f13.address()).pQueueCreateInfos(queues)
-                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(rayTracing));
-            check(vkCreateDevice(physical,deviceInfo,null,out),"create device"); device=new VkDevice(out.get(0),physical,deviceInfo);
+                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(rayTracing).shaderStorageImageExtendedFormats(dlssExtensions));
+            int created=vkCreateDevice(physical,deviceInfo,null,out);
+            if(created!=VK_SUCCESS&&dlssExtensions) {
+                dlssExtensions=false;dlssUnavailable="DLSS device creation failed (VkResult "+created+")";
+                var baseNames=stack.mallocPointer(EXTENSIONS.size());for(var extension:EXTENSIONS)baseNames.put(stack.UTF8(extension));baseNames.flip();
+                deviceInfo.ppEnabledExtensionNames(baseNames);deviceInfo.pEnabledFeatures().shaderStorageImageExtendedFormats(false);
+                created=vkCreateDevice(physical,deviceInfo,null,out);
+            }
+            check(created,"create device"); device=new VkDevice(out.get(0),physical,deviceInfo);
             vkGetDeviceQueue(device,family,0,out); queue=new VkQueue(out.get(0),device);
             var functions=VmaVulkanFunctions.calloc(stack).set(instance,device);
             var allocatorInfo=VmaAllocatorCreateInfo.calloc(stack).instance(instance).physicalDevice(physical).device(device)

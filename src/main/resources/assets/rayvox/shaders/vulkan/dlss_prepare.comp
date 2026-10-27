@@ -1,0 +1,44 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(rgba32f,set=0,binding=2) uniform readonly image2D geometryImage;
+layout(rgba32f,set=0,binding=7) uniform readonly image2D previousGeometry;
+layout(std140,set=0,binding=5) uniform Camera {
+    mat4 inverseVP;mat4 previousVP;mat4 currentVP;
+    vec4 originFrame;vec4 sunDirection;vec4 sunRadiance;vec4 skyReset;
+    vec4 outputSize;vec4 lightPosition[4];vec4 lightColor[4];vec4 fogColorStart;vec4 fogEnd;
+} camera;
+layout(r32f,set=0,binding=17) uniform writeonly image2D dlssDepth;
+layout(rg16f,set=0,binding=18) uniform writeonly image2D dlssMotion;
+layout(r32f,set=0,binding=19) uniform writeonly image2D dlssBias;
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(geometryImage);
+    if(any(greaterThanEqual(pixel,size)))return;
+    vec4 g=imageLoad(geometryImage,pixel);
+    vec2 uv=(vec2(pixel)+.5+camera.fogEnd.yz)/vec2(size);
+    vec4 currentClip,oldClip;
+    float bias=1,depth=1;
+    if(g.w>=0) {
+        currentClip=camera.currentVP*vec4(g.xyz-camera.originFrame.xyz,1);
+        oldClip=camera.previousVP*vec4(g.xyz-camera.originFrame.xyz,1);
+        depth=clamp(currentClip.z/currentClip.w*.5+.5,0,1);
+    }else {
+        vec4 ray=camera.inverseVP*vec4(uv*2-1,1,1);
+        vec3 direction=normalize(ray.xyz/ray.w);
+        currentClip=camera.currentVP*vec4(direction,0);
+        oldClip=camera.previousVP*vec4(direction,0);
+    }
+    vec2 motion=vec2(0);
+    if(oldClip.w>0&&currentClip.w>0) {
+        vec2 oldUv=oldClip.xy/oldClip.w*.5+.5;
+        motion=(oldUv-(currentClip.xy/currentClip.w*.5+.5))*vec2(size);
+        if(camera.skyReset.w==0&&g.w>=0&&all(greaterThanEqual(oldUv,vec2(0)))&&all(lessThan(oldUv,vec2(1)))) {
+            vec4 old=imageLoad(previousGeometry,ivec2(oldUv*vec2(size)));
+            bool sameSurface=old.w==g.w&&length(old.xyz-g.xyz)<.1+.005*length(g.xyz-camera.originFrame.xyz);
+            // shortcut: dynamic meshes use camera flow and current-color bias; add object motion when persistent transforms exist.
+            if(sameSurface&&(uint(g.w)&0x00800000u)==0u)bias=0;
+        }
+    }
+    imageStore(dlssDepth,pixel,vec4(depth));
+    imageStore(dlssMotion,pixel,vec4(clamp(motion,vec2(-65504),vec2(65504)),0,0));
+    imageStore(dlssBias,pixel,vec4(bias));
+}

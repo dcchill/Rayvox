@@ -97,7 +97,7 @@ public final class RenderBackends {
         if(!active())return;
         try {
             if(backend instanceof VulkanRasterBackend raster){raster.detach();return;}
-            if(Rayvox.ANTI_ALIASING.get()!=AntiAliasing.FXAA)return;
+            if(backend instanceof VulkanBackend vulkan&&(vulkan.dlssActive()||Rayvox.ANTI_ALIASING.get()!=AntiAliasing.FXAA&&!vulkan.dlssFallbackFxaa()))return;
             var main=Minecraft.getInstance().getMainRenderTarget();
             if(main.width<1||main.height<1)return;
             if(worldResolve==null)worldResolve=new dev.rayvox.render.vulkan.GlWorldResolve();

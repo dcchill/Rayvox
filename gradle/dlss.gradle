@@ -1,0 +1,37 @@
+// Opt-in: ordinary builds need neither a C++ compiler nor NVIDIA's SDK.
+if (providers.gradleProperty('rayvoxDlssSdk').isPresent()) {
+    def sdk = file(providers.gradleProperty('rayvoxDlssSdk').get())
+    def cmake = providers.gradleProperty('rayvoxCmake').getOrElse('cmake')
+    def nativeBuild = layout.buildDirectory.dir('dlss-native')
+    def nativeResources = layout.buildDirectory.dir('dlss-resources')
+    tasks.register('configureDlssNative', Exec) {
+        inputs.dir('native/dlss')
+        inputs.dir(new File(sdk, 'include'))
+        inputs.property('sdk', sdk.absolutePath)
+        outputs.file(nativeBuild.map { it.file('CMakeCache.txt') })
+        doFirst {
+            environment 'JAVA_HOME', javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(21) }.get().metadata.installationPath.asFile
+            commandLine cmake, '-S', file('native/dlss'), '-B', nativeBuild.get().asFile, "-DDLSS_SDK=${sdk}"
+            if (providers.gradleProperty('rayvoxVulkanHeaders').isPresent()) {
+                args "-DVULKAN_HEADERS=${file(providers.gradleProperty('rayvoxVulkanHeaders').get())}"
+            }
+        }
+    }
+    tasks.register('buildDlssNative', Exec) {
+        dependsOn 'configureDlssNative'
+        commandLine cmake, '--build', nativeBuild.get().asFile, '--config', 'Release'
+    }
+    tasks.register('installDlssNative', Exec) {
+        dependsOn 'buildDlssNative'
+        commandLine cmake, '--install', nativeBuild.get().asFile, '--config', 'Release', '--prefix', nativeResources.get().dir('natives/windows-x86_64').asFile
+    }
+    sourceSets.main.output.dir([builtBy: 'installDlssNative'], nativeResources)
+    tasks.named('jar') { archiveClassifier = 'dlss' }
+}
+
+tasks.named('vulkanTest') {
+    if (providers.gradleProperty('rayvoxDlssGpuTest').isPresent()) {
+        systemProperty 'rayvox.dlss.gpuTest', 'true'
+        outputs.upToDateWhen { false }
+    }
+}

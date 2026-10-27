@@ -89,7 +89,7 @@ void main() {
     int samples=max(1,int(camera.outputSize.z));
     for(int sampleIndex=0;sampleIndex<samples;sampleIndex++) {
     rng=(uint(pixel.x)+uint(pixel.y)*uint(size.x))*747796405u+(samples>1?0u:uint(camera.originFrame.w))*2891336453u+uint(sampleIndex)*277803737u+1u;
-    vec2 uv=(vec2(pixel)+vec2(randomFloat(),randomFloat()))/vec2(size);
+    vec2 uv=(vec2(pixel)+(camera.fogEnd.w>.5?vec2(.5)+camera.fogEnd.yz:vec2(randomFloat(),randomFloat())))/vec2(size);
     vec4 q=camera.inverseVP*vec4(uv*2-1,1,1);vec3 direction=normalize(q.xyz/q.w);
     vec3 origin=camera.originFrame.xyz,throughput=vec3(1),radiance=vec3(0);
     bool specularPath=true;

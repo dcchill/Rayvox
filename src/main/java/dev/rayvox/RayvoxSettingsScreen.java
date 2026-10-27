@@ -37,13 +37,18 @@ final class RayvoxSettingsScreen extends Screen {
                 Rayvox.ANTI_ALIASING.set(modes[(Rayvox.ANTI_ALIASING.get().ordinal() + 1) % modes.length]);
                 Rayvox.PRESET.set(QualityPreset.CUSTOM);
                 Rayvox.ANTI_ALIASING.save();
-            }, "OFF or FXAA. Filters only the rendered world, never the HUD. FXAA is spatial anti-aliasing, not temporal AA; path tracing keeps its existing temporal reconstruction.");
+            }, "OFF or FXAA for either Vulkan renderer; TAA uses path-tracing reprojection and history. Filters only the world, never the HUD.");
             cycle("Upscaling", () -> Rayvox.UPSCALING.get().name(), () -> {
                 var modes = UpscalingMode.values();
                 Rayvox.UPSCALING.set(modes[(Rayvox.UPSCALING.get().ordinal() + 1) % modes.length]);
                 Rayvox.PRESET.set(QualityPreset.CUSTOM);
                 Rayvox.UPSCALING.save();
-            }, "NATIVE: 100%. QUALITY: 67%. BALANCED: 59%. PERFORMANCE: 50%. Vanilla uses a spatial upscaler; path tracing retains its temporal path. ADAPTIVE adjusts path-traced resolution using GPU timings only; vanilla stays native until adaptive timing is supported.");
+            }, "NATIVE: 100%. QUALITY: 67%. BALANCED: 59%. PERFORMANCE: 50%. Vanilla uses spatial upscaling; path tracing uses temporal reconstruction. ADAPTIVE adjusts path-traced resolution using GPU timings only.");
+            if(!vanilla)cycle("Upscaler",()->Rayvox.UPSCALER.get().name(),()->{
+                var modes=dev.rayvox.render.Upscaler.values();
+                Rayvox.UPSCALER.set(modes[(Rayvox.UPSCALER.get().ordinal()+1)%modes.length]);
+                Rayvox.PRESET.set(QualityPreset.CUSTOM);Rayvox.UPSCALER.save();
+            },"DLSS: NVIDIA AI upscaling with AA. Requires an NGX-enabled build and a supported NVIDIA GPU/driver. Falls back to reconstruction with FXAA or selected TAA. Diagnostics reports the active path. NATIVE uses DLAA; ADAPTIVE recreates DLSS when the input size changes.");
                 if(vanilla)slider("Upscale sharpness", Rayvox.UPSCALE_SHARPNESS, 0, 100, "%",
                     "Vanilla Vulkan spatial-upscaling sharpness; 0 disables sharpening. Only applies below native resolution. The hand and HUD stay untouched.");
             if(!vanilla) {
