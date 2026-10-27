@@ -82,7 +82,7 @@ final class RayvoxDebugScreen extends Screen {
         graphics.drawString(font, title, 16, 16, 0xff8080);
         int y = 32 - scroll;
         graphics.enableScissor(8, 30, width - 8, height - 184);
-        for (String line : new String[]{RayvoxEngine.status(), RayvoxEngine.gpu(),
+        for (String line : new String[]{RenderBackends.status(),RayvoxEngine.status(), RayvoxEngine.gpu(),
                 "Compute 4.3: " + RayvoxEngine.computeAvailable() + " (unused)", RayvoxEngine.lightStats(),
                 RayvoxEngine.cacheStats(), RayvoxEngine.uploadStats(),
                 RayvoxEngine.distantStats(),
@@ -90,8 +90,8 @@ final class RayvoxDebugScreen extends Screen {
                 RayvoxEngine.pipelineStats(), RayvoxEngine.governorStats(), RayvoxEngine.spanStats(),
                 RayvoxEngine.historyStats(), RayvoxEngine.timingStats(), RayvoxEngine.dynamicStats(),
                 RayvoxEngine.worldLightingStats(),
-                RayvoxEngine.deferredActive() ? "History reuse: green=fresh cached light, amber=stale (awaiting refresh), red=new (unshadowed estimate)"
-                        : "History reuse: green=reused static light, red=recomputed",
+                RayvoxEngine.deferredActive() ? "History reuse: green=fresh cached light, amber=stale (awaiting refresh), red=new (unshadowed estimate), blue=history unavailable/off"
+                        : "History reuse: green=reused static light, red=recomputed, blue=history unavailable/off",
                 "Light samples: static up to " + Rayvox.LIGHTS_PER_SECTION.get() + "; moving up to 4; sun 1; "
                         + (RayvoxEngine.shadowSoftness() > 0 ? "4 rays/sample (soft)" : "1 ray/sample (sharp)"),
                 "Entity shadow volumes: " + RayvoxEngine.entityShadowCount() + "/16 within 32 blocks; rounded body bounds",

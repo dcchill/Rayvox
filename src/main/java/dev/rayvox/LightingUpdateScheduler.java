@@ -51,6 +51,12 @@ public final class LightingUpdateScheduler implements AutoCloseable {
     /** Unknown cost bootstraps one region; zero budget explicitly disables dispatch. */
     public List<Work> schedule(double cameraX, double cameraY, double cameraZ, int maxRegions, long gpuBudgetNanos,
             Predicate<WorldLightingCache.Region> visible, ToDoubleFunction<WorldLightingCache.Region> importance) {
+        return schedule(cameraX, cameraY, cameraZ, maxRegions, gpuBudgetNanos, visible, importance, channel -> true);
+    }
+
+    public List<Work> schedule(double cameraX, double cameraY, double cameraZ, int maxRegions, long gpuBudgetNanos,
+            Predicate<WorldLightingCache.Region> visible, ToDoubleFunction<WorldLightingCache.Region> importance,
+            Predicate<WorldLightingCache.Ticket> supported) {
         if (maxRegions < 0 || gpuBudgetNanos < 0) throw new IllegalArgumentException("Negative lighting budget");
         synchronize();
         if (closed || maxRegions == 0 || gpuBudgetNanos == 0) return List.of();
@@ -58,7 +64,7 @@ public final class LightingUpdateScheduler implements AutoCloseable {
                 : (int)Math.min(maxRegions, Math.max(1, Math.floor(gpuBudgetNanos / gpuNanosPerRegion)));
         limit = Math.min(limit, maxRegions);
         var regions = new LinkedHashMap<WorldLightingCache.Region, List<Pending>>();
-        for (var item : pending.values()) if (!item.inFlight)
+        for (var item : pending.values()) if (!item.inFlight && supported.test(item.ticket))
             regions.computeIfAbsent(item.ticket.region(), ignored -> new ArrayList<>()).add(item);
         var ranked = new ArrayList<>(regions.keySet());
         // Visibility and importance are bounded hints. Overdue work outranks both, ensuring eventual service.
@@ -109,10 +115,18 @@ public final class LightingUpdateScheduler implements AutoCloseable {
     }
 
     public boolean complete(WorldLightingCache.Ticket ticket, float[] samples) {
+        return complete(ticket, samples, false);
+    }
+
+    public boolean completeGpu(WorldLightingCache.Ticket ticket) {
+        return complete(ticket, null, true);
+    }
+
+    private boolean complete(WorldLightingCache.Ticket ticket, float[] samples, boolean gpu) {
         synchronize();
         var item = ticket == null ? null : pending.get(new Key(ticket.region(), ticket.channel()));
         if (closed || item == null || !item.inFlight || !item.ticket.equals(ticket)) return false;
-        boolean accepted = cache.publish(ticket, samples);
+        boolean accepted = gpu ? cache.publishGpu(ticket) : cache.publish(ticket, samples);
         if (accepted) {
             // Publication only removed this dirty entry. Avoid rescanning every brick per completed channel.
             pending.remove(new Key(ticket.region(), ticket.channel()));

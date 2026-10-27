@@ -113,6 +113,7 @@ public final class VoxelGrid {
         public java.util.List<LightSourceManager.Light> uploadedLights = java.util.List.of();
         public boolean lightOverflow;
         public boolean uploadedLightOverflow;
+        final long[] uploadedOpaque = new long[SECTION_BYTES / 64];
         public final byte[] data = new byte[SECTION_BYTES];
         public final byte[] albedo = new byte[SECTION_BYTES * 3];
         public final long[] shapes = new long[SECTION_BYTES];

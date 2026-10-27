@@ -1,0 +1,49 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(rgba16f,set=0,binding=1) uniform image2D radianceImage;
+layout(rgba32f,set=0,binding=2) uniform image2D geometryImage;
+layout(rgba16f,set=0,binding=3) uniform image2D normalImage;
+layout(std140,set=0,binding=5) uniform Camera {
+    mat4 inverseVP;mat4 previousVP;mat4 currentVP;
+    vec4 originFrame;vec4 sunDirection;vec4 sunRadiance;vec4 skyReset;
+    vec4 outputSize;vec4 lightPosition[4];vec4 lightColor[4];vec4 fogColorStart;vec4 fogEnd;
+} camera;
+layout(rgba16f,set=0,binding=6) uniform image2D historyImage;
+layout(rgba32f,set=0,binding=7) uniform image2D previousGeometry;
+layout(rgba16f,set=0,binding=8) uniform image2D resolvedImage;
+layout(push_constant) uniform Pass { int mode;int stepWidth; } pass;
+float luminance(vec3 c){return dot(c,vec3(.2126,.7152,.0722));}
+vec4 spatialInput(ivec2 p){return pass.mode==2?imageLoad(radianceImage,p):imageLoad(resolvedImage,p);}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(radianceImage);if(any(greaterThanEqual(pixel,size)))return;
+    vec4 g=imageLoad(geometryImage,pixel),n=imageLoad(normalImage,pixel);
+    if(pass.mode==0) {
+        vec3 color=imageLoad(radianceImage,pixel).rgb;float weight=1;
+        vec4 p=camera.previousVP*vec4(g.xyz-camera.originFrame.xyz,1);vec2 uv=p.xy/p.w*.5+.5;
+        ivec2 old=ivec2(uv*vec2(size));
+        if(camera.skyReset.w==0 && p.w>0 && g.w>=0 && all(greaterThanEqual(old,ivec2(0))) && all(lessThan(old,size))) {
+            vec4 previous=imageLoad(previousGeometry,old);vec4 h=imageLoad(historyImage,old);
+            if(previous.w==g.w && length(previous.xyz-g.xyz)<.1+.005*length(g.xyz-camera.originFrame.xyz)) {
+                weight=min(h.a+1,(uint(g.w)&0x00800000u)!=0u?8:64);color=mix(color,h.rgb,(weight-1)/weight);
+            }
+        }
+        imageStore(resolvedImage,pixel,vec4(color,weight));return;
+    }
+    vec4 center=spatialInput(pixel);vec3 sum=vec3(0);float weights=0;
+    float localMean=0,secondMoment=0,mean=luminance(center.rgb);
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
+        ivec2 q=clamp(pixel+ivec2(x,y),ivec2(0),size-1);float value=luminance(spatialInput(q).rgb);
+        localMean+=value/9;secondMoment+=value*value/9;
+    }
+    float deviation=sqrt(max(0,secondMoment-localMean*localMean));
+    for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++) {
+        ivec2 q=clamp(pixel+ivec2(x,y)*pass.stepWidth,ivec2(0),size-1);
+        vec4 gn=imageLoad(geometryImage,q),nn=imageLoad(normalImage,q),c=spatialInput(q);
+        float w=exp(-float(x*x+y*y)*.25);
+        if(g.w!=gn.w)w=0;
+        if(g.w>=0)w*=pow(max(dot(n.xyz,nn.xyz),0),32)*exp(-length(g.xyz-gn.xyz)*2);
+        w*=exp(-abs(luminance(c.rgb)-mean)/(4*deviation+.1));sum+=c.rgb*w;weights+=w;
+    }
+    vec4 value=vec4(sum/max(weights,.00001),center.a);
+    if(pass.mode==2)imageStore(resolvedImage,pixel,value);else imageStore(radianceImage,pixel,value);
+}

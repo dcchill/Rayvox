@@ -6,6 +6,7 @@ import net.minecraft.server.packs.resources.ResourceProvider;
 /** Owns the independent lighting stages; GameRenderer reloads/closes this resource as one shader. */
 final class LightingRenderPipeline extends LightingPass {
     LightingPass direct, indirect, dynamic;
+    LightingPass probes;
     private boolean closed;
 
     LightingRenderPipeline(ResourceProvider resources) throws IOException {
@@ -17,6 +18,10 @@ final class LightingRenderPipeline extends LightingPass {
         } catch (IOException | RuntimeException failure) {
             close();
             throw failure;
+        }
+        try { probes = new LightingPass(resources, Kind.PROBE); }
+        catch (IOException | RuntimeException failure) {
+            com.mojang.logging.LogUtils.getLogger().error("Rayvox world probes unavailable; using surface GI gathers", failure);
         }
     }
 
@@ -33,6 +38,7 @@ final class LightingRenderPipeline extends LightingPass {
         if (direct != null) direct.close();
         if (indirect != null) indirect.close();
         if (dynamic != null) dynamic.close();
+        if (probes != null) probes.close();
         super.close();
     }
 }

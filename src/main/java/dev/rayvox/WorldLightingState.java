@@ -4,18 +4,19 @@ import java.util.List;
 import net.minecraft.world.phys.AABB;
 import static dev.rayvox.WorldLightingCache.Channel.*;
 
-/** Phase 2 shadow bookkeeping only: no GPU dispatch and no terrain sampling until acceptance measurements. */
+/** World-owned residency and invalidation. Static indirect probes have an optional GPU producer. */
 final class WorldLightingState implements AutoCloseable {
     static final int MAX_BRICKS = 729;
     static final long PAYLOAD_BUDGET = 8L * 1024 * 1024;
     final WorldLightingCache cache = new WorldLightingCache(MAX_BRICKS, PAYLOAD_BUDGET, 4);
     final LightingUpdateScheduler scheduler = new LightingUpdateScheduler(cache);
-    private long geometryRevision = -1, emitterRevision = -1, definitionRevision = -1;
+    private long geometryRevision = -1, emitterRevision = -1, definitionRevision = -1, sourceRevision = -1;
     private int sunEpoch = -1;
+    private DirectionalLight indirectSun;
     private List<LightSourceManager.Light> dynamic = List.of(), testLights = List.of();
     private List<AABB> casters = List.of();
 
-    void update(VoxelGrid grid, long emitters, LightSourceManager lights,
+    void update(VoxelGrid grid, long emitters, long sources, LightSourceManager lights,
             List<LightSourceManager.Light> moving, DirectionalLight sun, List<AABB> entityCasters) {
         if (geometryRevision != grid.snapshotRevision) {
             // Only committed uploaded sections can acquire residency. Never retain mutable extraction buffers.
@@ -26,26 +27,30 @@ final class WorldLightingState implements AutoCloseable {
             geometryUnavailable();
             geometryRevision = grid.snapshotRevision;
         }
-        if (emitterRevision != emitters || definitionRevision != lights.definitionRevision() || !testLights.equals(lights.testLights)) {
-            // This deliberately does not use the camera-dependent active light list as a world source revision.
+        if (emitterRevision != emitters || sourceRevision != sources || definitionRevision != lights.definitionRevision() || !testLights.equals(lights.testLights)) {
+            // Both world source changes and changes to the actual GPU source selection affect irradiance.
             cache.invalidateAll(STATIC_DIRECT, INDIRECT);
             emitterRevision = emitters;
+            sourceRevision = sources;
             definitionRevision = lights.definitionRevision();
             testLights = List.copyOf(lights.testLights);
         }
         if (!dynamic.equals(moving)) {
             invalidateDynamic(dynamic);
             invalidateDynamic(moving);
-            // Indirect dependencies are not bounded by a direct-light radius yet.
-            cache.invalidateAll(INDIRECT);
+            // The world probe producer deliberately excludes held lights and entity shadows.
             dynamic = List.copyOf(moving);
         }
         if (sunEpoch != sun.epoch()) {
             cache.invalidateAll(DIRECTIONAL_VISIBILITY, INDIRECT);
             sunEpoch = sun.epoch();
         }
+        if (!sun.equals(indirectSun)) {
+            cache.invalidateAll(INDIRECT);
+            indirectSun = sun;
+        }
         if (!casters.equals(entityCasters)) {
-            geometryUnavailable();
+            cache.invalidateAll(STATIC_DIRECT, DIRECTIONAL_VISIBILITY);
             casters = List.copyOf(entityCasters);
         }
         scheduler.advanceFrame();
@@ -70,9 +75,10 @@ final class WorldLightingState implements AutoCloseable {
     void geometryUnavailable() { cache.invalidateAll(WorldLightingCache.Channel.values()); }
 
     String status() {
-        return "World lighting (bookkeeping): " + cache.size() + "/" + cache.capacity() + " bricks; "
+        return "World lighting: " + cache.size() + "/" + cache.capacity() + " bricks; "
                 + cache.residentPayloadBytes() / 1024 + " KiB stored / " + cache.reservedPayloadBytes() / 1024
-                + " KiB reserved; " + scheduler.pendingCount() + " channel updates; producer OFF";
+                + " KiB reserved; " + cache.validCount(INDIRECT) + " indirect bricks ready; "
+                + scheduler.pendingCount() + " channel updates";
     }
 
     @Override public void close() { scheduler.close(); cache.close(); }

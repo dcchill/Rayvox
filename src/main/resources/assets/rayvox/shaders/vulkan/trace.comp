@@ -1,0 +1,136 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform accelerationStructureEXT world;
+layout(rgba16f,set=0,binding=1) uniform image2D radianceImage;
+layout(rgba32f,set=0,binding=2) uniform image2D geometryImage;
+layout(rgba16f,set=0,binding=3) uniform image2D normalImage;
+struct Vertex { vec4 position; vec4 normalEmission; vec4 uvMaterial; vec4 color; };
+layout(buffer_reference,std430,buffer_reference_align=16) readonly buffer Vertices { Vertex vertex[]; };
+struct Mesh { uint64_t address; uint textureIndex; uint identity; };
+layout(std430,set=0,binding=4) readonly buffer Meshes { Mesh mesh[]; };
+layout(std140,set=0,binding=5) uniform Camera {
+    mat4 inverseVP; mat4 previousVP; mat4 currentVP;
+    vec4 originFrame; vec4 sunDirection; vec4 sunRadiance; vec4 skyReset;
+    vec4 outputSize; vec4 lightPosition[4]; vec4 lightColor[4];vec4 fogColorStart;vec4 fogEnd;
+} camera;
+layout(set=0,binding=9) uniform sampler2D textures[1024];
+struct Emitter { uvec4 indices;vec4 originArea; };
+layout(std430,set=0,binding=12) readonly buffer Emitters {uvec4 emitterCount;Emitter emitter[];};
+uint rng;
+float randomFloat() { rng^=rng<<13; rng^=rng>>17; rng^=rng<<5; return float(rng)*2.3283064365386963e-10; }
+vec3 cosineDirection(vec3 n) {
+    float a=6.2831853*randomFloat(),r=sqrt(randomFloat());
+    vec3 t=normalize(cross(abs(n.y)<.99?vec3(0,1,0):vec3(1,0,0),n));
+    return normalize(t*(r*cos(a))+cross(n,t)*(r*sin(a))+n*sqrt(max(0,1-r*r)));
+}
+Vertex interpolateVertex(uint id,uint primitive,vec2 b) {
+    Vertices data=Vertices(mesh[id].address); uint k=primitive*3;
+    Vertex a=data.vertex[k],c=data.vertex[k+1],d=data.vertex[k+2]; vec3 w=vec3(1-b.x-b.y,b);
+    Vertex v;v.position=a.position*w.x+c.position*w.y+d.position*w.z;v.position.w=a.position.w;
+    v.normalEmission=a.normalEmission*w.x+c.normalEmission*w.y+d.normalEmission*w.z;
+    v.uvMaterial=a.uvMaterial*w.x+c.uvMaterial*w.y+d.uvMaterial*w.z;
+    v.color=a.color*w.x+c.color*w.y+d.color*w.z;return v;
+}
+bool intersect(vec3 origin,vec3 direction,float maximum,out vec3 point,out vec3 normal,out vec4 albedo,out vec4 material,out uint identity) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query,world,gl_RayFlagsNoneEXT,255,origin,.002,direction,maximum);
+    while(rayQueryProceedEXT(query)) {
+        if(rayQueryGetIntersectionTypeEXT(query,false)==gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint id=rayQueryGetIntersectionInstanceCustomIndexEXT(query,false);
+            Vertex v=interpolateVertex(id,rayQueryGetIntersectionPrimitiveIndexEXT(query,false),rayQueryGetIntersectionBarycentricsEXT(query,false));
+            float alpha=textureLod(textures[nonuniformEXT(mesh[id].textureIndex)],v.uvMaterial.xy,0).a*v.color.a;
+            if(alpha>=.1)rayQueryConfirmIntersectionEXT(query);
+        }
+    }
+    if(rayQueryGetIntersectionTypeEXT(query,true)==gl_RayQueryCommittedIntersectionNoneEXT)return false;
+    uint id=rayQueryGetIntersectionInstanceCustomIndexEXT(query,true);
+    Vertex v=interpolateVertex(id,rayQueryGetIntersectionPrimitiveIndexEXT(query,true),rayQueryGetIntersectionBarycentricsEXT(query,true));
+    point=origin+direction*rayQueryGetIntersectionTEXT(query,true);
+    normal=normalize(v.normalEmission.xyz);
+    albedo=textureLod(textures[nonuniformEXT(mesh[id].textureIndex)],v.uvMaterial.xy,0)*v.color;
+    albedo.rgb=pow(max(albedo.rgb,vec3(0)),vec3(2.2));
+    material=vec4(v.normalEmission.w,v.uvMaterial.z,v.uvMaterial.w,v.position.w);identity=mesh[id].identity;return true;
+}
+vec3 visibility(vec3 origin,vec3 direction,float maximum) {
+    vec3 trans=vec3(1),p,n;vec4 c,m;uint id;
+    for(int i=0;i<8;i++) {
+        if(!intersect(origin,direction,maximum,p,n,c,m,id))return trans;
+        if(m.y<1.5)return vec3(0);
+        trans*=m.y>2.5?vec3(1-c.a):mix(vec3(.93),c.rgb,.35);maximum-=length(p-origin);origin=p+direction*.004;
+        if(maximum<=.004)return trans;
+    }return vec3(0);
+}
+vec3 emissionColor(float packed,vec3 albedo) {
+    if(packed>=0)return albedo;
+    uint rgb=uint(-packed)-1u;return pow(vec3((rgb>>16)&255u,(rgb>>8)&255u,rgb&255u)/255,vec3(2.2));
+}
+vec3 sampleEmitter(vec3 point,vec3 normal,vec3 albedo) {
+    if(emitterCount.x==0)return vec3(0);
+    Emitter light=emitter[min(uint(randomFloat()*emitterCount.x),emitterCount.x-1)];
+    float root=sqrt(randomFloat());vec2 bary=vec2(1-root,randomFloat()*root);
+    Vertex v=interpolateVertex(light.indices.x,light.indices.y,bary);
+    vec3 target=v.position.xyz+light.originArea.xyz,delta=target-point;float distance=length(delta);
+    if(distance<.01)return vec3(0);vec3 direction=delta/distance;
+    float geometry=max(dot(normal,direction),0)*abs(dot(normalize(v.normalEmission.xyz),-direction));
+    vec4 texel=textureLod(textures[nonuniformEXT(mesh[light.indices.x].textureIndex)],v.uvMaterial.xy,0)*v.color;
+    if(texel.a<.1)return vec3(0);
+    vec3 emission=emissionColor(v.position.w,pow(max(texel.rgb,vec3(0)),vec3(2.2)))*v.normalEmission.w;
+    return albedo*emission*geometry*light.originArea.w*float(emitterCount.x)*visibility(point+normal*.004,direction,distance-.008)/(3.14159265*max(distance*distance,.001));
+}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(radianceImage);
+    if(any(greaterThanEqual(pixel,size)))return;
+    vec3 totalRadiance=vec3(0);vec4 firstGeometry=vec4(0,0,0,-1),firstNormal=vec4(0);
+    int samples=max(1,int(camera.outputSize.z));
+    for(int sampleIndex=0;sampleIndex<samples;sampleIndex++) {
+    rng=(uint(pixel.x)+uint(pixel.y)*uint(size.x))*747796405u+(samples>1?0u:uint(camera.originFrame.w))*2891336453u+uint(sampleIndex)*277803737u+1u;
+    vec2 uv=(vec2(pixel)+vec2(randomFloat(),randomFloat()))/vec2(size);
+    vec4 q=camera.inverseVP*vec4(uv*2-1,1,1);vec3 direction=normalize(q.xyz/q.w);
+    vec3 origin=camera.originFrame.xyz,throughput=vec3(1),radiance=vec3(0);
+    bool specularPath=true;
+    for(int bounce=0;bounce<4;bounce++) {
+        vec3 p,n;vec4 color,m;uint identity;
+        if(!intersect(origin,direction,8192,p,n,color,m,identity)) {
+            radiance+=throughput*camera.skyReset.rgb*(.3+.7*max(direction.y,0));break;
+        }
+        if(bounce==0&&sampleIndex==0){firstGeometry=vec4(p,float(identity));firstNormal=vec4(n,m.z);}
+        vec3 outward=n;bool entering=dot(direction,n)<0;if(!entering)n=-n;
+        if(m.y>2.5) {
+            if(randomFloat()>color.a){origin=p+direction*.004;continue;}
+            m.y=0;
+        }
+        if(specularPath)radiance+=throughput*emissionColor(m.w,color.rgb)*max(m.x,0);
+        if(m.y>1.5) {
+            specularPath=true;
+            float ior=m.z<.15?1.333:1.5;
+            float f0=pow((1-ior)/(1+ior),2),fresnel=f0+(1-f0)*pow(1-max(dot(-direction,n),0),5);
+            vec3 refracted=refract(direction,n,entering?1/ior:ior);
+            if(randomFloat()<fresnel || dot(refracted,refracted)<.01)direction=reflect(direction,n);
+            else {direction=refracted;throughput*=mix(vec3(.98),color.rgb,.15);}
+            origin=p+direction*.004;continue;
+        }
+        if(m.x<0) {
+            direction=normalize(mix(reflect(direction,n),cosineDirection(n),m.z*m.z));
+            throughput*=color.rgb;origin=p+n*.004;specularPath=true;continue;
+        }
+        radiance+=throughput*sampleEmitter(p,n,color.rgb);
+        float ndl=max(dot(n,camera.sunDirection.xyz),0);
+        if(ndl>0)radiance+=throughput*color.rgb*camera.sunRadiance.rgb*ndl*visibility(p+n*.004,camera.sunDirection.xyz,4096)/3.14159265;
+        for(int i=0;i<4;i++)if(camera.lightColor[i].w>0) {
+            vec3 delta=camera.lightPosition[i].xyz-p;float d=length(delta);
+            if(d>.01)radiance+=throughput*color.rgb*camera.lightColor[i].rgb*max(dot(n,delta/d),0)*visibility(p+n*.004,delta/d,d-.01)/(1+d*d);
+        }
+        if(randomFloat()<.08){direction=normalize(mix(reflect(direction,n),cosineDirection(n),m.z*m.z));throughput*=mix(vec3(.04),color.rgb,.1)/.08;specularPath=true;}
+        else {direction=cosineDirection(n);throughput*=color.rgb*.96/.92;specularPath=false;}
+        origin=p+n*.004;
+        if(bounce>=2){float survive=clamp(max(throughput.r,max(throughput.g,throughput.b)),.1,.95);if(randomFloat()>survive)break;throughput/=survive;}
+    }
+    totalRadiance+=min(radiance,vec3(64));
+    }
+    imageStore(radianceImage,pixel,vec4(totalRadiance/float(samples),1));
+    imageStore(geometryImage,pixel,firstGeometry);imageStore(normalImage,pixel,firstNormal);
+}

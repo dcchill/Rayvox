@@ -14,6 +14,14 @@ final class GpuTimer implements AutoCloseable {
 
     void begin() {
         if (active != -1) return;
+        poll();
+        if (pending[next]) return;
+        active = next;
+        next = (next + 1) % pending.length;
+        glQueryCounter(queries[active * 2], GL_TIMESTAMP);
+    }
+
+    void poll() {
         for (int i = 0; i < pending.length; i++) {
             if (pending[i] && glGetQueryObjecti(queries[i * 2 + 1], GL_QUERY_RESULT_AVAILABLE) != 0) {
                 long start = glGetQueryObjectui64(queries[i * 2], GL_QUERY_RESULT);
@@ -23,10 +31,6 @@ final class GpuTimer implements AutoCloseable {
                 pending[i] = false;
             }
         }
-        if (pending[next]) return;
-        active = next;
-        next = (next + 1) % pending.length;
-        glQueryCounter(queries[active * 2], GL_TIMESTAMP);
     }
 
     void end() {

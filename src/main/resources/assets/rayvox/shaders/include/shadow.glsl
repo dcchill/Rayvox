@@ -1,3 +1,5 @@
+uniform int CullingDisabled;
+
 // Logical sections and the ring offset are each in [0, CacheWidth); one subtraction wraps their sum.
 ivec3 cacheSlot(ivec3 cell) {
     ivec3 slot = cell / 16 + CacheMinSlot;
@@ -5,11 +7,21 @@ ivec3 cacheSlot(ivec3 cell) {
 }
 
 int voxelAt(ivec3 cell) {
-    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(CacheWidth * 16)))) return -1;
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(CacheWidth * 16)))) {
+#ifdef RAYVOX_WORLD_PROBES
+        WorldProbeKnown = false;
+#endif
+        return -1;
+    }
     ivec3 sectionSlot = cacheSlot(cell);
     // A pending replacement keeps its last uploaded visibility until the new snapshot commits.
     uint state = texelFetch(VoxelState, sectionSlot, 0).r;
-    if ((state & 1u) == 0u) return -1;
+    if ((state & 1u) == 0u) {
+#ifdef RAYVOX_WORLD_PROBES
+        WorldProbeKnown = false;
+#endif
+        return -1;
+    }
     if ((state & 4u) != 0u) return 0;
     return int(texelFetch(VoxelData, sectionSlot * 16 + cell % 16, 0).r);
 }
@@ -219,7 +231,14 @@ vec3 traceTransmission(vec3 origin, vec3 target, bool environment) {
     float rayLength = length(ray);
     for (int step = 0; step < 128; step++) {
         int voxel = voxelAt(cell);
-        if (voxel < 0) return environment ? transmission : vec3(0.0);
+        if (voxel < 0) {
+#ifdef RAYVOX_WORLD_PROBES
+            // Missing geometry never establishes sky visibility for persistent irradiance.
+            return vec3(0.0);
+#else
+            return environment ? transmission : vec3(0.0);
+#endif
+        }
         // Opaque emitters illuminate outward from their own cell.
         if (!environment && all(equal(cell, goal))) return transmission;
         int material = voxel & 63;

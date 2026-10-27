@@ -58,10 +58,12 @@ void main() {
         int row = sectionSlot.x + CacheWidth * (sectionSlot.y + CacheWidth * sectionSlot.z);
         ivec3 tile = (cell % 16) / 4;
         int column = (tile.x + 4 * (tile.y + 4 * tile.z)) * 9;
-        int count = int(texelFetch(LightLists, ivec2(column, row), 0).r & 255u);
+        uint header = texelFetch(LightLists, ivec2(column, row), 0).r;
+        int count = int(header & 255u);
         for (int i = 0; i < 8; i++) {
             if (i >= count) break;
             int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+            if (lightCulled(index)) continue;
             vec4 light = texelFetch(LightData, ivec2(0, index), 0);
             vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
             vec3 contribution = nearContribution(light, radiance, position, normal);
@@ -69,7 +71,8 @@ void main() {
             bool matched = farReady && ((mask >> i) & 1) != 0;
             float weight = staticWeight(light.xyz, farReady, matched);
             if (weight <= 0.0) continue;
-            vec3 visibility = ShadowsEnabled != 0 && radiance.w > 0.5 ? blockVisibility(origin, light.xyz) : vec3(1.0);
+            vec3 visibility = ShadowsEnabled != 0 && radiance.w > 0.5
+                    ? blockVisibility(origin, light.xyz, tileOccluded(header, i)) : vec3(1.0);
             direct += contribution * weight * visibility;
         }
     }

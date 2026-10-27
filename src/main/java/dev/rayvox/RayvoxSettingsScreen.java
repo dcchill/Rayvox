@@ -11,18 +11,31 @@ import net.neoforged.neoforge.common.ModConfigSpec;
 final class RayvoxSettingsScreen extends Screen {
     private final Screen parent;
     private boolean performance;
-    private int next, columnWidth, left;
+    private int next, columnWidth, left,rowSpacing;
 
     RayvoxSettingsScreen(Screen parent) {
-        super(Component.literal("Rayvox lighting settings"));
+        super(Component.literal("Rayvox rendering settings"));
         this.parent = parent;
     }
 
     @Override protected void init() {
         next = 0;
+        rowSpacing=Math.max(20,Math.min(24,(height-68)/8));
         columnWidth = Math.min(220, (width - 32) / 2);
         left = (width - columnWidth * 2 - 8) / 2;
-        if (performance) {
+        boolean vulkan=RenderBackends.active();
+        if(vulkan) {
+            renderer();
+            toggle("Rayvox rendering",Rayvox.ENABLED,"Enable the selected renderer.");
+            toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable directional sun and moon illumination.");
+            toggle("Held item lights",Rayvox.DYNAMIC,"Emissive held blocks illuminate the path-traced world.");
+            slider("GPU memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Renderer memory budget. Restart required.");
+        } else if (performance) {
+            slider("Vulkan memory",Rayvox.VULKAN_MEMORY,512,8192," MiB","Vulkan GPU memory budget. Restart required.");
+            toggle("Lighting culling", Rayvox.CULLING,
+                    "Skip lighting and shadow work outside the view or fully blocked by opaque geometry. Disable to compare performance.");
+            slider("History memory", Rayvox.HISTORY_MEMORY, 64, 2048, " MiB",
+                    "GPU memory limit for lighting history. Full-resolution 4K with deferred indirect lighting needs about 791 MiB. Too small a budget disables reuse.");
             slider("Voxel cache radius", Rayvox.CACHE_RADIUS, 1, 4, " sections",
                     "Minimum cache radius. Shadow draw distances may expand it; larger caches use more memory.");
             slider("Shadowed lights", Rayvox.ACTIVE_LIGHTS, 1, LightSourceManager.MAX_LIGHTS, "",
@@ -57,6 +70,7 @@ final class RayvoxSettingsScreen extends Screen {
             slider("Governor min level", Rayvox.GOVERNOR_MIN, 0, 4, "", "Lowest quality level the governor may select.");
             slider("Governor max level", Rayvox.GOVERNOR_MAX, 0, 4, "", "Highest quality level; 4 applies no caps to configured settings.");
         } else {
+            renderer();
             toggle("RGB lighting", Rayvox.ENABLED, "Enable Rayvox lighting.");
             toggle("Block shadows", Rayvox.SHADOWS, "Enable shadow rays for block and held lights; also gates sky shadows.");
             slider("Shadow draw distance", Rayvox.SHADOW_DRAW_DISTANCE, 16, 64, " blocks",
@@ -71,11 +85,13 @@ final class RayvoxSettingsScreen extends Screen {
             toggle("Lighting history", Rayvox.HISTORY, "Reuse lighting on stationary surfaces to reduce GPU work.");
             toggle("Advanced materials", Rayvox.MATERIALS, "Experimental colored glass, water and partial block shadow shapes.");
             toggle("Indirect light", Rayvox.INDIRECT, "Experimental one-bounce lighting. Expensive.");
+            toggle("World indirect cache", Rayvox.WORLD_INDIRECT, "Experimental four-block probes reuse bounce lighting as you move. Requires Indirect light, DEFERRED pipeline and Lighting history.");
             toggle("Entity shadows", Rayvox.ENTITY_SHADOWS, "Real-time shadows from up to 16 nearby entities using rounded body bounds. Requires block shadows.");
             slider("Shadow softness", Rayvox.SHADOW_SOFTNESS, 0, 4, "",
                     "0: sharp. 1–4: progressively softer block, entity and sky shadows using four area-light samples. Costs more GPU time.");
         }
-        addRenderableWidget(Button.builder(Component.literal(performance ? "Lighting options..." : "Performance options..."), button -> {
+        addRenderableWidget(Button.builder(Component.literal(vulkan?"Diagnostics...":performance ? "Lighting options..." : "Performance options..."), button -> {
+            if(vulkan){minecraft.setScreen(new RayvoxDebugScreen());return;}
             performance = !performance;
             rebuildWidgets();
         }).bounds(left, height - 28, columnWidth, 20).build());
@@ -84,7 +100,14 @@ final class RayvoxSettingsScreen extends Screen {
     }
 
     private int x() { return left + (next % 2) * (columnWidth + 8); }
-    private int y() { return 40 + (next++ / 2) * 24; }
+    private int y() { return 40 + (next++ / 2) * rowSpacing; }
+
+    private void renderer() {
+        cycle("Renderer",()->Rayvox.RENDER_BACKEND.get().name(),()->{
+            var modes=dev.rayvox.render.BackendMode.values();
+            Rayvox.RENDER_BACKEND.set(modes[(Rayvox.RENDER_BACKEND.get().ordinal()+1)%modes.length]);Rayvox.RENDER_BACKEND.save();
+        },"Restart required. AUTO chooses a validated available backend. Vulkan requires a compatible ray-tracing GPU and Fast/Fancy graphics.");
+    }
 
     private void toggle(String label, ModConfigSpec.BooleanValue setting, String help) {
         var button = addRenderableWidget(Button.builder(toggleLabel(label, setting), clicked -> {
@@ -131,7 +154,7 @@ final class RayvoxSettingsScreen extends Screen {
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         super.render(graphics, mouseX, mouseY, partialTick);
         graphics.drawCenteredString(font, title, width / 2, 12, 0xffffff);
-        graphics.drawCenteredString(font, performance ? "Performance" : "Lighting", width / 2, 26, 0xaaaaaa);
+        graphics.drawCenteredString(font, RenderBackends.active()?"Vulkan path tracing":performance ? "OpenGL performance" : "OpenGL lighting", width / 2, 26, 0xaaaaaa);
     }
 
     @Override public void onClose() { minecraft.setScreen(parent); }

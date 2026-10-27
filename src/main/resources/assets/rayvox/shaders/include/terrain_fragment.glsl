@@ -24,6 +24,7 @@ uniform int FarLightCount;
 uniform int FarReady;
 uniform vec4 FarLightRecords[16];
 uniform int HistoryValid;
+uniform int HistoryAvailable;
 uniform sampler2D HistoryColor;
 uniform sampler2D HistoryKey;
 uniform int DynamicCount;
@@ -97,11 +98,11 @@ bool farMatched(int index) {
     return matched;
 }
 
-vec3 staticVisibility(vec3 origin, vec3 target, int index, bool shadows) {
+vec3 staticVisibility(vec3 origin, vec3 target, int index, bool shadows, bool occluded) {
     bool matched = FarReady != 0 && farMatched(index);
     float weight = staticWeight(target, FarReady != 0, matched);
     if (weight <= 0.0) return vec3(0.0);
-    vec3 visibility = shadows ? blockVisibility(origin, target) : vec3(1.0);
+    vec3 visibility = shadows ? blockVisibility(origin, target, occluded) : vec3(1.0);
     // Ready section lights provide stable RGB; matching near records contribute only the shadow correction.
     return (FarReady != 0 && matched ? visibility - vec3(1.0) : visibility) * weight;
 }
@@ -198,6 +199,7 @@ void main() {
                 for (int i = 0; i < 8; i++) {
                     if (i >= count) break;
                     int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                    if (lightCulled(index)) continue;
                     vec4 light = texelFetch(LightData, ivec2(0, index), 0);
                     vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
                     vec3 toLight = light.xyz - localPosition;
@@ -210,6 +212,7 @@ void main() {
             for (int i = 0; i < 8 && deferredState != 0; i++) {
                 if (i >= count) break;
                 int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                if (lightCulled(index)) continue;
                 vec4 light = texelFetch(LightData, ivec2(0, index), 0);
                 vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
                 vec3 contribution = nearContribution(light, radiance, anchor, normal);
@@ -255,6 +258,7 @@ void main() {
             for (int i = 0; i < 8; i++) {
                 if (i >= count) break;
                 int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+                if (lightCulled(index)) continue;
                 vec4 light = texelFetch(LightData, ivec2(0, index), 0);
                 vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
                 vec3 toLight = light.xyz - localPosition;
@@ -267,6 +271,7 @@ void main() {
         for (int i = 0; i < 8 && !reused; i++) {
             if (i >= count) break;
             int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
+            if (lightCulled(index)) continue;
             vec4 light = texelFetch(LightData, ivec2(0, index), 0);
             vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
             vec3 toLight = light.xyz - localPosition;
@@ -276,7 +281,7 @@ void main() {
             float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
             if (falloff <= 0.0 || diffuse <= 0.0) continue;
             vec3 visibility = staticVisibility(localPosition + normal * 0.03, light.xyz, index,
-                    ShadowsEnabled != 0 && radiance.w > 0.5);
+                    ShadowsEnabled != 0 && radiance.w > 0.5, tileOccluded(header, i));
             direct += radiance.rgb * (falloff * falloff * diffuse * visibility);
         }
     }
@@ -359,6 +364,11 @@ void main() {
         geometryAlbedo = vec4(albedo.rgb, alpha);
     }
     if (DebugMode == 6) {
+        if (HistoryAvailable == 0) {
+            // Unavailable/off history is different from a new surface or a scene invalidation.
+            fragColor = vec4(0.15, 0.35, 0.9, alpha);
+            return;
+        }
         // Deferred: green fresh, amber stale (awaiting refresh), red newly visible estimate.
         vec3 reuse = deferred ? (deferredState == 0 ? vec3(0.1, 0.8, 0.2) : deferredState == 1 ? vec3(0.9, 0.65, 0.05)
                 : vec3(0.8, 0.15, 0.05)) : reused ? vec3(0.1, 0.8, 0.2) : vec3(0.8, 0.15, 0.05);

@@ -15,7 +15,7 @@ final class LightingHistory implements AutoCloseable {
     private int oldColor, oldKey, oldActive, oldFramebuffer;
     private int oldIndirect;
     private int cachedProgram, validLocation, sunValidLocation, indirectLocation, colorLocation, keyLocation;
-    private int deferredLocation, staleLocation;
+    private int deferredLocation, staleLocation, availableLocation;
     private boolean gi;
     /** Deferred mode: history is geometry-valid across revisions; a revision change only marks stored lighting stale. */
     private boolean deferred, stale;
@@ -67,17 +67,26 @@ final class LightingHistory implements AutoCloseable {
     static int bytesPerPixel(boolean gi, boolean deferred) { return (gi ? 64 : 48) + (deferred ? 36 : 0); }
 
     static boolean fitsBudget(int width, int height, boolean gi, boolean deferred) {
-        return width > 0 && height > 0 && (long)width * height <= 128L * 1024 * 1024 / bytesPerPixel(gi, deferred);
+        return fitsBudget(width, height, gi, deferred, Rayvox.HISTORY_MEMORY.get() * 1024L * 1024);
+    }
+
+    static boolean fitsBudget(int width, int height, boolean gi, boolean deferred, long budgetBytes) {
+        return width > 0 && height > 0 && budgetBytes > 0
+                && (long)width * height <= budgetBytes / bytesPerPixel(gi, deferred);
     }
 
     void begin(int width, int height, long revision, int sunRevision, boolean gi, boolean deferred) {
+        begin(width, height, revision, sunRevision, gi, deferred, Rayvox.HISTORY_MEMORY.get() * 1024L * 1024);
+    }
+
+    void begin(int width, int height, long revision, int sunRevision, boolean gi, boolean deferred, long budgetBytes) {
         available = false;
         if (attached) detach();
         boolean requestedDeferred = deferred;
         int bound = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
         // Select the feasible layout before allocation; a deferred bypass must retain usable legacy history.
         if (deferred) {
-            deferred = bound != 0 && drawBuffers >= 8 && glGetInteger(GL_SAMPLES) == 0 && fitsBudget(width, height, gi, true);
+            deferred = bound != 0 && drawBuffers >= 8 && glGetInteger(GL_SAMPLES) == 0 && fitsBudget(width, height, gi, true, budgetBytes);
             for (int i = 4; deferred && i < 8; i++) deferred = glGetFramebufferAttachmentParameteri(
                     GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == GL_NONE;
             for (int attachment : new int[]{GL_COLOR_ATTACHMENT0, GL_DEPTH_ATTACHMENT}) {
@@ -93,9 +102,11 @@ final class LightingHistory implements AutoCloseable {
             }
         }
         int bytes = bytesPerPixel(gi, deferred);
-        if (!fitsBudget(width, height, gi, deferred)) {
+        if (!fitsBudget(width, height, gi, deferred, budgetBytes)) {
             releaseTextures();
-            status = "Lighting history bypassed: exceeds 128 MiB budget";
+            long required = ((long)width * height * bytes + 1024 * 1024 - 1) / (1024 * 1024);
+            status = "Lighting history bypassed: " + width + "x" + height + " needs " + required
+                    + " MiB; budget " + budgetBytes / (1024 * 1024) + " MiB (raise History memory in Performance options)";
             return;
         }
         if (bound == 0 || glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
@@ -161,11 +172,13 @@ final class LightingHistory implements AutoCloseable {
             cameraOffsetLocation = glGetUniformLocation(program, "HistoryCameraOffset");
             deferredLocation = glGetUniformLocation(program, "DeferredLighting");
             staleLocation = glGetUniformLocation(program, "HistoryStale");
+            availableLocation = glGetUniformLocation(program, "HistoryAvailable");
         }
         glUniform1i(validLocation, 0);
         glUniform1i(sunValidLocation, 0);
         glUniform1i(deferredLocation, 0);
         glUniform1i(staleLocation, 0);
+        glUniform1i(availableLocation, 0);
         if (!available || attached || glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING) != target) return false;
         oldFramebuffer = target;
         oldActive = glGetInteger(GL_ACTIVE_TEXTURE);
@@ -209,6 +222,7 @@ final class LightingHistory implements AutoCloseable {
         }
         glUniform1i(deferredLocation, deferred ? 1 : 0);
         glUniform1i(staleLocation, stale ? 1 : 0);
+        glUniform1i(availableLocation, 1);
         attached = true;
         written = true;
         return true;

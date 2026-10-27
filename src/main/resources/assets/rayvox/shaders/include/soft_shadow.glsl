@@ -45,7 +45,9 @@ vec3 softTransmission(vec3 origin, vec3 target) {
     // Uniform loop bounds avoid duplicating the full voxel tracer four times on eager-unrolling drivers.
     for (int i = 0; i < samples; i++) {
         vec3 light = target + (samples > 1 ? areaOffset(target - origin, i, float(ShadowSoftness) * 0.035) : vec3(0.0));
-        result += traceTransmission(origin, light, false) * entityVisibility(origin - camera, light - camera);
+        float entity = entityVisibility(origin - camera, light - camera);
+        if (CullingDisabled == 0 && entity <= 0.0) continue;
+        result += traceTransmission(origin, light, false) * entity;
     }
     return result / float(samples);
 }
@@ -57,8 +59,9 @@ vec3 softDirectionalTransmission(vec3 origin, vec3 target, vec3 camera, float ra
     for (int i = 0; i < samples; i++) {
         vec3 light = target + (samples > 1 ? areaOffset(target - origin, i,
                 length(target - origin) * float(ShadowSoftness) * 0.001) : vec3(0.0));
-        result += traceDirectionalTransmission(origin, light, camera, range)
-                * entityVisibility(origin - camera, light - camera);
+        float entity = entityVisibility(origin - camera, light - camera);
+        if (CullingDisabled == 0 && entity <= 0.0) continue;
+        result += traceDirectionalTransmission(origin, light, camera, range) * entity;
     }
     return result / float(samples);
 }

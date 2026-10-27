@@ -16,6 +16,8 @@ import org.lwjgl.glfw.GLFW;
 
 @Mod(value = "rayvox", dist = Dist.CLIENT)
 public final class Rayvox {
+    public static final ModConfigSpec.EnumValue<dev.rayvox.render.BackendMode> RENDER_BACKEND;
+    public static final ModConfigSpec.IntValue VULKAN_MEMORY;
     private static final ModConfigSpec SPEC;
     public static final ModConfigSpec.BooleanValue ENABLED;
     public static final ModConfigSpec.IntValue CACHE_RADIUS;
@@ -24,15 +26,18 @@ public final class Rayvox {
     public static final ModConfigSpec.IntValue ACTIVE_LIGHTS;
     public static final ModConfigSpec.IntValue LIGHTS_PER_SECTION;
     public static final ModConfigSpec.BooleanValue SHADOWS;
+    public static final ModConfigSpec.BooleanValue CULLING;
     public static final ModConfigSpec.IntValue SHADOW_DISTANCE;
     public static final ModConfigSpec.IntValue SHADOW_DRAW_DISTANCE;
     public static final ModConfigSpec.BooleanValue HISTORY;
+    public static final ModConfigSpec.IntValue HISTORY_MEMORY;
     public static final ModConfigSpec.BooleanValue DYNAMIC;
     public static final ModConfigSpec.BooleanValue SUNLIGHT;
     public static final ModConfigSpec.BooleanValue GODRAYS;
     public static final ModConfigSpec.IntValue SUN_SHADOW_DISTANCE;
     public static final ModConfigSpec.BooleanValue MATERIALS;
     public static final ModConfigSpec.BooleanValue INDIRECT;
+    public static final ModConfigSpec.BooleanValue WORLD_INDIRECT;
     public static final ModConfigSpec.IntValue INDIRECT_INTERVAL;
     public static final ModConfigSpec.BooleanValue ENTITY_SHADOWS;
     public static final ModConfigSpec.IntValue SHADOW_SOFTNESS;
@@ -47,6 +52,10 @@ public final class Rayvox {
 
     static {
         var builder = new ModConfigSpec.Builder();
+        RENDER_BACKEND = builder.comment("Renderer selection; restart required. AUTO retains OpenGL until Vulkan playable acceptance is complete. Explicit Vulkan is a development preview.")
+                .defineEnum("renderBackend",dev.rayvox.render.BackendMode.AUTO);
+        VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; restart required.")
+                .defineInRange("vulkanMemoryMiB",2048,512,8192);
         ENABLED = builder.comment("Enable Rayvox world-surface RGB lighting.").define("enabled", true);
         CACHE_RADIUS = builder.comment("Voxel radius in 16-block sections; one resolution level.")
                 .defineInRange("cacheRadiusSections", 2, 1, 4);
@@ -59,6 +68,8 @@ public final class Rayvox {
         LIGHTS_PER_SECTION = builder.comment("Maximum point lights/rays per fragment, selected within 4-block cells. Key retained for existing configs.")
                 .defineInRange("lightsPerSection", 4, 1, LightSourceManager.PER_SECTION);
         SHADOWS = builder.define("blockShadows", true);
+        CULLING = builder.comment("Cull lighting and shadow work using the camera frustum and conservative voxel occlusion.")
+                .define("lightingCulling", true);
         ENTITY_SHADOWS = builder.comment("Real-time shadows from up to 16 nearby visible living/solid entities. Uses rounded bounds rather than animated model geometry.")
                 .define("entityShadows", true);
         SHADOW_SOFTNESS = builder.comment("Shadow edge softness: 0 is sharp; 1..4 use four stable area-light samples. Higher GPU cost than sharp shadows.")
@@ -67,8 +78,10 @@ public final class Rayvox {
                 .defineInRange("shadowDistance", 16, 1, 16);
         SHADOW_DRAW_DISTANCE = builder.comment("Block shadow draw distance from the camera in blocks. Fades to unshadowed RGB light. Expands the voxel cache while shadows are enabled.")
                 .defineInRange("shadowDrawDistance", 32, 16, 64);
-        HISTORY = builder.comment("Reuse matching visible surfaces' static lighting; at most 128 MiB, otherwise bypass.")
+        HISTORY = builder.comment("Reuse matching visible surfaces' static lighting within the configured GPU memory budget.")
                 .define("lightingHistory", true);
+        HISTORY_MEMORY = builder.comment("Maximum GPU memory for lighting history in MiB. 1024 supports full-resolution 4K history with deferred GI. Lower budgets may bypass history or fall back to LEGACY.")
+                .defineInRange("lightingHistoryMemoryMiB", 1024, 64, 2048);
         DYNAMIC = builder.comment("Up to four nearby players holding emissive block items; visual only.")
                 .define("heldItemLights", true);
         SUNLIGHT = builder.comment("Traced warm sunlight and cool moonlight; retains vanilla sky outside the voxel cache.")
@@ -81,6 +94,8 @@ public final class Rayvox {
                 .define("advancedMaterials", false);
         INDIRECT = builder.comment("Experimental one-bounce voxel GI: six-block gathers with eight-sample accumulation. Expensive; no dynamic-light bounce.")
                 .define("indirectPrototype", false);
+        WORLD_INDIRECT = builder.comment("Experimental world-space indirect probes, four-block spacing and six directions. Requires indirectPrototype, DEFERRED and lightingHistory. Missing probes use surface gathers; excludes moving lights and entity shadows.")
+                .define("worldSpaceIndirect", false);
         INDIRECT_INTERVAL = builder.comment("DEFERRED GI: frames between progressive gather samples, 1..8. New surfaces start immediately. LEGACY keeps its existing per-frame gather.")
                 .defineInRange("indirectUpdateInterval", 1, 1, 8);
         PIPELINE = builder.comment("LEGACY traces static shadows inside terrain shading (reference). DEFERRED samples reprojected lighting in terrain shading and traces new/stale visible pixels once in a separate pass; newly visible surfaces use a bounded unshadowed estimate for one frame. Requires lightingHistory.")

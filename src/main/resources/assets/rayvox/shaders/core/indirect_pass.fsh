@@ -22,12 +22,14 @@ uniform int RefreshInterval;
 uniform int FrameIndex;
 uniform vec4 SunDirection;
 uniform float SunShadowDistance;
+uniform int WorldProbeChanged;
 
 #moj_import <rayvox:shadow.glsl>
 #moj_import <rayvox:soft_shadow.glsl>
 #moj_import <rayvox:lighting_common.glsl>
 #moj_import <rayvox:sunlight.glsl>
 #moj_import <rayvox:indirect.glsl>
+#moj_import <rayvox:world_indirect.glsl>
 
 out vec4 lighting;
 
@@ -44,6 +46,17 @@ void main() {
     float state = floor(texelFetch(PassInputs, pixel, 0).a / 512.0 + 0.001);
     vec4 accumulated = state >= 1.0 ? vec4(0.0) : texelFetch(PassIndirect, pixel, 0);
     float count = clamp(accumulated.a, 0.0, 8.0);
+    // Reprojected, converged pixels need no visibility rays while the world atlas is unchanged.
+    // New/stale surfaces and any probe publication/invalidation must consult the world cache first.
+    if (WorldIndirectEnabled != 0 && (state >= 1.0 || WorldProbeChanged != 0)) {
+        vec3 cached;
+        if (worldIndirect(key.xyz + normal * 0.03, normal, cached)) {
+            lighting = vec4(cached, 8.0);
+            return;
+        }
+        // Previously cached irradiance may have lost its last usable probe. Never retain it as fallback.
+        if (WorldProbeChanged != 0) { accumulated = vec4(0.0); count = 0.0; }
+    }
     // Freshly invalidated GI starts immediately; later samples follow the independent work cadence.
     bool sampleNow = count < 1.0 || RefreshInterval <= 1
             || ((pixel.x / 8 + pixel.y / 8 + FrameIndex) % RefreshInterval) == 0;

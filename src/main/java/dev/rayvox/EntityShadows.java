@@ -14,12 +14,18 @@ final class EntityShadows {
     static final double RANGE = 32;
 
     static List<AABB> collect(ClientLevel level, Vec3 camera, float partialTick) {
+        return collect(level, camera, partialTick, null, DirectionalLight.OFF, 0, 0);
+    }
+
+    static List<AABB> collect(ClientLevel level, Vec3 camera, float partialTick, LightingCulling culling,
+            DirectionalLight sun, double sunReach, double pointReach) {
         var result = new ArrayList<AABB>();
         for (var entity : level.entitiesForRendering()) {
             if (!entity.isAlive() || entity.isInvisible() || entity.isSpectator()
                     || !(entity instanceof LivingEntity || entity.isPickable())) continue;
             var bounds = entity.getBoundingBox().move(entity.getPosition(partialTick).subtract(entity.position()));
             if (bounds.getCenter().distanceToSqr(camera) >= RANGE * RANGE) continue;
+            if (culling != null && !culling.shadowCaster(bounds, sun, sunReach, pointReach)) continue;
             offer(result, bounds, camera);
         }
         return List.copyOf(result);

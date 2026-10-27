@@ -31,6 +31,11 @@ final class DynamicLights {
 
     static List<LightSourceManager.Light> collect(ClientLevel level, Vec3 camera, float partialTick,
             LightColors colors) {
+        return collect(level, camera, partialTick, colors, null);
+    }
+
+    static List<LightSourceManager.Light> collect(ClientLevel level, Vec3 camera, float partialTick,
+            LightColors colors, LightingCulling culling) {
         var result = new ArrayList<LightSourceManager.Light>(4);
         for (var player : level.players()) {
             if (player.distanceToSqr(camera) > 32 * 32 || player.isSpectator()) continue;
@@ -38,8 +43,9 @@ final class DynamicLights {
             if (source == null) continue;
             var position = player.getPosition(partialTick).add(0, player.getEyeHeight() - 0.25, 0);
             if (result.size() == 4 && position.distanceToSqr(camera) >= result.getLast().distanceSquared(camera.x, camera.y, camera.z)) continue;
-            offer(result, new LightSourceManager.Light(source.type(), position.x, position.y, position.z, source.definition()),
-                    camera.x, camera.y, camera.z);
+            var light = new LightSourceManager.Light(source.type(), position.x, position.y, position.z, source.definition());
+            if (culling != null && !culling.light(light, source.definition())) continue;
+            offer(result, light, camera.x, camera.y, camera.z);
         }
         return List.copyOf(result);
     }

@@ -1,0 +1,55 @@
+#version 460
+layout(local_size_x=8,local_size_y=8) in;
+layout(rgba16f,set=0,binding=1) uniform image2D radianceImage;
+layout(rgba32f,set=0,binding=2) uniform image2D geometryImage;
+layout(rgba16f,set=0,binding=3) uniform image2D normalImage;
+layout(rgba32f,set=0,binding=7) uniform image2D previousGeometry;
+layout(std140,set=0,binding=5) uniform Camera {
+    mat4 inverseVP;mat4 previousVP;mat4 currentVP;
+    vec4 originFrame;vec4 sunDirection;vec4 sunRadiance;vec4 skyReset;
+    vec4 outputSize;vec4 lightPosition[4];vec4 lightColor[4];vec4 fogColorStart;vec4 fogEnd;
+} camera;
+layout(rgba16f,set=0,binding=10) uniform image2D outputColor;
+layout(r32f,set=0,binding=11) uniform image2D outputDepth;
+layout(std430,set=0,binding=13) readonly buffer Exposure {float exposure;};
+layout(rgba16f,set=0,binding=14) uniform image2D previousUpscale;
+layout(rgba16f,set=0,binding=15) uniform image2D nextUpscale;
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(outputColor);if(any(greaterThanEqual(pixel,size)))return;
+    vec2 source=(vec2(pixel)+.5)*vec2(imageSize(radianceImage))/vec2(size)-.5;
+    ivec2 p=clamp(ivec2(round(source)),ivec2(0),imageSize(radianceImage)-1);
+    vec4 g=imageLoad(geometryImage,p);vec3 normal=imageLoad(normalImage,p).xyz;
+    vec3 color=vec3(0),minimum=vec3(1e10),maximum=vec3(0);float weights=0;
+    ivec2 lowSize=imageSize(radianceImage);
+    for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
+        ivec2 q=clamp(ivec2(floor(source))+ivec2(x,y),ivec2(0),lowSize-1);
+        vec4 sampleGeometry=imageLoad(geometryImage,q);if(sampleGeometry.w!=g.w)continue;
+        vec3 c=imageLoad(radianceImage,q).rgb;
+        float w=max(.001,(1-abs(source.x-q.x))*(1-abs(source.y-q.y)));
+        color+=c*w;weights+=w;minimum=min(minimum,c);maximum=max(maximum,c);
+    }
+    if(weights>0)color/=weights;else{color=imageLoad(radianceImage,p).rgb;minimum=maximum=color;}
+    // Intersect the full-resolution camera ray with the reconstructed surface
+    // plane, preserving subpixel positions rather than repeating low-res pixels.
+    vec2 uv=(vec2(pixel)+.5)/vec2(size);
+    vec4 ray=camera.inverseVP*vec4(uv*2-1,1,1);vec3 direction=normalize(ray.xyz/ray.w);
+    vec3 point=g.xyz;float denominator=dot(normal,direction);
+    if(g.w>=0&&abs(denominator)>.01){float t=dot(normal,g.xyz-camera.originFrame.xyz)/denominator;if(t>0)point=camera.originFrame.xyz+direction*t;}
+    vec4 oldClip=camera.previousVP*vec4(point-camera.originFrame.xyz,1);vec2 oldUv=oldClip.xy/oldClip.w*.5+.5;
+    float samples=1;
+    if(camera.skyReset.w==0&&camera.outputSize.z==1&&g.w>=0&&oldClip.w>0&&all(greaterThanEqual(oldUv,vec2(0)))&&all(lessThan(oldUv,vec2(1)))) {
+        ivec2 previousPixel=ivec2(oldUv*vec2(size)),oldLow=ivec2(oldUv*vec2(lowSize));
+        vec4 oldSurface=imageLoad(previousGeometry,oldLow),oldColor=imageLoad(previousUpscale,previousPixel);
+        if(oldSurface.w==g.w&&length(oldSurface.xyz-point)<.15+.005*length(point-camera.originFrame.xyz)) {
+            samples=min(oldColor.a+1,(uint(g.w)&0x00800000u)!=0u?8:32);
+            color=mix(color,clamp(oldColor.rgb,minimum,maximum),(samples-1)/samples);
+        }
+    }
+    imageStore(nextUpscale,pixel,vec4(color,samples));
+    vec3 c=color*exposure;c=clamp((c*(2.51*c+.03))/(c*(2.43*c+.59)+.14),0,1);
+    vec4 projected=camera.currentVP*vec4(point-camera.originFrame.xyz,1);
+    float depth=g.w<0?1:clamp(projected.z/projected.w*.5+.5,0,1);
+    float fog=smoothstep(camera.fogColorStart.w,max(camera.fogEnd.x,camera.fogColorStart.w+.001),length(g.xyz-camera.originFrame.xyz));
+    c=mix(pow(c,vec3(1/2.2)),camera.fogColorStart.rgb,fog);
+    imageStore(outputColor,pixel,vec4(c,g.w<0?0:1));imageStore(outputDepth,pixel,vec4(depth));
+}

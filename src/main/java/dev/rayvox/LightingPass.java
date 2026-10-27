@@ -14,7 +14,7 @@ import static org.lwjgl.opengl.GL33C.*;
  * Only the full-screen triangle is drawn; no geometry is rendered twice and nothing is read back.
  */
 class LightingPass extends ShaderInstance {
-    enum Kind { STATIC, INDIRECT, DYNAMIC, COMPOSITION }
+    enum Kind { STATIC, INDIRECT, DYNAMIC, COMPOSITION, PROBE }
     private static final String[] SAMPLERS = {"VoxelData", "VoxelState", "VoxelShapes", "LightData", "LightLists", "PassKey", "PassInputs"};
     private static final int FIRST_UNIT = 3;
     private final String[] samplers;
@@ -23,8 +23,10 @@ class LightingPass extends ShaderInstance {
     private final int cacheWidth, cacheMinSlot, cameraInCache, cameraFraction, shadowsEnabled, shadowDistance,
             shadowDrawDistance, shadowBudget, sunShadowDistance, sunDirection, sunRadiance, advanced, transmission,
             refreshInterval, frameIndex, entityCount, entityRecords, softness,
-            inverseClip, dynamicCount, dynamicRecords, indirectEnabled, debugMode, fogColor;
+            inverseClip, dynamicCount, dynamicRecords, indirectEnabled, debugMode, fogColor, probeOrigin, worldIndirectEnabled, worldProbeChanged;
     private final float[] moving = new float[32];
+    private final int culledLocation;
+    private final int cullingDisabledLocation;
     private final LightRadianceCache radiances = new LightRadianceCache();
     private final float[] entities = new float[EntityShadows.MAX_CASTERS * 8];
     private final int[] viewport = new int[4];
@@ -41,6 +43,7 @@ class LightingPass extends ShaderInstance {
         super(resources, ResourceLocation.fromNamespaceAndPath("rayvox", switch (kind) {
             case STATIC -> "lighting_pass"; case INDIRECT -> "indirect_pass";
             case DYNAMIC -> "dynamic_pass"; case COMPOSITION -> "composition_pass";
+            case PROBE -> "world_probe_pass";
         }), DefaultVertexFormat.POSITION);
         this.kind = kind;
         if (glGetProgrami(getId(), GL_LINK_STATUS) != GL_TRUE) {
@@ -48,13 +51,16 @@ class LightingPass extends ShaderInstance {
         }
         samplers = switch (kind) {
             case STATIC -> SAMPLERS;
-            case INDIRECT -> new String[]{"VoxelData", "VoxelState", "VoxelShapes", "LightData", "LightLists", "PassKey", "PassInputs", "PassIndirect"};
+            case INDIRECT -> new String[]{"VoxelData", "VoxelState", "VoxelShapes", "LightData", "LightLists", "PassKey", "PassInputs", "PassIndirect", "WorldIndirect", "WorldProbeState"};
+            case PROBE -> new String[]{"VoxelData", "VoxelState", "VoxelShapes", "LightData", "LightLists"};
             case DYNAMIC -> new String[]{"VoxelData", "VoxelState", "VoxelShapes", "PassKey", "PassDepth"};
             case COMPOSITION -> new String[]{"SceneColor", "PassKey", "PassLighting", "PassIndirect", "PassDynamic", "PassBase", "PassEmission", "PassAlbedo", "PassInputs", "PassDepth"};
         };
         samplerLocations = new int[samplers.length];
         savedTextures = new int[samplers.length];
         int program = getId();
+        culledLocation = glGetUniformLocation(program, "CulledLights");
+        cullingDisabledLocation = glGetUniformLocation(program, "CullingDisabled");
         for (int i = 0; i < samplers.length; i++) samplerLocations[i] = glGetUniformLocation(program, samplers[i]);
         cacheWidth = glGetUniformLocation(program, "CacheWidth");
         cacheMinSlot = glGetUniformLocation(program, "CacheMinSlot");
@@ -80,6 +86,9 @@ class LightingPass extends ShaderInstance {
         indirectEnabled = glGetUniformLocation(program, "IndirectEnabled");
         debugMode = glGetUniformLocation(program, "DebugMode");
         fogColor = glGetUniformLocation(program, "FogColor");
+        probeOrigin = glGetUniformLocation(program, "ProbeOrigin");
+        worldIndirectEnabled = glGetUniformLocation(program, "WorldIndirectEnabled");
+        worldProbeChanged = glGetUniformLocation(program, "WorldProbeChanged");
         for (int i = 0; i < samplers.length; i++) {
             if (samplerLocations[i] < 0) {
                 close();
@@ -97,11 +106,21 @@ class LightingPass extends ShaderInstance {
             double cameraX, double cameraY, double cameraZ, DirectionalLight sun, MaterialTable materials,
             java.util.List<net.minecraft.world.phys.AABB> casters, boolean shadows, float shadowDistance,
             float shadowDrawDistance, float sunShadowDistance, int softness, int refreshInterval, int indirectInterval,
-            java.util.List<LightSourceManager.Light> dynamic, boolean indirect, int debugMode, float[] fogColor) {}
+            java.util.List<LightSourceManager.Light> dynamic, boolean indirect, int debugMode, float[] fogColor,
+            GpuWorldIndirect worldIndirect) {}
 
     void render(LightingHistory history, Frame f, GpuTimer timer) {
+        render(history, null, null, f, timer);
+    }
+
+    void renderProbes(GpuWorldIndirect target, WorldLightingCache.Region region, Frame f, GpuTimer timer) {
+        if (kind != Kind.PROBE) throw new IllegalStateException("Not a probe producer");
+        render(null, target, region, f, timer);
+    }
+
+    private void render(LightingHistory history, GpuWorldIndirect target, WorldLightingCache.Region region, Frame f, GpuTimer timer) {
         RenderSystem.assertOnRenderThread();
-        if (!history.passReady()) return;
+        if (history != null && !history.passReady()) return;
         int previousFramebuffer = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
         int previousReadFramebuffer = glGetInteger(GL_READ_FRAMEBUFFER_BINDING);
         int previousVao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
@@ -124,31 +143,39 @@ class LightingPass extends ShaderInstance {
             boolean ready = switch (kind) {
                 case STATIC -> history.bindPassTarget(); case INDIRECT -> history.bindIndirectPassTarget();
                 case DYNAMIC -> history.bindDynamicPassTarget(); case COMPOSITION -> history.bindCompositionTarget();
+                case PROBE -> { target.bind(region); yield true; }
             };
             if (!ready)
                 throw new IllegalStateException("Incomplete deferred lighting framebuffer");
             apply();
             applied = true;
             publish(f);
-            history.uploadInverseClip(inverseClip);
+            if (history != null) history.uploadInverseClip(inverseClip);
+            if (kind == Kind.PROBE) glUniform3i(probeOrigin,
+                    (region.x() - f.grid().centerX + f.grid().radius) * 16,
+                    (region.y() - f.grid().centerY + f.grid().radius) * 16,
+                    (region.z() - f.grid().centerZ + f.grid().radius) * 16);
             int[] textures = switch (kind) {
                 case STATIC, INDIRECT -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists,
-                        history.passKey(), history.passInputs(), history.passIndirect()};
+                        history.passKey(), history.passInputs(), history.passIndirect(),
+                        f.worldIndirect() == null ? 0 : f.worldIndirect().irradiance,
+                        f.worldIndirect() == null ? 0 : f.worldIndirect().validity};
+                case PROBE -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists};
                 case DYNAMIC -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, history.passKey(), history.sceneDepth()};
                 case COMPOSITION -> new int[]{history.sceneColor(), history.passKey(), history.passLighting(), history.passIndirect(), history.passDynamic(),
                         history.passBase(), history.passEmission(), history.passAlbedo(), history.passInputs(), history.sceneDepth()};
             };
             for (int i = 0; i < samplers.length; i++) {
-                int target = textureTarget(i);
+                int textureType = textureTarget(i);
                 glActiveTexture(GL_TEXTURE0 + FIRST_UNIT + i);
-                savedTextures[i] = glGetInteger(target == GL_TEXTURE_3D ? GL_TEXTURE_BINDING_3D : GL_TEXTURE_BINDING_2D);
+                savedTextures[i] = glGetInteger(textureType == GL_TEXTURE_3D ? GL_TEXTURE_BINDING_3D : GL_TEXTURE_BINDING_2D);
                 boundTextures = i + 1;
-                glBindTexture(target, textures[i]);
+                glBindTexture(textureType, textures[i]);
                 glUniform1i(samplerLocations[i], FIRST_UNIT + i);
             }
             if (vao == 0) vao = glGenVertexArrays();
             glBindVertexArray(vao);
-            glViewport(0, 0, history.width(), history.height());
+            if (history != null) glViewport(0, 0, history.width(), history.height());
             if (timer != null) timer.begin();
             glDrawArrays(GL_TRIANGLES, 0, 3);
             if (kind == Kind.INDIRECT) history.finishIndirectPass();
@@ -178,6 +205,8 @@ class LightingPass extends ShaderInstance {
     private int textureTarget(int sampler) { return kind != Kind.COMPOSITION && sampler < 3 ? GL_TEXTURE_3D : GL_TEXTURE_2D; }
 
     private void publish(Frame f) {
+        glUniform1i(cullingDisabledLocation, Rayvox.CULLING.get() ? 0 : 1);
+        glUniform2i(culledLocation, RayvoxEngine.culledLightsLow(), RayvoxEngine.culledLightsHigh());
         var grid = f.grid();
         int minX = grid.centerX - grid.radius, minY = grid.centerY - grid.radius, minZ = grid.centerZ - grid.radius;
         int bx = (int)Math.floor(f.cameraX()), by = (int)Math.floor(f.cameraY()), bz = (int)Math.floor(f.cameraZ());
@@ -210,6 +239,8 @@ class LightingPass extends ShaderInstance {
         glUniform1i(indirectEnabled, f.indirect() ? 1 : 0);
         glUniform1i(debugMode, f.debugMode());
         glUniform4fv(fogColor, f.fogColor());
+        glUniform1i(worldIndirectEnabled, f.worldIndirect() == null ? 0 : 1);
+        glUniform1i(worldProbeChanged, f.worldIndirect() != null && f.worldIndirect().changed() ? 1 : 0);
     }
 
     @Override public void close() {

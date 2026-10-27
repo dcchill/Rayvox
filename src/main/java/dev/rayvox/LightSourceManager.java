@@ -31,23 +31,31 @@ public final class LightSourceManager {
     Light budgetBoundary;
     public int discovered, completeSections, truncatedSections;
     public long buildNanos;
+    public int occludedTiles;
     private final Map<Light, LightDefinition> overrides = new LinkedHashMap<>();
     private long lastRevision = -1;
     private int lastX, lastY, lastZ, lastLimit, lastPerSection;
     private int lastMinSection, lastMaxSection;
     private int eligibleSources;
     private long definitionRevision;
+    private boolean lastCulling;
 
     public boolean rebuild(VoxelGrid grid, int x, int y, int z, int limit, int perSection, int minSection, int maxSection) {
+        return rebuild(grid, x, y, z, limit, perSection, minSection, maxSection, true);
+    }
+
+    public boolean rebuild(VoxelGrid grid, int x, int y, int z, int limit, int perSection, int minSection, int maxSection,
+            boolean culling) {
         if (limit < 1 || limit > MAX_LIGHTS || perSection < 1 || perSection > PER_SECTION)
             throw new IllegalArgumentException("Invalid light budget");
-        if (lastRevision == grid.snapshotRevision && (eligibleSources <= limit || x == lastX && y == lastY && z == lastZ)
+        if (lastCulling == culling && lastRevision == grid.snapshotRevision && (eligibleSources <= limit || x == lastX && y == lastY && z == lastZ)
                 && limit == lastLimit && perSection == lastPerSection
                 && minSection == lastMinSection && maxSection == lastMaxSection) return false;
         long start = System.nanoTime();
-        boolean sameInputs = lastRevision == grid.snapshotRevision && limit == lastLimit && perSection == lastPerSection
+        boolean sameInputs = lastCulling == culling && lastRevision == grid.snapshotRevision && limit == lastLimit && perSection == lastPerSection
                 && minSection == lastMinSection && maxSection == lastMaxSection;
         lastRevision = grid.snapshotRevision;
+        lastCulling = culling;
         lastX = x; lastY = y; lastZ = z; lastLimit = limit; lastPerSection = perSection;
         lastMinSection = minSection; lastMaxSection = maxSection;
         var all = new ArrayList<Light>();
@@ -116,7 +124,7 @@ public final class LightSourceManager {
         }
         if (lists.length != grid.slots.length * LIST_WIDTH) lists = new int[grid.slots.length * LIST_WIDTH];
         Arrays.fill(lists, 0);
-        completeSections = truncatedSections = 0;
+        completeSections = truncatedSections = occludedTiles = 0;
         int[] nearest = new int[PER_SECTION];
         double[] distances = new double[PER_SECTION];
         double[] radiusSquared = new double[active.size()];
@@ -170,7 +178,14 @@ public final class LightSourceManager {
                 if (relevant > perSection) truncated = true;
                 int offset = row * LIST_WIDTH + tile * 9;
                 lists[offset] = count | (tileComplete ? 0x100 : 0);
-                for (int i = 0; i < count; i++) lists[offset + 1 + i] = nearest[i];
+                for (int i = 0; i < count; i++) {
+                    lists[offset + 1 + i] = nearest[i];
+                    if (culling && definition(active.get(nearest[i])).shadows()
+                            && VoxelOcclusion.blocked(grid, active.get(nearest[i]), tx, ty, tz)) {
+                        lists[offset] |= 1 << (16 + i);
+                        occludedTiles++;
+                    }
+                }
             }
             if (truncated) truncatedSections++;
             if (complete && !truncated) completeSections++;

@@ -4,7 +4,8 @@ vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
     int row = slot.x + CacheWidth * (slot.y + CacheWidth * slot.z);
     ivec3 tile = (cell % 16) / 4;
     int column = (tile.x + 4 * (tile.y + 4 * tile.z)) * 9;
-    int count = int(texelFetch(LightLists, ivec2(column, row), 0).r & 255u);
+    uint header = texelFetch(LightLists, ivec2(column, row), 0).r;
+    int count = int(header & 255u);
     vec3 result = vec3(0.0);
     for (int i = 0; i < 4; i++) {
         if (i >= count) break;
@@ -19,15 +20,19 @@ vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
         if (falloff * diffuse <= 0.0) continue;
         vec3 visibility = vec3(1.0);
         if (ShadowsEnabled != 0 && radiance.w > 0.5)
-            visibility = blockVisibility(hit + normal * 0.03, light.xyz);
+            visibility = blockVisibility(hit + normal * 0.03, light.xyz, tileOccluded(header, i));
         result += radiance.rgb * falloff * falloff * diffuse * visibility;
     }
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
     float sunFacing = max(dot(normal, SunDirection.xyz), 0.0);
     if (SunDirection.w > 0.0 && sunFacing > 0.0) {
         vec3 origin = hit + normal * 0.03;
+#ifdef RAYVOX_WORLD_PROBES
+        vec3 sunlight = traceTransmission(origin, origin + SunDirection.xyz * SunShadowDistance, true);
+#else
         vec3 sunlight = traceDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
                 CameraFraction + vec3(CameraInCache), SunShadowDistance);
+#endif
         result += SunRadiance * (SunDirection.w * sunFacing) * sunlight;
     }
 #endif

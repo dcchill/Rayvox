@@ -1,0 +1,16 @@
+#version 460
+layout(local_size_x=1,local_size_y=1) in;
+layout(rgba16f,set=0,binding=1) uniform image2D radianceImage;
+layout(rgba32f,set=0,binding=2) uniform image2D geometryImage;
+layout(std430,set=0,binding=13) buffer Exposure {float exposure;};
+void main() {
+    ivec2 size=imageSize(radianceImage);float logarithms=0,count=0;
+    for(int y=0;y<18;y++)for(int x=0;x<32;x++) {
+        ivec2 p=clamp(ivec2((vec2(x,y)+.5)/vec2(32,18)*vec2(size)),ivec2(0),size-1);
+        if(imageLoad(geometryImage,p).w<0)continue;
+        float value=dot(imageLoad(radianceImage,p).rgb,vec3(.2126,.7152,.0722));
+        logarithms+=log(max(value,.0001));count++;
+    }
+    float target=count==0?1:clamp(.18/exp(logarithms/count),.25,32);
+    exposure=mix(exposure,target,.025);
+}

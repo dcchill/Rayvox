@@ -114,6 +114,7 @@ public final class GpuVoxelCache implements AutoCloseable {
                     uploadedBytesLastFrame += VoxelGrid.SECTION_BYTES * 8;
                 }
                 slot.ready = false;
+                VoxelOcclusion.commit(slot);
                 slot.uploaded = true;
                 slot.uploadedRayEmpty = rayEmpty;
                 slot.uploadedLights = slot.lights;

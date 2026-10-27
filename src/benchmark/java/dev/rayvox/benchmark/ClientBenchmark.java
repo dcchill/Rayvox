@@ -42,19 +42,32 @@ import static org.lwjgl.opengl.GL33C.*;
 public final class ClientBenchmark {
     private static ClientBenchmark instance;
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
+    private static final boolean VULKAN = SCENE.startsWith("vulkan-");
     private static final boolean TEMPORAL = SCENE.equals("temporal");
-    private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi");
+    private static final boolean WORLD_CACHE = SCENE.equals("world-cache");
+    private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi") || WORLD_CACHE;
     private static final boolean GOVERNOR_PIPELINE = SCENE.equals("pipeline-governor");
     private static final boolean HELD_PIPELINE = SCENE.equals("pipeline-held");
     private static final boolean PIPELINE = SCENE.equals("pipeline") || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
-    private static final boolean ENTITIES = SCENE.equals("entities");
+    private static final boolean ENTITIES = SCENE.equals("entities") || SCENE.equals("vulkan-entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
-    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS;
+    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor");
     private static final boolean DIRECTIONAL_MATERIALS = !SCENE.equals("directional-basic");
     private static final String WORLD = ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
-    private final List<Phase> phases = HELD_PIPELINE ? List.of(
+    private final List<Phase> phases = SCENE.equals("vulkan-lifecycle") ? List.of(
+            new Phase("vulkan-static",true,true,true,false,45,5),
+            new Phase("vulkan-edited",true,true,true,false,10,5),
+            new Phase("vulkan-reloaded",true,true,true,false,15,5),
+            new Phase("vulkan-resized",true,true,true,false,10,5),
+            new Phase("vulkan-nether",true,true,true,false,30,5)) : VULKAN ? List.of(
+            new Phase("vulkan-static",true,true,true,false,45,10),
+            new Phase("vulkan-moving",true,true,true,true,20,10)) : WORLD_CACHE ? List.of(
+            new Phase("deferred-gi-control", true, false, true, false, 8, 4),
+            new Phase("deferred-world-static", true, false, true, false, 8, 4),
+            new Phase("deferred-world-moving", true, false, true, true, 8, 4),
+            new Phase("deferred-world-disabled", true, false, true, false, 4, 4)) : HELD_PIPELINE ? List.of(
             new Phase("legacy-held-static", true, false, false, false, 8, 6),
             new Phase("deferred-held-static", true, false, false, false, 8, 6),
             new Phase("legacy-held-moving", true, false, false, true, 8, 6),
@@ -115,7 +128,7 @@ public final class ClientBenchmark {
         var mc = Minecraft.getInstance();
         try {
             ticks++;
-            if (System.nanoTime() - boot > (PIPELINE ? 600_000_000_000L : 240_000_000_000L))
+            if (System.nanoTime() - boot > (PIPELINE || VULKAN ? 600_000_000_000L : 240_000_000_000L))
                 throw new IllegalStateException("Client benchmark timed out: " + mc.screen);
             if (!opening && mc.getOverlay() == null) {
                 if (!mc.gameDirectory.toPath().toAbsolutePath().normalize().getFileName().toString().equals("benchmark-client"))
@@ -148,6 +161,7 @@ public final class ClientBenchmark {
                 setup = CompletableFuture.runAsync(() -> {
                     if (DIRECTIONAL) prepareDirectional(server.overworld());
                     else prepareWorld(server.overworld());
+                    if(VULKAN)prepareVulkanMaterials(server.overworld());
                     if (ENTITIES) {
                         var world = server.overworld();
                         var area = new net.minecraft.world.phys.AABB(-16, 64, -16, 16, 76, 16);
@@ -198,7 +212,7 @@ public final class ClientBenchmark {
         mc.options.hideGui = true;
         mc.options.enableVsync().set(false);
         mc.options.framerateLimit().set(260);
-        mc.options.renderDistance().set(6);
+        mc.options.renderDistance().set(Integer.getInteger("rayvox.benchmark.renderDistance",6));
         mc.options.simulationDistance().set(5);
         mc.options.bobView().set(false);
         mc.options.fov().set(70);
@@ -254,8 +268,19 @@ public final class ClientBenchmark {
         phaseCompositionDraws = RayvoxEngine.compositionPassDraws();
         phaseDynamicDraws = RayvoxEngine.dynamicPassDraws();
         var config = phases.get(index);
+        if(VULKAN) {
+            var client=Minecraft.getInstance();var server=client.getSingleplayerServer();
+            if(config.name.equals("vulkan-edited"))setup=CompletableFuture.runAsync(()->server.overworld().setBlock(new BlockPos(0,65,6),Blocks.OBSIDIAN.defaultBlockState(),3),server);
+            if(config.name.equals("vulkan-reloaded"))setup=client.reloadResourcePacks();
+            if(config.name.equals("vulkan-resized"))GLFW.glfwSetWindowSize(client.getWindow().getWindow(),1920,1080);
+            if(config.name.equals("vulkan-nether"))setup=CompletableFuture.runAsync(()-> {
+                var nether=server.getLevel(net.minecraft.world.level.Level.NETHER);prepareWorld(nether);
+                server.getPlayerList().getPlayer(client.player.getUUID()).teleportTo(nether,.5,66,13.5,180,12);
+            },server);
+        }
         config.lastQualityLevel = RayvoxEngine.governorLevel();
         Rayvox.ENABLED.set(config.enabled); Rayvox.MATERIALS.set(config.materials); Rayvox.INDIRECT.set(config.indirect);
+        Rayvox.WORLD_INDIRECT.set(WORLD_CACHE && config.name.startsWith("deferred-world-") && !config.name.endsWith("disabled"));
         Rayvox.HISTORY.set(!config.name.equals("reference-moving") && !config.name.equals("deferred-history-off"));
         Rayvox.PIPELINE.set(PIPELINE && config.name.startsWith("deferred-")
                 ? dev.rayvox.LightingPipeline.DEFERRED : dev.rayvox.LightingPipeline.LEGACY);
@@ -307,6 +332,21 @@ public final class ClientBenchmark {
         }
     }
 
+    private static void prepareVulkanMaterials(ServerLevel world) {
+        var position=new BlockPos.MutableBlockPos();
+        if(SCENE.equals("vulkan-reflective")) {
+            for(int x=-6;x<=6;x++)for(int z=-4;z<=6;z++)world.setBlock(position.set(x,64,z),
+                    (x<0?Blocks.GOLD_BLOCK:Blocks.IRON_BLOCK).defaultBlockState(),18);
+        }
+        if(SCENE.equals("vulkan-glass-water")) {
+            for(int x=-7;x<=7;x++)for(int z=-5;z<=5;z++)world.setBlock(position.set(x,64,z),Blocks.WATER.defaultBlockState(),18);
+            for(int x=-5;x<=5;x++)for(int y=65;y<=68;y++)world.setBlock(position.set(x,y,4),
+                    (x<0?Blocks.RED_STAINED_GLASS:Blocks.GLASS).defaultBlockState(),18);
+            world.setBlock(new BlockPos(3,65,7),Blocks.CHEST.defaultBlockState(),18);
+            world.setBlock(new BlockPos(-3,65,7),Blocks.LAVA.defaultBlockState(),18);
+        }
+    }
+
     private static void preparePartial(ServerLevel world) {
         var cursor = new BlockPos.MutableBlockPos();
         var bars = Blocks.IRON_BARS.defaultBlockState().setValue(BlockStateProperties.EAST, true)
@@ -332,7 +372,7 @@ public final class ClientBenchmark {
     private void start() {
         framePhase = -1; renderStart = 0;
         if (finished || phase < 0) return;
-        if (frameFences[frameFence] != 0) {
+        if (!VULKAN && frameFences[frameFence] != 0) {
             int result;
             long deadline = System.nanoTime() + 10_000_000_000L;
             do {
@@ -348,6 +388,9 @@ public final class ClientBenchmark {
         }
         poll();
         if (System.nanoTime() - phaseStart < phases.get(phase).warm * 1_000_000_000L) return;
+        // Keep initial chunk residency out of steady-state timing. The recorded
+        // warm-up duration and source/artifact hashes identify the measured run.
+        if(VULKAN&&dev.rayvox.RenderBackends.pendingSections()>0)return;
         if (measuredStart == 0) measuredStart = System.nanoTime();
         framePhase = phase; renderStart = System.nanoTime();
         if (timers && !pending[nextQuery]) {
@@ -400,10 +443,14 @@ public final class ClientBenchmark {
                 // Driver compilation can consume the warmup frame; measure a full window afterwards.
                 if (measuredStart != 0 && now - measuredStart >= current.seconds * 1_000_000_000L) {
                     var mc = Minecraft.getInstance();
-                    if (current.enabled && (RayvoxEngine.lights().active.size() != current.expectedLights || !RayvoxEngine.status().equals("Terrain shader ready")))
+                    if (!VULKAN && current.enabled && (RayvoxEngine.lights().active.size() != current.expectedLights || !RayvoxEngine.status().equals("Terrain shader ready")))
                         throw new IllegalStateException("Rayvox did not activate: " + RayvoxEngine.status() + "; " + RayvoxEngine.lightStats());
-                    if (ENTITIES && RayvoxEngine.entityShadowCount() == 0)
+                    if (ENTITIES && !VULKAN && RayvoxEngine.entityShadowCount() == 0)
                         throw new IllegalStateException("Moving entity was not published to the terrain shader");
+                    if (ENTITIES && !VULKAN && RayvoxEngine.entityLightingDraws() == 0)
+                        throw new IllegalStateException("Moving entity did not use the RGB lighting shader");
+                    if(ENTITIES&&VULKAN&&dev.rayvox.RenderBackends.dynamicMeshCount()==0)
+                        throw new IllegalStateException("Animated entity geometry was not captured by Vulkan");
                     if (PIPELINE && configDeferred(current) != RayvoxEngine.deferredActive())
                         throw new IllegalStateException("Unexpected pipeline: " + RayvoxEngine.pipelineStats());
                     if (PIPELINE && configDeferred(current) && RayvoxEngine.lightingPassDraws() <= phasePassDraws)
@@ -425,16 +472,32 @@ public final class ClientBenchmark {
                         throw new IllegalStateException("Unexpected indirect pass activity in " + current.name
                                 + ": " + RayvoxEngine.governorStats());
                     int error = glGetError();
+                    if (WORLD_CACHE && Rayvox.WORLD_INDIRECT.get()
+                            && (RayvoxEngine.worldIndirectReadyBricks() == 0 || RayvoxEngine.worldIndirectDraws() == 0))
+                        throw new IllegalStateException("World probe producer did not publish usable bricks: " + RayvoxEngine.worldLightingStats());
+                    if (WORLD_CACHE && !Rayvox.WORLD_INDIRECT.get() && RayvoxEngine.worldIndirectReadyBricks() != 0)
+                        throw new IllegalStateException("Disabled world probes remained active");
                     if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error in " + current.name + ": " + error);
                     Path screenshot = mc.gameDirectory.toPath().resolve(current.name + ".png");
                     try (var image = Screenshot.takeScreenshot(mc.getMainRenderTarget())) { image.writeToFile(screenshot); }
                     var report = new LinkedHashMap<String, Object>();
                     report.put("phase", current.name); report.put("engine", RayvoxEngine.status());
+                    report.put("renderer",dev.rayvox.RenderBackends.status());
+                    if(VULKAN)report.put("vulkan",dev.rayvox.RenderBackends.diagnostics());
+                    if(VULKAN)report.put("vulkanTimings",dev.rayvox.RenderBackends.timings());
+                    if(VULKAN)report.put("vulkanDynamicMeshes",dev.rayvox.RenderBackends.dynamicMeshCount());
+                    if(VULKAN&&!dev.rayvox.RenderBackends.active())throw new IllegalStateException("Vulkan benchmark fell back: "+dev.rayvox.RenderBackends.status());
                     report.put("activeLightLimit", current.limit); report.put("lightsPerTile", current.perTile);
                     if (ENTITIES) report.put("entityCasters", RayvoxEngine.entityShadowCount());
+                    if (ENTITIES) report.put("entityLightingDraws", RayvoxEngine.entityLightingDraws());
                     report.put("cache", RayvoxEngine.cacheStats()); report.put("lights", RayvoxEngine.lightStats());
                     report.put("history", RayvoxEngine.historyStats()); report.put("screenshot", screenshot.toAbsolutePath().toString());
                     report.put("pipeline", RayvoxEngine.pipelineStats()); report.put("governor", RayvoxEngine.governorStats());
+                    if (WORLD_CACHE) {
+                        report.put("worldLighting", RayvoxEngine.worldLightingStats());
+                        report.put("worldIndirectReadyBricks", RayvoxEngine.worldIndirectReadyBricks());
+                        report.put("worldIndirectDraws", RayvoxEngine.worldIndirectDraws());
+                    }
                     report.put("governorTargetFps", Rayvox.GOVERNOR_TARGET.get());
                     report.put("qualityLevelFrames", current.qualityFrames);
                     report.put("qualityDecisions", current.qualityDecisions);
@@ -456,9 +519,13 @@ public final class ClientBenchmark {
             }
         } catch (Throwable error) { fail(error); }
         if (!finished && phase >= 0) {
-            frameFences[frameFence] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-            if (frameFences[frameFence] == 0) fail(new IllegalStateException("Cannot allocate benchmark frame fence"));
-            frameFence = (frameFence + 1) % frameFences.length;
+            // Vulkan already bounds submissions to two slots using native fences.
+            // A second GL limiter measures Windows park/timer latency as frame time.
+            if(!VULKAN) {
+                frameFences[frameFence] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                if (frameFences[frameFence] == 0) fail(new IllegalStateException("Cannot allocate benchmark frame fence"));
+                frameFence = (frameFence + 1) % frameFences.length;
+            }
             glFlush();
         }
         lastFrame = now;
@@ -486,7 +553,7 @@ public final class ClientBenchmark {
         result.put("success", true); result.put("gpu", RayvoxEngine.gpu());
         result.put("width", mc.getMainRenderTarget().width); result.put("height", mc.getMainRenderTarget().height);
         result.put("renderDistance", mc.options.renderDistance().get()); result.put("phases", reports);
-        result.put("scene", HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
+        result.put("scene", WORLD_CACHE ? "world-cache-v1" : HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
                 : DIRECTIONAL ? (DIRECTIONAL_MATERIALS ? "directional-v1" : "directional-basic-v1") : "fixed-room-v3"); result.put("seed", 42);
         result.put("hidden", GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) == GLFW.GLFW_FALSE);
         result.put("maxFramesInFlight", frameFences.length);

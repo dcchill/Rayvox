@@ -8,7 +8,7 @@ import java.util.List;
 /** Single-owner-thread probe-brick residency and publication; independent of screen history and GL. */
 public final class WorldLightingCache implements AutoCloseable {
     public enum Channel {
-        STATIC_DIRECT(3), DYNAMIC(3), DIRECTIONAL_VISIBILITY(1), INDIRECT(3);
+        STATIC_DIRECT(3), DYNAMIC(3), DIRECTIONAL_VISIBILITY(1), INDIRECT(18);
 
         final int components;
         Channel(int components) { this.components = components; }
@@ -31,6 +31,7 @@ public final class WorldLightingCache implements AutoCloseable {
     private static final class Value {
         long requested = 1, completed;
         float[] samples;
+        boolean gpuPublished;
     }
 
     private static final class Brick {
@@ -54,7 +55,9 @@ public final class WorldLightingCache implements AutoCloseable {
             throw new IllegalArgumentException("Invalid probe-brick limits");
         int side = 16 / probeSpacing;
         probes = side * side * side;
-        bytesPerBrick = (long)probes * 10 * Float.BYTES;
+        int components = 0;
+        for (var channel : Channel.values()) components += channel.components;
+        bytesPerBrick = (long)probes * components * Float.BYTES;
         capacity = (int)Math.min(maxBricks, payloadBudgetBytes / bytesPerBrick);
         if (capacity == 0) throw new IllegalArgumentException("Budget cannot hold one probe brick");
     }
@@ -99,7 +102,7 @@ public final class WorldLightingCache implements AutoCloseable {
         var brick = peek(region);
         if (brick == null) return false;
         var value = brick.values.get(channel);
-        return value.samples != null && value.completed == value.requested;
+        return (value.samples != null || value.gpuPublished) && value.completed == value.requested;
     }
 
     /** A producer must supply a complete brick. Dequeueing work never makes it valid. */
@@ -112,15 +115,28 @@ public final class WorldLightingCache implements AutoCloseable {
         }
         var value = peek(ticket.region).values.get(ticket.channel);
         value.samples = samples.clone();
+        value.gpuPublished = false;
         value.completed = ticket.version;
         revision++;
         return true;
     }
 
-    /** No mutable payload or stale illumination escapes the cache. Null means unknown, not darkness. */
+    /** Publish GPU-owned storage after a complete brick draw, ordered before consumers on the same GL context. */
+    public boolean publishGpu(Ticket ticket) {
+        if (!isCurrent(ticket) || valid(ticket.region, ticket.channel)) return false;
+        var value = peek(ticket.region).values.get(ticket.channel);
+        value.samples = null;
+        value.gpuPublished = true;
+        value.completed = ticket.version;
+        revision++;
+        return true;
+    }
+
+    /** No mutable or stale payload escapes. GPU-owned samples have no CPU copy and return null. */
     public float[] copySamples(Region region, Channel channel) {
         if (!valid(region, channel)) return null;
-        return bricks.get(region).values.get(channel).samples.clone();
+        var samples = bricks.get(region).values.get(channel).samples;
+        return samples == null ? null : samples.clone();
     }
 
     public List<Ticket> dirtyTickets() {
@@ -150,6 +166,11 @@ public final class WorldLightingCache implements AutoCloseable {
         return bytes;
     }
     public long revision() { return revision; }
+    public int validCount(Channel channel) {
+        int count = 0;
+        for (var region : bricks.keySet()) if (valid(region, channel)) count++;
+        return count;
+    }
     public long evictions() { return evictions; }
 
     public void clear() { bricks.clear(); revision++; }

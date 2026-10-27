@@ -12,6 +12,7 @@ final class TerrainShader extends ShaderInstance {
     GpuVoxelCache cache;
     GpuLightCache lights;
     boolean drawing;
+    long draws;
     LightingHistory history;
     GpuTimer timer;
     java.util.List<LightSourceManager.Light> dynamic = java.util.List.of();
@@ -26,6 +27,9 @@ final class TerrainShader extends ShaderInstance {
     private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
     private final int sunLocation, sunRadianceLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation, deferredLocation;
     private final int entityCountLocation, entityRecordsLocation, softnessLocation;
+    private final int culledLocation;
+    private final int cullingDisabledLocation;
+    private final int historyAvailableLocation;
     private final float[] entities = new float[EntityShadows.MAX_CASTERS * 8];
     private final float[] distant = new float[LightSourceManager.PER_SECTION * 8];
     private final int[] locations = new int[4];
@@ -34,8 +38,13 @@ final class TerrainShader extends ShaderInstance {
     private MaterialTable publishedMaterials;
 
     TerrainShader(ResourceProvider resources, boolean directional, boolean advanced, boolean indirect) throws IOException {
-        super(resources, ResourceLocation.fromNamespaceAndPath("rayvox",
-                (directional ? "terrain" : "terrain_point") + (advanced ? "" : "_basic") + (indirect ? "" : "_direct")), DefaultVertexFormat.BLOCK);
+        this(resources, (directional ? "terrain" : "terrain_point") + (advanced ? "" : "_basic")
+                + (indirect ? "" : "_direct"), false);
+    }
+
+    TerrainShader(ResourceProvider resources, String name, boolean entity) throws IOException {
+        super(resources, ResourceLocation.fromNamespaceAndPath("rayvox", name),
+                entity ? DefaultVertexFormat.NEW_ENTITY : DefaultVertexFormat.BLOCK);
         String[] names = {"VoxelData", "VoxelState", "LightData", "LightLists"};
         for (int i = 0; i < 4; i++) locations[i] = glGetUniformLocation(getId(), names[i]);
         sectionUniforms = new SectionLightUniforms(getId());
@@ -53,6 +62,9 @@ final class TerrainShader extends ShaderInstance {
         entityCountLocation = glGetUniformLocation(getId(), "EntityCount");
         entityRecordsLocation = glGetUniformLocation(getId(), "EntityRecords[0]");
         softnessLocation = glGetUniformLocation(getId(), "ShadowSoftness");
+        culledLocation = glGetUniformLocation(getId(), "CulledLights");
+        cullingDisabledLocation = glGetUniformLocation(getId(), "CullingDisabled");
+        historyAvailableLocation = glGetUniformLocation(getId(), "HistoryAvailable");
     }
 
     @Override public void attachToProgram() {
@@ -70,6 +82,8 @@ final class TerrainShader extends ShaderInstance {
     @Override
     public void apply() {
         super.apply();
+        glUniform1i(cullingDisabledLocation, Rayvox.CULLING.get() ? 0 : 1);
+        glUniform2i(culledLocation, RayvoxEngine.culledLightsLow(), RayvoxEngine.culledLightsHigh());
         int active = glGetInteger(GL_ACTIVE_TEXTURE);
         for (int i = 0; i < 4; i++) {
             glActiveTexture(GL_TEXTURE3 + i);
@@ -82,6 +96,7 @@ final class TerrainShader extends ShaderInstance {
         glActiveTexture(active);
         if (history != null) history.attach(getId());
         else {
+            glUniform1i(historyAvailableLocation, 0);
             glUniform1i(historyValidLocation, 0);
             glUniform1i(deferredLocation, 0);
         }
@@ -111,6 +126,7 @@ final class TerrainShader extends ShaderInstance {
         if (dynamicCount > 0) glUniform4fv(dynamicRecordsLocation, moving);
         if (timer != null) timer.begin();
         drawing = true;
+        draws++;
     }
 
     static int packDynamic(java.util.List<LightSourceManager.Light> dynamic, double cameraX, double cameraY,
