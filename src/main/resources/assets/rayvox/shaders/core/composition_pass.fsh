@@ -2,6 +2,7 @@
 uniform usampler3D VoxelData;
 uniform usampler3D VoxelState;
 uniform usampler3D VoxelShapes;
+uniform usampler3D VoxelOccupancy;
 uniform sampler2D LightData;
 uniform usampler2D LightLists;
 uniform int CacheWidth;

@@ -56,7 +56,7 @@ public final class RayvoxEngine {
     private static boolean volumeFailed;
     private static boolean passFailed, deferredActive;
     // Span: AFTER_SKY (before uploads) to the end of opaque terrain and the deferred pass. Includes vanilla terrain draws.
-    private static GpuTimer spanTimer, passTimer, indirectTimer;
+    private static GpuTimer spanTimer, passTimer, indirectTimer, dynamicTimer, compositionTimer;
     private static int spanSamples;
     private static long lastFrameNanos;
     private static final java.lang.management.ThreadMXBean cpuClock = java.lang.management.ManagementFactory.getThreadMXBean();
@@ -236,7 +236,8 @@ public final class RayvoxEngine {
             long start = System.nanoTime();
             boolean timing = profiling || Rayvox.GOVERNOR_TARGET.get() > 0;
             if (timing && spanTimer == null && (GL.getCapabilities().OpenGL33 || GL.getCapabilities().GL_ARB_timer_query)) {
-                spanTimer = new GpuTimer(); passTimer = new GpuTimer(); indirectTimer = new GpuTimer(); spanSamples = 0;
+                spanTimer = new GpuTimer(); passTimer = new GpuTimer(); indirectTimer = new GpuTimer();
+                dynamicTimer = new GpuTimer(); compositionTimer = new GpuTimer(); spanSamples = 0;
             }
             if (!timing && spanTimer != null) closeSpanTimers();
             if (spanTimer != null) spanTimer.begin();
@@ -323,7 +324,7 @@ public final class RayvoxEngine {
             if (deferredActive && history != null && lightingPipeline != null && worldCache != null && gpuCache != null
                     && gpuLights != null && history.passReady()) {
                 updateWorldIndirect(event);
-                lightingPipeline.renderFrame(history, lightingFrame(event), passTimer, indirectTimer);
+                lightingPipeline.renderFrame(history, lightingFrame(event), passTimer, indirectTimer, dynamicTimer, compositionTimer);
             }
         } catch (RuntimeException failure) {
             passFailed = true;
@@ -410,6 +411,8 @@ public final class RayvoxEngine {
         if (spanTimer != null) { spanTimer.close(); spanTimer = null; }
         if (passTimer != null) { passTimer.close(); passTimer = null; }
         if (indirectTimer != null) { indirectTimer.close(); indirectTimer = null; }
+        if (dynamicTimer != null) { dynamicTimer.close(); dynamicTimer = null; }
+        if (compositionTimer != null) { compositionTimer.close(); compositionTimer = null; }
         spanSamples = 0;
     }
 
@@ -613,7 +616,11 @@ public final class RayvoxEngine {
                         : "probe producer OFF (requires world cache + GI + DEFERRED)");
     }
     public static String timingStats() { return (timer == null ? "GPU profiler OFF / unsupported" : timer.status())
-            + String.format(java.util.Locale.ROOT, "; CPU frame update %.3f ms; last list build %.3f ms", updateNanos / 1_000_000.0, lights.buildNanos / 1_000_000.0); }
+            + String.format(java.util.Locale.ROOT, "; CPU frame update %.3f ms; last list build %.3f ms", updateNanos / 1_000_000.0, lights.buildNanos / 1_000_000.0)
+            + "; dynamic pass " + timerStats(dynamicTimer) + "; composition pass " + timerStats(compositionTimer); }
+    private static String timerStats(GpuTimer timer) {
+        return timer == null || timer.samples() == 0 ? "n/a" : String.format(java.util.Locale.ROOT, "%.3f ms", timer.millis());
+    }
     public static String dynamicStats() { return "Moving held lights: " + dynamic.size() + "/4; lighting " + (frozen ? "FROZEN (world simulation continues)" : "live"); }
     public static LightSourceManager lights() { return lights; }
     static int culledLightsLow() { return culling.low; }

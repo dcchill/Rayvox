@@ -21,11 +21,11 @@ final class TerrainShader extends ShaderInstance {
     DirectionalLight sun = DirectionalLight.OFF;
     LightSourceManager.Light budgetBoundary;
     MaterialTable materials;
-    private int previousShapes, previousSurface, previousEntities;
+    private int previousShapes, previousSurface, previousEntities, previousOccupancy;
     private final int surfaceLocation, surfaceReadyLocation, bumpLocation, metalLocation, translucentLocation;
     private final float[] moving = new float[32];
     private final SectionLightUniforms sectionUniforms;
-    private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
+    private final int shapesLocation, occupancyLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
     private final int sunLocation, sunRadianceLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation, deferredLocation;
     private final int entityCountLocation, entityDataLocation, softnessLocation;
     private final int culledLocation;
@@ -54,6 +54,7 @@ final class TerrainShader extends ShaderInstance {
         metalLocation = glGetUniformLocation(getId(), "MetalReflections");
         translucentLocation = glGetUniformLocation(getId(), "TranslucentSurface");
         shapesLocation = glGetUniformLocation(getId(), "VoxelShapes");
+        occupancyLocation = glGetUniformLocation(getId(), "VoxelOccupancy");
         advancedLocation = glGetUniformLocation(getId(), "AdvancedMaterials");
         indirectLocation = glGetUniformLocation(getId(), "IndirectEnabled");
         transmissionLocation = glGetUniformLocation(getId(), "MaterialTransmission[0]");
@@ -126,6 +127,10 @@ final class TerrainShader extends ShaderInstance {
         previousShapes = glGetInteger(GL_TEXTURE_BINDING_3D);
         glBindTexture(GL_TEXTURE_3D, cache.shapes);
         glUniform1i(shapesLocation, 9);
+        glActiveTexture(GL_TEXTURE13);
+        previousOccupancy = glGetInteger(GL_TEXTURE_BINDING_3D);
+        glBindTexture(GL_TEXTURE_3D, cache.occupancy);
+        glUniform1i(occupancyLocation, 13);
         glActiveTexture(active);
         glUniform1i(advancedLocation, Rayvox.MATERIALS.get() ? 1 : 0);
         glUniform1i(indirectLocation, RayvoxEngine.indirectActive() ? 1 : 0);
@@ -197,6 +202,8 @@ final class TerrainShader extends ShaderInstance {
         }
         glActiveTexture(GL_TEXTURE9);
         glBindTexture(GL_TEXTURE_3D, previousShapes);
+        glActiveTexture(GL_TEXTURE13);
+        glBindTexture(GL_TEXTURE_3D, previousOccupancy);
         glActiveTexture(savedActive);
         drawing = false;
         int active = glGetInteger(GL_ACTIVE_TEXTURE);

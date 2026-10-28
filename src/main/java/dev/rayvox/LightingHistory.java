@@ -89,11 +89,10 @@ final class LightingHistory implements AutoCloseable {
             deferred = bound != 0 && drawBuffers >= 8 && glGetInteger(GL_SAMPLES) == 0 && fitsBudget(width, height, gi, true, budgetBytes);
             for (int i = 4; deferred && i < 8; i++) deferred = glGetFramebufferAttachmentParameteri(
                     GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == GL_NONE;
-            for (int attachment : new int[]{GL_COLOR_ATTACHMENT0, GL_DEPTH_ATTACHMENT}) {
-                if (!deferred) break;
-                deferred = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, attachment,
-                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == GL_TEXTURE;
-            }
+            if (deferred) deferred = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == GL_TEXTURE;
+            if (deferred) deferred = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE) == GL_TEXTURE;
             if (deferred) {
                 sceneColor = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
                 sceneDepth = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
@@ -205,8 +204,10 @@ final class LightingHistory implements AutoCloseable {
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, key[write], 0);
         if (gi) glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_2D, indirect[write], 0);
         if (deferred) {
-            int[] surfaces = {inputs, base, emission, albedo};
-            for (int i = 0; i < surfaces.length; i++) glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT4 + i, GL_TEXTURE_2D, surfaces[i], 0);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT4, GL_TEXTURE_2D, inputs, 0);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT5, GL_TEXTURE_2D, base, 0);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT6, GL_TEXTURE_2D, emission, 0);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT7, GL_TEXTURE_2D, albedo, 0);
         }
         if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
             detach();

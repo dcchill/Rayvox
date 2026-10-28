@@ -44,7 +44,8 @@ vec3 bounceDirection(vec3 normal, int sampleIndex) {
     float u = (7.5 - float(sampleIndex)) / 8.0;
     float phi = float(sampleIndex) * 2.39996323;
     vec3 tangent = normalize(cross(abs(normal.y) < 0.99 ? vec3(0, 1, 0) : vec3(1, 0, 0), normal));
-    return tangent * (sqrt(u) * cos(phi)) + cross(normal, tangent) * (sqrt(u) * sin(phi))
+    float radius = sqrt(u);
+    return tangent * (radius * cos(phi)) + cross(normal, tangent) * (radius * sin(phi))
             + normal * sqrt(1.0 - u);
 }
 
@@ -60,7 +61,20 @@ vec3 surfaceRay(vec3 origin, vec3 ray, vec3 normal, bool reflection, int shadowS
     float entry = 0.0;
     vec3 hitNormal = -normal;
     vec3 throughput = vec3(1.0);
+    float rayLength = length(ray);
+    ivec3 checkedRegion = ivec3(-1);
     for (int step = 0; step < 32; step++) {
+#ifndef RAYVOX_NO_EMPTY_SECTION_SKIP
+        ivec3 region = cell / 4;
+        if (any(notEqual(region, checkedRegion))) {
+            checkedRegion = region;
+        bool finished;
+        if (skipEmptyVoxelRegion(cell, next, entry, origin, ray, stepDir, delta, finished)) {
+            if (finished) return vec3(0.0);
+            continue;
+        }
+        }
+#endif
         int voxel = voxelAt(cell);
         if (voxel < 0) return vec3(0.0);
         int material = voxel & 63;
@@ -71,11 +85,11 @@ vec3 surfaceRay(vec3 origin, vec3 ray, vec3 normal, bool reflection, int shadowS
                 || shapeHit(cell, origin, ray, entry, min(nearest, 1.0), (voxel & 64) != 0, hitDistance, subNormal)));
         if (blocked) {
             if (dot(subNormal, subNormal) > 0.0) hitNormal = subNormal;
-            float fade = reflection ? 1.0 - smoothstep(6.0, 8.0, hitDistance * length(ray)) : 1.0;
+            float fade = reflection ? 1.0 - smoothstep(6.0, 8.0, hitDistance * rayLength) : 1.0;
             return throughput * bounceLighting(origin + ray * hitDistance, hitNormal, cell, shadowSample) * (reflection ? 2.0 : 1.0) * fade;
         }
         if (AdvancedMaterials != 0 && (material == 3 || material >= 16)) {
-            float distance = shapeThickness(cell, origin, ray, entry, min(nearest, 1.0), (voxel & 64) != 0) * length(ray);
+            float distance = shapeThickness(cell, origin, ray, entry, min(nearest, 1.0), (voxel & 64) != 0) * rayLength;
             if (distance > 0.0) throughput *= pow(MaterialTransmission[min(material, 63)], vec3(distance));
             if (all(equal(throughput, vec3(0.0)))) return vec3(0.0);
         }

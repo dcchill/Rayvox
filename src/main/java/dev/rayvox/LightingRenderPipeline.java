@@ -25,11 +25,12 @@ final class LightingRenderPipeline extends LightingPass {
         }
     }
 
-    void renderFrame(LightingHistory history, Frame frame, GpuTimer directTimer, GpuTimer indirectTimer) {
+    void renderFrame(LightingHistory history, Frame frame, GpuTimer directTimer, GpuTimer indirectTimer,
+            GpuTimer dynamicTimer, GpuTimer compositionTimer) {
         direct.render(history, frame, directTimer);
         if (frame.indirect()) indirect.render(history, frame, indirectTimer);
-        if (!frame.dynamic().isEmpty()) dynamic.render(history, frame, null);
-        render(history, frame, null);
+        if (!frame.dynamic().isEmpty()) dynamic.render(history, frame, dynamicTimer);
+        render(history, frame, compositionTimer);
     }
 
     @Override public void close() {

@@ -36,6 +36,7 @@ uniform vec4 DynamicRecords[8];
 uniform vec4 SunDirection;
 uniform int SunHistoryValid;
 uniform usampler3D VoxelShapes;
+uniform usampler3D VoxelOccupancy;
 #ifdef RAYVOX_BASIC_MATERIALS
 const int AdvancedMaterials = 0;
 #else

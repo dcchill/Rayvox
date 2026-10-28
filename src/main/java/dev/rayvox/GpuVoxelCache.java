@@ -11,7 +11,9 @@ public final class GpuVoxelCache implements AutoCloseable {
     public final int voxels;
     public final int states;
     public final int shapes;
+    public final int occupancy;
     private final ByteBuffer section = BufferUtils.createByteBuffer(VoxelGrid.SECTION_BYTES * 4);
+    private final ByteBuffer occupancySection = BufferUtils.createByteBuffer(64);
     private final java.nio.IntBuffer shapeData = BufferUtils.createIntBuffer(VoxelGrid.SECTION_BYTES * 2);
     private final ByteBuffer metadata;
     private final boolean[] airSnapshots;
@@ -27,21 +29,24 @@ public final class GpuVoxelCache implements AutoCloseable {
         metadata = BufferUtils.createByteBuffer(width * width * width);
         airSnapshots = new boolean[width * width * width];
         var saved = new UploadState();
-        int data = 0, status = 0, shape = 0;
+        int data = 0, status = 0, shape = 0, occupied = 0;
         try {
             data = allocate(width * 16, GL_RGBA8UI, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE);
             shape = allocate(width * 16, GL_RG32UI, GL_RG_INTEGER, GL_UNSIGNED_INT);
             status = allocate(width, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE);
+            occupied = allocate(width * 4, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE);
             glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, width, width, width, GL_RED_INTEGER, GL_UNSIGNED_BYTE, metadata);
         } catch (RuntimeException failure) {
             glDeleteTextures(data);
             glDeleteTextures(status);
             glDeleteTextures(shape);
+            glDeleteTextures(occupied);
             throw failure;
         } finally { saved.restore(); }
         voxels = data;
         states = status;
         shapes = shape;
+        occupancy = occupied;
     }
 
     private static int allocate(int side, int internal, int format, int type) {
@@ -93,8 +98,8 @@ public final class GpuVoxelCache implements AutoCloseable {
                         int material = Byte.toUnsignedInt(slot.data[i]) & BoxShape.MATERIAL_MASK;
                         allAir &= slot.data[i] == 0;
                         needsShapes |= material == 2 || material == 3 || material >= 16;
-                        rayEmpty &= material == 0 || material >= 4 && material < 16;
                     }
+                    rayEmpty = !packOccupancy(slot.data, occupancySection);
                     section.flip();
                     glBindTexture(GL_TEXTURE_3D, voxels);
                     glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 16,
@@ -102,6 +107,11 @@ public final class GpuVoxelCache implements AutoCloseable {
                             16, 16, 16, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, section);
                     uploadedBytesLastFrame += VoxelGrid.SECTION_BYTES * 4;
                     airSnapshots[index] = allAir;
+                    glBindTexture(GL_TEXTURE_3D, occupancy);
+                    glTexSubImage3D(GL_TEXTURE_3D, 0, Math.floorMod(slot.x, width) * 4,
+                            Math.floorMod(slot.y, width) * 4, Math.floorMod(slot.z, width) * 4,
+                            4, 4, 4, GL_RED_INTEGER, GL_UNSIGNED_BYTE, occupancySection);
+                    uploadedBytesLastFrame += 64;
                 }
                 // A material snapshot without partial geometry or filters never samples the shape texture.
                 if (needsShapes) {
@@ -140,7 +150,25 @@ public final class GpuVoxelCache implements AutoCloseable {
         } finally { saved.restore(); }
     }
 
-    public long bytes() { return (long)width * width * width * (VoxelGrid.SECTION_BYTES * 12 + 1); }
+    public long bytes() { return (long)width * width * width * (VoxelGrid.SECTION_BYTES * 12 + 65); }
+
+    static boolean packOccupancy(byte[] data, ByteBuffer target) {
+        if (data.length != VoxelGrid.SECTION_BYTES || target.capacity() < 64)
+            throw new IllegalArgumentException("Invalid voxel occupancy buffer");
+        target.clear();
+        for (int i = 0; i < 64; i++) target.put(i, (byte)0);
+        boolean anyOccupied = false;
+        for (int i = 0; i < data.length; i++) {
+            int material = Byte.toUnsignedInt(data[i]) & BoxShape.MATERIAL_MASK;
+            if (material == 0 || material >= 4 && material < 16) continue;
+            int x = i & 15, y = i >> 4 & 15, z = i >> 8;
+            int region = (x >> 2) + 4 * ((y >> 2) + 4 * (z >> 2));
+            target.put(region, (byte)1);
+            anyOccupied = true;
+        }
+        target.position(0).limit(64);
+        return anyOccupied;
+    }
 
     @Override
     public void close() {
@@ -148,6 +176,7 @@ public final class GpuVoxelCache implements AutoCloseable {
         glDeleteTextures(voxels);
         glDeleteTextures(states);
         glDeleteTextures(shapes);
+        glDeleteTextures(occupancy);
     }
 
     static final class UploadState {

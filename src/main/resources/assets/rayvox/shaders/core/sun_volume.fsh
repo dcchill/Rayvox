@@ -3,6 +3,7 @@
 uniform usampler3D VoxelData;
 uniform usampler3D VoxelState;
 uniform usampler3D VoxelShapes;
+uniform usampler3D VoxelOccupancy;
 uniform int CacheWidth;
 uniform ivec3 CacheMinSlot;
 uniform ivec3 CameraInCache;

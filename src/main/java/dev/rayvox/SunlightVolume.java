@@ -19,8 +19,17 @@ final class SunlightVolume extends ShaderInstance {
     private int texture, framebuffer, vao, width, height;
     private final Matrix4f inverseClip = new Matrix4f();
     private final float[] matrix = new float[16];
-    private final int[] viewport = new int[4], savedTextures = new int[5];
+    private final int[] viewport = new int[4], savedTextures = new int[6];
+    private final int[] textures = new int[5];
     private final java.nio.ByteBuffer mask = org.lwjgl.BufferUtils.createByteBuffer(4);
+    private final int[] volumeSamplers = new int[5];
+    private final int occupancyLocation;
+    private final int inverseClipLocation, volumeSizeLocation, volumeStepsLocation, rainLocation,
+            sunShadowDistanceLocation, sunDirectionLocation, sunRadianceLocation, cacheWidthLocation,
+            cacheMinSlotLocation, cameraInCacheLocation, cameraFractionLocation, advancedMaterialsLocation,
+            materialTransmissionLocation;
+    private final int compositeDepthLocation, compositeLightLocation, compositeInverseClipLocation,
+            compositeShadowDistanceLocation;
     private GpuTimer timer;
     private boolean closed;
     long draws;
@@ -32,6 +41,26 @@ final class SunlightVolume extends ShaderInstance {
             for (int program : new int[]{getId(), composite.getId()})
                 if (glGetProgrami(program, GL_LINK_STATUS) != GL_TRUE)
                     throw new IllegalStateException(glGetProgramInfoLog(program));
+            String[] samplers = {"PassDepth", "VoxelData", "VoxelState", "VoxelShapes", "VolumeLight"};
+            for (int i = 0; i < samplers.length; i++) volumeSamplers[i] = glGetUniformLocation(getId(), samplers[i]);
+            occupancyLocation = glGetUniformLocation(getId(), "VoxelOccupancy");
+            inverseClipLocation = glGetUniformLocation(getId(), "InverseClipMat");
+            volumeSizeLocation = glGetUniformLocation(getId(), "VolumeSize");
+            volumeStepsLocation = glGetUniformLocation(getId(), "VolumeSteps");
+            rainLocation = glGetUniformLocation(getId(), "Rain");
+            sunShadowDistanceLocation = glGetUniformLocation(getId(), "SunShadowDistance");
+            sunDirectionLocation = glGetUniformLocation(getId(), "SunDirection");
+            sunRadianceLocation = glGetUniformLocation(getId(), "SunRadiance");
+            cacheWidthLocation = glGetUniformLocation(getId(), "CacheWidth");
+            cacheMinSlotLocation = glGetUniformLocation(getId(), "CacheMinSlot");
+            cameraInCacheLocation = glGetUniformLocation(getId(), "CameraInCache");
+            cameraFractionLocation = glGetUniformLocation(getId(), "CameraFraction");
+            advancedMaterialsLocation = glGetUniformLocation(getId(), "AdvancedMaterials");
+            materialTransmissionLocation = glGetUniformLocation(getId(), "MaterialTransmission[0]");
+            compositeDepthLocation = glGetUniformLocation(composite.getId(), "PassDepth");
+            compositeLightLocation = glGetUniformLocation(composite.getId(), "VolumeLight");
+            compositeInverseClipLocation = glGetUniformLocation(composite.getId(), "InverseClipMat");
+            compositeShadowDistanceLocation = glGetUniformLocation(composite.getId(), "SunShadowDistance");
         } catch (IOException | RuntimeException failure) {
             close();
             throw failure;
@@ -56,7 +85,7 @@ final class SunlightVolume extends ShaderInstance {
         glGetBooleanv(GL_COLOR_WRITEMASK, mask);
         for (int i = 0; i < savedTextures.length; i++) {
             glActiveTexture(GL_TEXTURE3 + i);
-            savedTextures[i] = glGetInteger(i > 0 && i < 4 ? GL_TEXTURE_BINDING_3D : GL_TEXTURE_BINDING_2D);
+            savedTextures[i] = glGetInteger(i > 0 && i < 4 || i == 5 ? GL_TEXTURE_BINDING_3D : GL_TEXTURE_BINDING_2D);
         }
         boolean timing = RayvoxEngine.profiling() || Rayvox.GOVERNOR_TARGET.get() > 0;
         try {
@@ -74,41 +103,42 @@ final class SunlightVolume extends ShaderInstance {
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
             glViewport(0, 0, width, height);
             apply();
-            int program = getId();
-            int[] textures = {depthTexture, f.cache().voxels, f.cache().states, f.cache().shapes, texture};
-            String[] names = {"PassDepth", "VoxelData", "VoxelState", "VoxelShapes", "VolumeLight"};
+            textures[0] = depthTexture; textures[1] = f.cache().voxels; textures[2] = f.cache().states;
+            textures[3] = f.cache().shapes; textures[4] = texture;
             for (int i = 0; i < textures.length; i++) {
                 glActiveTexture(GL_TEXTURE3 + i);
                 glBindTexture(i > 0 && i < 4 ? GL_TEXTURE_3D : GL_TEXTURE_2D, textures[i]);
-                glUniform1i(glGetUniformLocation(program, names[i]), 3 + i);
+                glUniform1i(volumeSamplers[i], 3 + i);
             }
-            glUniformMatrix4fv(glGetUniformLocation(program, "InverseClipMat"), false, matrix);
-            glUniform2f(glGetUniformLocation(program, "VolumeSize"), width, height);
-            glUniform1i(glGetUniformLocation(program, "VolumeSteps"), steps);
-            glUniform1f(glGetUniformLocation(program, "Rain"), rain);
-            glUniform1f(glGetUniformLocation(program, "SunShadowDistance"), f.sunShadowDistance());
+            glActiveTexture(GL_TEXTURE8);
+            glBindTexture(GL_TEXTURE_3D, f.cache().occupancy);
+            glUniform1i(occupancyLocation, 8);
+            glUniformMatrix4fv(inverseClipLocation, false, matrix);
+            glUniform2f(volumeSizeLocation, width, height);
+            glUniform1i(volumeStepsLocation, steps);
+            glUniform1f(rainLocation, rain);
+            glUniform1f(sunShadowDistanceLocation, f.sunShadowDistance());
             var sun = f.sun();
-            glUniform4f(glGetUniformLocation(program, "SunDirection"), sun.x(), sun.y(), sun.z(), sun.strength());
-            glUniform3f(glGetUniformLocation(program, "SunRadiance"), sun.red(), sun.green(), sun.blue());
+            glUniform4f(sunDirectionLocation, sun.x(), sun.y(), sun.z(), sun.strength());
+            glUniform3f(sunRadianceLocation, sun.red(), sun.green(), sun.blue());
             var grid = f.grid();
             int minX = grid.centerX - grid.radius, minY = grid.centerY - grid.radius, minZ = grid.centerZ - grid.radius;
             int bx = (int)Math.floor(f.cameraX()), by = (int)Math.floor(f.cameraY()), bz = (int)Math.floor(f.cameraZ());
-            glUniform1i(glGetUniformLocation(program, "CacheWidth"), grid.width);
-            glUniform3i(glGetUniformLocation(program, "CacheMinSlot"), Math.floorMod(minX, grid.width), Math.floorMod(minY, grid.width), Math.floorMod(minZ, grid.width));
-            glUniform3i(glGetUniformLocation(program, "CameraInCache"), bx - minX * 16, by - minY * 16, bz - minZ * 16);
-            glUniform3f(glGetUniformLocation(program, "CameraFraction"), (float)(f.cameraX() - bx), (float)(f.cameraY() - by), (float)(f.cameraZ() - bz));
-            glUniform1i(glGetUniformLocation(program, "AdvancedMaterials"), Rayvox.MATERIALS.get() ? 1 : 0);
-            glUniform3fv(glGetUniformLocation(program, "MaterialTransmission[0]"), f.materials().transmission);
+            glUniform1i(cacheWidthLocation, grid.width);
+            glUniform3i(cacheMinSlotLocation, Math.floorMod(minX, grid.width), Math.floorMod(minY, grid.width), Math.floorMod(minZ, grid.width));
+            glUniform3i(cameraInCacheLocation, bx - minX * 16, by - minY * 16, bz - minZ * 16);
+            glUniform3f(cameraFractionLocation, (float)(f.cameraX() - bx), (float)(f.cameraY() - by), (float)(f.cameraZ() - bz));
+            glUniform1i(advancedMaterialsLocation, Rayvox.MATERIALS.get() ? 1 : 0);
+            glUniform3fv(materialTransmissionLocation, f.materials().transmission);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             clear();
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldFramebuffer);
             glViewport(0, 0, target.width, target.height);
             composite.apply();
-            program = composite.getId();
-            glUniform1i(glGetUniformLocation(program, "PassDepth"), 3);
-            glUniform1i(glGetUniformLocation(program, "VolumeLight"), 7);
-            glUniformMatrix4fv(glGetUniformLocation(program, "InverseClipMat"), false, matrix);
-            glUniform1f(glGetUniformLocation(program, "SunShadowDistance"), f.sunShadowDistance());
+            glUniform1i(compositeDepthLocation, 3);
+            glUniform1i(compositeLightLocation, 7);
+            glUniformMatrix4fv(compositeInverseClipLocation, false, matrix);
+            glUniform1f(compositeShadowDistanceLocation, f.sunShadowDistance());
             glEnablei(GL_BLEND, 0);
             glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
             glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
@@ -121,7 +151,7 @@ final class SunlightVolume extends ShaderInstance {
             GlStateManager._glUseProgram(oldProgram);
             for (int i = 0; i < savedTextures.length; i++) {
                 glActiveTexture(GL_TEXTURE3 + i);
-                glBindTexture(i > 0 && i < 4 ? GL_TEXTURE_3D : GL_TEXTURE_2D, savedTextures[i]);
+                glBindTexture(i > 0 && i < 4 || i == 5 ? GL_TEXTURE_3D : GL_TEXTURE_2D, savedTextures[i]);
             }
             glActiveTexture(oldActive); glBindVertexArray(oldVao);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldFramebuffer); glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead);

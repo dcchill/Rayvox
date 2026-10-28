@@ -6,6 +6,46 @@ ivec3 cacheSlot(ivec3 cell) {
     return slot - ivec3(greaterThanEqual(slot, ivec3(CacheWidth))) * CacheWidth;
 }
 
+int emptyVoxelRegionSize(ivec3 cell) {
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(CacheWidth * 16)))) return 0;
+    ivec3 slot = cacheSlot(cell);
+    uint state = texelFetch(VoxelState, slot, 0).r;
+    if ((state & 1u) == 0u) return 0;
+    if ((state & 4u) != 0u) return 16;
+    return texelFetch(VoxelOccupancy, slot * 4 + (cell % 16) / 4, 0).r == 0u ? 4 : 0;
+}
+
+bool skipEmptyVoxelRegion(inout ivec3 cell, inout vec3 next, inout float entry,
+        vec3 origin, vec3 ray, ivec3 direction, vec3 delta, out bool finished) {
+    finished = false;
+#ifdef RAYVOX_NO_EMPTY_SECTION_SKIP
+    return false;
+#else
+    int regionSize = emptyVoxelRegionSize(cell);
+    if (regionSize == 0) return false;
+    ivec3 low = (cell / regionSize) * regionSize;
+    vec3 boundary = mix(vec3(low), vec3(low + regionSize), greaterThan(ray, vec3(0.0)));
+    vec3 regionNext = (boundary - origin) / ray;
+    if (direction.x == 0) regionNext.x = 1e20;
+    if (direction.y == 0) regionNext.y = 1e20;
+    if (direction.z == 0) regionNext.z = 1e20;
+    float nearest = min(regionNext.x, min(regionNext.y, regionNext.z));
+    if (nearest >= 1.0) { finished = true; return true; }
+    bvec3 crossed = lessThanEqual(regionNext, vec3(nearest + 0.0000001));
+    cell = ivec3(floor(origin + ray * nearest));
+    if (crossed.x) cell.x = direction.x > 0 ? low.x + regionSize : low.x - 1;
+    if (crossed.y) cell.y = direction.y > 0 ? low.y + regionSize : low.y - 1;
+    if (crossed.z) cell.z = direction.z > 0 ? low.z + regionSize : low.z - 1;
+    vec3 localBoundary = mix(origin - vec3(cell), vec3(cell + 1) - origin, greaterThan(ray, vec3(0.0)));
+    next = localBoundary * delta;
+    if (direction.x == 0) next.x = 1e20;
+    if (direction.y == 0) next.y = 1e20;
+    if (direction.z == 0) next.z = 1e20;
+    entry = nearest;
+    return true;
+#endif
+}
+
 int voxelAt(ivec3 cell) {
     if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(CacheWidth * 16)))) {
 #ifdef RAYVOX_WORLD_PROBES
@@ -142,7 +182,19 @@ vec3 traceDirectionalTransmission(vec3 origin, vec3 target, vec3 shadowCamera, f
     float directionalOcclusion = 0.0;
     float entry = 0.0;
     float rayLength = length(ray);
+    ivec3 checkedRegion = ivec3(-1);
     for (int step = 0; step < 128; step++) {
+#ifndef RAYVOX_NO_EMPTY_SECTION_SKIP
+        ivec3 region = cell / 4;
+        if (any(notEqual(region, checkedRegion))) {
+            checkedRegion = region;
+        bool finished;
+        if (skipEmptyVoxelRegion(cell, next, entry, origin, ray, direction, delta, finished)) {
+            if (finished) return transmission * (1.0 - directionalOcclusion);
+            continue;
+        }
+        }
+#endif
 #ifdef RAYVOX_NO_EMPTY_SECTION_SKIP
         int voxel = voxelAt(cell);
 #else
@@ -229,7 +281,19 @@ vec3 traceTransmission(vec3 origin, vec3 target, bool environment) {
     vec3 transmission = vec3(1.0);
     float entry = 0.0;
     float rayLength = length(ray);
+    ivec3 checkedRegion = ivec3(-1);
     for (int step = 0; step < 128; step++) {
+#ifndef RAYVOX_NO_EMPTY_SECTION_SKIP
+        ivec3 region = cell / 4;
+        if (any(notEqual(region, checkedRegion))) {
+            checkedRegion = region;
+        bool finished;
+        if (skipEmptyVoxelRegion(cell, next, entry, origin, ray, direction, delta, finished)) {
+            if (finished) return transmission;
+            continue;
+        }
+        }
+#endif
         int voxel = voxelAt(cell);
         if (voxel < 0) {
 #ifdef RAYVOX_WORLD_PROBES

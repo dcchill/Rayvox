@@ -19,6 +19,7 @@ class LightingPass extends ShaderInstance {
     private static final int FIRST_UNIT = 3;
     private final String[] samplers;
     private final int[] samplerLocations, savedTextures;
+    private final int[] passTextures;
     private final Kind kind;
     private final int cacheWidth, cacheMinSlot, cameraInCache, cameraFraction, shadowsEnabled, shadowDistance,
             shadowDrawDistance, shadowBudget, sunShadowDistance, sunDirection, sunRadiance, advanced, transmission,
@@ -27,6 +28,7 @@ class LightingPass extends ShaderInstance {
     private final float[] moving = new float[32];
     private final int culledLocation;
     private final int cullingDisabledLocation, metalLocation;
+    private final int occupancyLocation;
     private final LightRadianceCache radiances = new LightRadianceCache();
     private final int[] viewport = new int[4];
     private final java.nio.ByteBuffer mask = org.lwjgl.BufferUtils.createByteBuffer(4);
@@ -57,10 +59,12 @@ class LightingPass extends ShaderInstance {
         };
         samplerLocations = new int[samplers.length];
         savedTextures = new int[samplers.length];
+        passTextures = new int[samplers.length];
         int program = getId();
         culledLocation = glGetUniformLocation(program, "CulledLights");
         cullingDisabledLocation = glGetUniformLocation(program, "CullingDisabled");
         metalLocation = glGetUniformLocation(program, "MetalReflections");
+        occupancyLocation = glGetUniformLocation(program, "VoxelOccupancy");
         for (int i = 0; i < samplers.length; i++) samplerLocations[i] = glGetUniformLocation(program, samplers[i]);
         cacheWidth = glGetUniformLocation(program, "CacheWidth");
         cacheMinSlot = glGetUniformLocation(program, "CacheMinSlot");
@@ -142,6 +146,8 @@ class LightingPass extends ShaderInstance {
         glColorMaski(0, true, true, true, true);
         boolean applied = false;
         int boundTextures = 0;
+        int previousOccupancy = 0;
+        boolean occupancyBound = false;
         try {
             boolean ready = switch (kind) {
                 case STATIC -> history.bindPassTarget(); case INDIRECT -> history.bindIndirectPassTarget();
@@ -155,32 +161,29 @@ class LightingPass extends ShaderInstance {
             publish(f);
             glActiveTexture(GL_TEXTURE18);
             glBindTexture(GL_TEXTURE_2D,f.entities()==null?0:f.entities().texture);
-            glUniform1i(entityData,18);
+            // Composition has no entity occluders, so keep its 2D sampler off the occupancy unit.
+            glUniform1i(entityData, kind == Kind.COMPOSITION ? 2 : 18);
             if (history != null) history.uploadInverseClip(inverseClip);
             if (kind == Kind.PROBE) glUniform3i(probeOrigin,
                     (region.x() - f.grid().centerX + f.grid().radius) * 16,
                     (region.y() - f.grid().centerY + f.grid().radius) * 16,
                     (region.z() - f.grid().centerZ + f.grid().radius) * 16);
-            int[] textures = switch (kind) {
-                case STATIC -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists,
-                        history.passKey(), history.passInputs(), history.passAlbedo()};
-                case INDIRECT -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists,
-                        history.passKey(), history.passInputs(), history.passIndirect(),
-                        f.worldIndirect() == null ? 0 : f.worldIndirect().irradiance,
-                        f.worldIndirect() == null ? 0 : f.worldIndirect().validity};
-                case PROBE -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists};
-                case DYNAMIC -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, history.passKey(), history.sceneDepth(), history.passAlbedo()};
-                case COMPOSITION -> new int[]{f.cache().voxels, f.cache().states, f.cache().shapes, f.lights().data, f.lights().lists, history.sceneColor(), history.passKey(), history.passLighting(), history.passIndirect(), history.passDynamic(),
-                        history.passBase(), history.passEmission(), history.passAlbedo(), history.passInputs(), history.sceneDepth()};
-            };
+            fillTextures(history, f);
             for (int i = 0; i < samplers.length; i++) {
                 int textureType = textureTarget(i);
                 glActiveTexture(GL_TEXTURE0 + FIRST_UNIT + i);
                 savedTextures[i] = glGetInteger(textureType == GL_TEXTURE_3D ? GL_TEXTURE_BINDING_3D : GL_TEXTURE_BINDING_2D);
                 boundTextures = i + 1;
-                glBindTexture(textureType, textures[i]);
+                glBindTexture(textureType, passTextures[i]);
                 glUniform1i(samplerLocations[i], FIRST_UNIT + i);
             }
+            int occupancyUnit = FIRST_UNIT + samplers.length;
+            glActiveTexture(GL_TEXTURE0 + occupancyUnit);
+            previousOccupancy = glGetInteger(GL_TEXTURE_BINDING_3D);
+            glBindTexture(GL_TEXTURE_3D, f.cache().occupancy);
+            occupancyBound = true;
+            glUniform1i(occupancyLocation, occupancyUnit);
+            glActiveTexture(previousActive);
             if (vao == 0) vao = glGenVertexArrays();
             glBindVertexArray(vao);
             if (history != null) glViewport(0, 0, history.width(), history.height());
@@ -195,6 +198,10 @@ class LightingPass extends ShaderInstance {
             for (int i = 0; i < boundTextures; i++) {
                 glActiveTexture(GL_TEXTURE0 + FIRST_UNIT + i);
                 glBindTexture(textureTarget(i), savedTextures[i]);
+            }
+            if (occupancyBound) {
+                glActiveTexture(GL_TEXTURE0 + FIRST_UNIT + samplers.length);
+                glBindTexture(GL_TEXTURE_3D, previousOccupancy);
             }
             glActiveTexture(GL_TEXTURE18); glBindTexture(GL_TEXTURE_2D,previousEntities);
             glActiveTexture(previousActive);
@@ -212,6 +219,32 @@ class LightingPass extends ShaderInstance {
     }
 
     private int textureTarget(int sampler) { return sampler < 3 ? GL_TEXTURE_3D : GL_TEXTURE_2D; }
+
+    private void fillTextures(LightingHistory history, Frame f) {
+        passTextures[0] = f.cache().voxels; passTextures[1] = f.cache().states; passTextures[2] = f.cache().shapes;
+        switch (kind) {
+            case STATIC -> {
+                passTextures[3] = f.lights().data; passTextures[4] = f.lights().lists;
+                passTextures[5] = history.passKey(); passTextures[6] = history.passInputs(); passTextures[7] = history.passAlbedo();
+            }
+            case INDIRECT -> {
+                passTextures[3] = f.lights().data; passTextures[4] = f.lights().lists;
+                passTextures[5] = history.passKey(); passTextures[6] = history.passInputs(); passTextures[7] = history.passIndirect();
+                passTextures[8] = f.worldIndirect() == null ? 0 : f.worldIndirect().irradiance;
+                passTextures[9] = f.worldIndirect() == null ? 0 : f.worldIndirect().validity;
+            }
+            case PROBE -> { passTextures[3] = f.lights().data; passTextures[4] = f.lights().lists; }
+            case DYNAMIC -> {
+                passTextures[3] = history.passKey(); passTextures[4] = history.sceneDepth(); passTextures[5] = history.passAlbedo();
+            }
+            case COMPOSITION -> {
+                passTextures[3] = f.lights().data; passTextures[4] = f.lights().lists; passTextures[5] = history.sceneColor();
+                passTextures[6] = history.passKey(); passTextures[7] = history.passLighting(); passTextures[8] = history.passIndirect();
+                passTextures[9] = history.passDynamic(); passTextures[10] = history.passBase(); passTextures[11] = history.passEmission();
+                passTextures[12] = history.passAlbedo(); passTextures[13] = history.passInputs(); passTextures[14] = history.sceneDepth();
+            }
+        }
+    }
 
     private void publish(Frame f) {
         glUniform1i(cullingDisabledLocation, Rayvox.CULLING.get() ? 0 : 1);
