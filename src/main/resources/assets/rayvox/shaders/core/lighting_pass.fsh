@@ -8,6 +8,7 @@ uniform sampler2D LightData;
 uniform usampler2D LightLists;
 uniform sampler2D PassKey;
 uniform sampler2D PassInputs;
+uniform sampler2D PassAlbedo;
 uniform int CacheWidth;
 uniform ivec3 CacheMinSlot;
 uniform ivec3 CameraInCache;
@@ -26,6 +27,7 @@ uniform int FrameIndex;
 #moj_import <rayvox:shadow.glsl>
 #moj_import <rayvox:soft_shadow.glsl>
 #moj_import <rayvox:lighting_common.glsl>
+#moj_import <rayvox:surface_material.glsl>
 
 out vec4 lighting;
 
@@ -49,9 +51,10 @@ void main() {
     vec3 base = texelFetch(PassInputs, pixel, 0).rgb;
 
     vec3 position = key.xyz;
-    vec3 normal = historyNormal(key.w);
-    vec3 origin = position + normal * 0.03;
-    ivec3 cell = ivec3(floor(position - normal * 0.02));
+    vec3 geometric = historyNormal(key.w);
+    vec3 normal = surfaceDirection(texelFetch(PassAlbedo, pixel, 0));
+    vec3 origin = position + geometric * 0.03;
+    ivec3 cell = ivec3(floor(position - geometric * 0.02));
     vec3 direct = vec3(0.0);
     if (all(greaterThanEqual(cell, ivec3(0))) && all(lessThan(cell, ivec3(CacheWidth * 16)))) {
         ivec3 sectionSlot = cacheSlot(cell);
@@ -83,7 +86,7 @@ void main() {
     float fade = 1.0 - smoothstep(SunShadowDistance * 0.5, SunShadowDistance,
             length(position - CameraFraction - vec3(CameraInCache)));
     if (SunDirection.w > 0.0 && fade > 0.0 && facing > 0.0) {
-        vec3 transmission = softDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
+        vec3 transmission = softWorldDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
                 CameraFraction + vec3(CameraInCache), SunShadowDistance);
         sunlight = dot(transmission, vec3(1.0 / 3.0));
     }

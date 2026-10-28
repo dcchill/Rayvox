@@ -56,22 +56,45 @@ public final class ClientBenchmark {
     private static final String SCENE = System.getProperty("rayvox.benchmark.scene", "room");
     private static final boolean VULKAN = SCENE.startsWith("vulkan-");
     private static final boolean VANILLA_VULKAN = SCENE.startsWith("vulkan-vanilla");
+    private static final boolean SHADER_VULKAN = SCENE.equals("vulkan-shader");
     private static final boolean VANILLA_UPSCALING = SCENE.equals("vulkan-vanilla-upscaling");
+    private static final boolean PLAYER_SHADOWS = SCENE.equals("opengl-player-shadows");
+    private static final boolean SURFACES = SCENE.equals("opengl-surfaces");
     private static final boolean TEMPORAL = SCENE.equals("temporal");
     private static final boolean WORLD_CACHE = SCENE.equals("world-cache");
     private static final boolean INDIRECT_PIPELINE = SCENE.equals("pipeline-gi") || WORLD_CACHE;
     private static final boolean GOVERNOR_PIPELINE = SCENE.equals("pipeline-governor");
     private static final boolean HELD_PIPELINE = SCENE.equals("pipeline-held");
-    private static final boolean PIPELINE = SCENE.equals("pipeline") || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
+    private static final boolean PIPELINE = SCENE.equals("pipeline") || PLAYER_SHADOWS || SURFACES || INDIRECT_PIPELINE || GOVERNOR_PIPELINE || HELD_PIPELINE;
     private static final boolean ENTITIES = SCENE.equals("entities") || SCENE.equals("vulkan-entities") || SCENE.equals("vulkan-vanilla-entities");
     private static final boolean DIRECTIONAL_GLASS = SCENE.equals("directional-glass");
-    private static final boolean DIRECTIONAL = SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor") || SCENE.equals("vulkan-vanilla-outdoor") || VANILLA_UPSCALING;
+    private static final boolean DIRECTIONAL = PLAYER_SHADOWS || SCENE.equals("directional") || SCENE.equals("directional-basic") || DIRECTIONAL_GLASS || SCENE.equals("vulkan-outdoor") || SCENE.equals("vulkan-vanilla-outdoor") || VANILLA_UPSCALING || SHADER_VULKAN;
     private static final boolean DIRECTIONAL_MATERIALS = !SCENE.equals("directional-basic");
-    private static final String WORLD = VANILLA_UPSCALING ? "rayvox-benchmark-upscaling-v1" : ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
+    private static final String WORLD = PLAYER_SHADOWS ? "rayvox-player-shadows-v1" : SURFACES ? "rayvox-benchmark-surfaces-v1" : SHADER_VULKAN ? "rayvox-benchmark-shader-v1" : VANILLA_UPSCALING ? "rayvox-benchmark-upscaling-v1" : ENTITIES ? "rayvox-benchmark-entities-v1" : DIRECTIONAL_GLASS ? "rayvox-benchmark-directional-glass"
             : DIRECTIONAL ? "rayvox-benchmark-directional" : "rayvox-benchmark-room-v3";
     private final long boot = System.nanoTime();
     // Opt-in captures with coarse native-reference quality checks. 103 seconds of planned phases.
-    private final List<Phase> phases = VANILLA_UPSCALING ? List.of(
+    private final List<Phase> phases = PLAYER_SHADOWS ? List.of(
+            new Phase("legacy-player-static",true,false,false,false,12,4,32,4,2),
+            new Phase("deferred-player-static",true,false,false,false,8,4,32,4,2),
+            new Phase("deferred-player-walk",true,false,false,true,6,4,32,4,2),
+            new Phase("deferred-player-crouch",true,false,false,false,6,4,32,4,2),
+            new Phase("deferred-player-first-person",true,false,false,false,6,4,32,4,2),
+            new Phase("deferred-player-reloaded",true,false,false,false,8,4,32,4,2)) : SURFACES ? List.of(
+            new Phase("legacy-surfaces-off", true, false, false, false, 12, 4, 32, 4, 10),
+            new Phase("legacy-surfaces-on", true, false, false, false, 8, 4, 32, 4, 10),
+            new Phase("deferred-surfaces-off", true, false, false, false, 8, 4, 32, 4, 10),
+            new Phase("deferred-surfaces-on", true, false, false, false, 8, 4, 32, 4, 10),
+            new Phase("deferred-surfaces-moving", true, false, false, true, 6, 4, 32, 4, 10),
+            new Phase("deferred-surfaces-reloaded", true, false, false, false, 8, 4, 32, 4, 10)) : SHADER_VULKAN ? List.of(
+            new Phase("shader-unlit",true,false,false,false,12,3),
+            new Phase("shader-shadows",true,false,false,false,8,3),
+            new Phase("shader-reflections",true,false,false,false,6,3),
+            new Phase("shader-moving",true,false,false,true,4,3),
+            new Phase("vulkan-resized",true,false,false,false,4,3),
+            new Phase("vulkan-reloaded",true,false,false,false,8,3),
+            new Phase("shader-disabled",false,false,false,false,2,2),
+            new Phase("shader-return",true,false,false,false,8,3)) : VANILLA_UPSCALING ? List.of(
             new Phase("native-static", false, 8, UpscalingMode.NATIVE, AntiAliasing.OFF, 0),
             new Phase("upscale-native-off", true, 6, UpscalingMode.NATIVE, AntiAliasing.OFF, 0),
             new Phase("upscale-native-fxaa", true, 3, UpscalingMode.NATIVE, AntiAliasing.FXAA, 0),
@@ -216,7 +239,8 @@ public final class ClientBenchmark {
                 preparing = true;
                 var server = mc.getSingleplayerServer();
                 setup = CompletableFuture.runAsync(() -> {
-                    if (DIRECTIONAL) prepareDirectional(server.overworld());
+                    if (PLAYER_SHADOWS) preparePlayerShadows(server.overworld());
+                    else if (DIRECTIONAL) prepareDirectional(server.overworld());
                     else prepareWorld(server.overworld());
                     if(VULKAN)prepareVulkanMaterials(server.overworld());
                     if (ENTITIES) {
@@ -234,9 +258,9 @@ public final class ClientBenchmark {
                     }
                     var player = server.getPlayerList().getPlayer(mc.player.getUUID());
                     if (player == null) throw new IllegalStateException("Integrated server player missing");
-                    player.setGameMode(HELD_PIPELINE ? GameType.CREATIVE : GameType.SPECTATOR);
-                    if (HELD_PIPELINE) { player.getAbilities().flying = true; player.onUpdateAbilities(); }
-                    player.teleportTo(server.overworld(), .5, DIRECTIONAL ? 68 : 66, DIRECTIONAL ? 28 : 13.5, 180, DIRECTIONAL ? 25 : 12);
+                    player.setGameMode(HELD_PIPELINE || PLAYER_SHADOWS ? GameType.CREATIVE : GameType.SPECTATOR);
+                    if (HELD_PIPELINE || PLAYER_SHADOWS) { player.getAbilities().flying = true; player.onUpdateAbilities(); }
+                    player.teleportTo(server.overworld(), .5, PLAYER_SHADOWS ? 65 : DIRECTIONAL ? 68 : 66, PLAYER_SHADOWS ? 10 : DIRECTIONAL ? 28 : 13.5, 180, DIRECTIONAL ? 25 : 12);
                 }, server);
             }
             if (!setup.isDone()) return;
@@ -250,9 +274,18 @@ public final class ClientBenchmark {
             }
             var current = phases.get(phase);
             if(VANILLA_VULKAN&&ENTITIES)mc.level.addParticle(net.minecraft.core.particles.ParticleTypes.FLAME,.5,66,8,0,.01,0);
-            double x = .5 + (current.moving ? Math.sin((ticks - phaseTick) * .035) * (DIRECTIONAL ? 24 : 6) : 0);
-            mc.player.setPos(x, DIRECTIONAL ? 68 : 66, DIRECTIONAL ? 28 : 13.5);
-            mc.player.setYRot(180); mc.player.setXRot(DIRECTIONAL ? 25 : 12);
+            double x = .5 + (current.moving ? Math.sin((ticks - phaseTick) * .035) * (PLAYER_SHADOWS ? 2 : DIRECTIONAL ? 24 : 6) : 0);
+            mc.player.setPos(x, PLAYER_SHADOWS ? 65 : DIRECTIONAL ? 68 : 66, PLAYER_SHADOWS ? 10 : DIRECTIONAL ? 28 : 13.5);
+            if(PLAYER_SHADOWS) {
+                boolean crouch=current.name.endsWith("crouch");
+                mc.options.keyShift.setDown(crouch);
+                mc.player.getAbilities().flying=!crouch;
+                if(crouch)mc.player.setOnGround(true);
+                mc.player.setShiftKeyDown(crouch);
+                mc.player.setPose(crouch?net.minecraft.world.entity.Pose.CROUCHING:net.minecraft.world.entity.Pose.STANDING);
+                mc.player.walkAnimation.update(current.moving?0.5f:0,0.4f);
+            }
+            mc.player.setYRot(PLAYER_SHADOWS && current.name.endsWith("first-person") ? 90 : 180); mc.player.setXRot(PLAYER_SHADOWS && current.name.endsWith("first-person") ? 45 : DIRECTIONAL ? 25 : 12);
             if (ENTITIES) {
                 double entityX = -4 + Math.sin(ticks * 0.08) * 2;
                 var server = mc.getSingleplayerServer();
@@ -267,12 +300,14 @@ public final class ClientBenchmark {
     private static void configure(Minecraft mc) {
         if(Boolean.getBoolean("rayvox.benchmark.requirePackaged")&&!Rayvox.class.getResource("Rayvox.class").toString().contains("rayvox-packaged.jar"))throw new IllegalStateException("Packaged benchmark loaded development Rayvox classes");
         // Saved interactive settings (or an interrupted upscaling run) must not contaminate native parity scenes.
-        if (VANILLA_VULKAN) {
+        if (VANILLA_VULKAN || SHADER_VULKAN) {
             Rayvox.ANTI_ALIASING.set(AntiAliasing.OFF);
             Rayvox.UPSCALING.set(UpscalingMode.NATIVE);
             Rayvox.UPSCALE_SHARPNESS.set(0);
         }
-        if(VULKAN)Rayvox.RENDER_BACKEND.set(VANILLA_VULKAN?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.VULKAN_PATH_TRACING);
+        if (SURFACES) { Rayvox.RENDER_BACKEND.set(BackendMode.OPENGL); verifySurfaceUploads(mc); }
+        if(!VULKAN)Rayvox.RENDER_BACKEND.set(BackendMode.OPENGL);
+        if(VULKAN)Rayvox.RENDER_BACKEND.set(SHADER_VULKAN?BackendMode.VULKAN_SHADER:VANILLA_VULKAN?BackendMode.VULKAN_VANILLA:BackendMode.VULKAN_PATH_TRACING);
         if (GLFW.glfwGetWindowAttrib(mc.getWindow().getWindow(), GLFW.GLFW_VISIBLE) != GLFW.GLFW_FALSE)
             throw new IllegalStateException("Benchmark window must be hidden");
         mc.options.pauseOnLostFocus = false;
@@ -286,6 +321,70 @@ public final class ClientBenchmark {
         mc.getWindow().updateVsync(false);
         mc.getWindow().setFramerateLimit(260);
         if (PIPELINE && !RayvoxEngine.profiling()) RayvoxEngine.toggleProfiling();
+    }
+
+    private static void verifySurfaceUploads(Minecraft mc) {
+        var atlas = mc.getModelManager().getAtlas(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS);
+        var sprite = atlas.getSprite(net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("minecraft", "block/iron_block"));
+        var contents = sprite.contents();
+        int active = glGetInteger(GL_ACTIVE_TEXTURE); glActiveTexture(GL_TEXTURE0);
+        int bound = glGetInteger(GL_TEXTURE_BINDING_2D), unpack = glGetInteger(GL_PIXEL_UNPACK_BUFFER_BINDING);
+        int row = glGetInteger(GL_UNPACK_ROW_LENGTH), skipX = glGetInteger(GL_UNPACK_SKIP_PIXELS);
+        int skipY = glGetInteger(GL_UNPACK_SKIP_ROWS), alignment = glGetInteger(GL_UNPACK_ALIGNMENT);
+        int testBuffer = glGenBuffers();
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, testBuffer); glBufferData(GL_PIXEL_UNPACK_BUFFER,64,GL_STATIC_DRAW);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH,37); glPixelStorei(GL_UNPACK_SKIP_PIXELS,2);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS,3); glPixelStorei(GL_UNPACK_ALIGNMENT,8);
+        try (var frame = new com.mojang.blaze3d.platform.NativeImage(contents.width(),contents.height(),false)) {
+            glBindTexture(GL_TEXTURE_2D,atlas.getId());
+            int surface = dev.rayvox.SurfaceAtlas.texture(atlas.getId());
+            if(surface==0)throw new IllegalStateException("Block surface atlas was not uploaded");
+            for(int phase=0;phase<3;phase++) {
+                for(int y=0;y<contents.height();y++)for(int x=0;x<contents.width();x++) {
+                    int value=phase==2?0xff808080:(x<contents.width()/2)==(phase==0)?0xff000000:0xffffffff;
+                    frame.setPixelRGBA(x,y,value);
+                }
+                long revision=dev.rayvox.SurfaceAtlas.revision();
+                dev.rayvox.SurfaceAtlas.upload(contents.name(),sprite.getX(),sprite.getY(),0,0,
+                        contents.width(),contents.height(),new com.mojang.blaze3d.platform.NativeImage[]{frame});
+                if(glGetInteger(GL_TEXTURE_BINDING_2D)!=atlas.getId()||glGetInteger(GL_PIXEL_UNPACK_BUFFER_BINDING)!=testBuffer
+                        ||glGetInteger(GL_UNPACK_ROW_LENGTH)!=37||glGetInteger(GL_UNPACK_SKIP_PIXELS)!=2
+                        ||glGetInteger(GL_UNPACK_SKIP_ROWS)!=3||glGetInteger(GL_UNPACK_ALIGNMENT)!=8)
+                    throw new IllegalStateException("Surface upload leaked GL bindings or pixel-store state");
+                if(dev.rayvox.SurfaceAtlas.revision()<=revision)throw new IllegalStateException("Animated surface did not update");
+                int[] pixel=surfacePixel(surface,sprite.getX()+contents.width()/2-1,sprite.getY());
+                if((phase==0&&pixel[0]>=128)||(phase==1&&pixel[0]<=128)||(phase==2&&pixel[0]!=128)||pixel[2]!=255)
+                    throw new IllegalStateException("Animated/interpolated surface upload mismatch: "+Arrays.toString(pixel));
+            }
+        } finally {
+            glBindTexture(GL_TEXTURE_2D,atlas.getId());
+            dev.rayvox.SurfaceAtlas.upload(contents.name(),sprite.getX(),sprite.getY(),0,0,
+                    contents.width(),contents.height(),contents.byMipLevel);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER,unpack);glDeleteBuffers(testBuffer);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH,row);glPixelStorei(GL_UNPACK_SKIP_PIXELS,skipX);
+            glPixelStorei(GL_UNPACK_SKIP_ROWS,skipY);glPixelStorei(GL_UNPACK_ALIGNMENT,alignment);
+            glBindTexture(GL_TEXTURE_2D,bound);glActiveTexture(active);
+        }
+    }
+
+    private static int[] surfacePixel(int texture,int x,int y) {
+        int bound=glGetInteger(GL_TEXTURE_BINDING_2D),pack=glGetInteger(GL_PIXEL_PACK_BUFFER_BINDING);
+        int row=glGetInteger(GL_PACK_ROW_LENGTH),skipX=glGetInteger(GL_PACK_SKIP_PIXELS),skipY=glGetInteger(GL_PACK_SKIP_ROWS);
+        int alignment=glGetInteger(GL_PACK_ALIGNMENT);
+        glBindTexture(GL_TEXTURE_2D,texture);
+        int width=glGetTexLevelParameteri(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH),height=glGetTexLevelParameteri(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT);
+        var pixels=org.lwjgl.system.MemoryUtil.memAlloc(width*height*4);
+        try {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER,0);glPixelStorei(GL_PACK_ROW_LENGTH,0);glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+            glPixelStorei(GL_PACK_SKIP_ROWS,0);glPixelStorei(GL_PACK_ALIGNMENT,1);
+            glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+            int offset=(y*width+x)*4;
+            return new int[]{pixels.get(offset)&255,pixels.get(offset+1)&255,pixels.get(offset+2)&255,pixels.get(offset+3)&255};
+        } finally {
+            org.lwjgl.system.MemoryUtil.memFree(pixels);glBindTexture(GL_TEXTURE_2D,bound);glBindBuffer(GL_PIXEL_PACK_BUFFER,pack);
+            glPixelStorei(GL_PACK_ROW_LENGTH,row);glPixelStorei(GL_PACK_SKIP_PIXELS,skipX);glPixelStorei(GL_PACK_SKIP_ROWS,skipY);
+            glPixelStorei(GL_PACK_ALIGNMENT,alignment);
+        }
     }
 
     private static void prepareWorld(ServerLevel world) {
@@ -310,6 +409,31 @@ public final class ClientBenchmark {
             world.setBlock(cursor.set(x, y, -7), Blocks.RED_STAINED_GLASS_PANE.defaultBlockState()
                     .setValue(BlockStateProperties.EAST, true).setValue(BlockStateProperties.WEST, true), 18);
         for (int x = -2; x <= 2; x++) world.setBlock(cursor.set(x, 65, -3), Blocks.STONE_SLAB.defaultBlockState(), 18);
+        if (SURFACES) {
+            var metals = new net.minecraft.world.level.block.Block[]{Blocks.IRON_BLOCK, Blocks.GOLD_BLOCK,
+                    Blocks.COPPER_BLOCK, Blocks.RAW_IRON_BLOCK, Blocks.OXIDIZED_COPPER, Blocks.NETHERITE_BLOCK};
+            for (int z=-15; z<=15; z++) for(int x=-15; x<=15; x++)
+                world.setBlock(cursor.set(x,64,z),metals[Math.floorMod(x / 4,metals.length)].defaultBlockState(),18);
+            for(int y=65;y<=69;y++) for(int x=-12;x<=12;x++)
+                world.setBlock(cursor.set(x,y,0),(x<0?Blocks.BLUE_CONCRETE:Blocks.RED_CONCRETE).defaultBlockState(),18);
+            var glassAndIce = new net.minecraft.world.level.block.Block[]{Blocks.GLASS, Blocks.LIGHT_BLUE_STAINED_GLASS,
+                    Blocks.ICE, Blocks.PACKED_ICE, Blocks.BLUE_ICE};
+            for(int i=0;i<glassAndIce.length;i++) for(int y=65;y<=66;y++) for(int dx=0;dx<2;dx++)
+                world.setBlock(cursor.set(-9+i*4+dx,y,5),glassAndIce[i].defaultBlockState(),18);
+            for(int y=65;y<=66;y++) world.setBlock(cursor.set(-12,y,5),Blocks.GLASS_PANE.defaultBlockState()
+                    .setValue(BlockStateProperties.EAST,true).setValue(BlockStateProperties.WEST,true),18);
+        }
+    }
+
+    private static void preparePlayerShadows(ServerLevel world) {
+        world.setDayTime(1000);world.setWeatherParameters(0,24000,false,false);
+        var cursor=new BlockPos.MutableBlockPos();
+        for(int z=-24;z<=24;z++)for(int x=-24;x<=24;x++)for(int y=64;y<=70;y++)
+            world.setBlock(cursor.set(x,y,z),(y==64?Blocks.WHITE_CONCRETE:Blocks.AIR).defaultBlockState(),18);
+        for(int x:new int[]{-4,4}) {
+            world.setBlock(cursor.set(x,65,8),Blocks.STONE_BRICKS.defaultBlockState(),18);
+            world.setBlock(cursor.set(x,66,8),Blocks.TORCH.defaultBlockState(),18);
+        }
     }
 
     private static void prepareDirectional(ServerLevel world) {
@@ -341,6 +465,7 @@ public final class ClientBenchmark {
             Rayvox.UPSCALE_SHARPNESS.set(config.upscaling.sharpness());
         }
         if(VANILLA_VULKAN)dev.rayvox.RenderBackends.requestMode(config.enabled?dev.rayvox.render.BackendMode.VULKAN_VANILLA:dev.rayvox.render.BackendMode.OPENGL);
+        if(SHADER_VULKAN)RenderBackends.requestMode(config.enabled?BackendMode.VULKAN_SHADER:BackendMode.OPENGL);
         if(VULKAN) {
             var client=Minecraft.getInstance();var server=client.getSingleplayerServer();
             if(config.name.equals("vulkan-edited"))setup=CompletableFuture.runAsync(()->server.overworld().setBlock(new BlockPos(0,65,6),Blocks.OBSIDIAN.defaultBlockState(),3),server);
@@ -356,6 +481,17 @@ public final class ClientBenchmark {
         }
         config.lastQualityLevel = RayvoxEngine.governorLevel();
         Rayvox.ENABLED.set(config.enabled); Rayvox.MATERIALS.set(config.materials); Rayvox.INDIRECT.set(config.indirect);
+        if(PLAYER_SHADOWS) {
+            var mc=Minecraft.getInstance();
+            mc.options.setCameraType(config.name.endsWith("first-person")?net.minecraft.client.CameraType.FIRST_PERSON:net.minecraft.client.CameraType.THIRD_PERSON_BACK);
+            Rayvox.ENTITY_SHADOWS.set(true);Rayvox.SHADOW_SOFTNESS.set(2);Rayvox.DYNAMIC.set(true);
+            if(config.name.endsWith("reloaded"))setup=mc.reloadResourcePacks();
+        }
+        if (SURFACES) {
+            Rayvox.TEXTURE_BUMP.set(!config.name.endsWith("off"));
+            Rayvox.METAL_REFLECTIONS.set(!config.name.endsWith("off"));
+            if (config.name.endsWith("reloaded")) setup = Minecraft.getInstance().reloadResourcePacks();
+        }
         Rayvox.WORLD_INDIRECT.set(WORLD_CACHE && config.name.startsWith("deferred-world-") && !config.name.endsWith("disabled"));
         Rayvox.HISTORY.set(!config.name.equals("reference-moving") && !config.name.equals("deferred-history-off"));
         Rayvox.PIPELINE.set(PIPELINE && config.name.startsWith("deferred-")
@@ -365,7 +501,7 @@ public final class ClientBenchmark {
         Rayvox.GOVERNOR_TARGET.set(GOVERNOR_PIPELINE && !config.name.equals("deferred-fixed-moving") ? 60 : 0);
         Rayvox.GOVERNOR_MIN.set(0); Rayvox.GOVERNOR_MAX.set(4);
         if (PIPELINE) { Rayvox.SHADOW_SOFTNESS.set(2); Rayvox.SHADOW_DRAW_DISTANCE.set(32); }
-        Rayvox.SHADOWS.set(true); Rayvox.SUNLIGHT.set(DIRECTIONAL); Rayvox.DYNAMIC.set(HELD_PIPELINE);
+        Rayvox.SHADOWS.set(true); Rayvox.SUNLIGHT.set(DIRECTIONAL); Rayvox.DYNAMIC.set(HELD_PIPELINE || PLAYER_SHADOWS);
         if (HELD_PIPELINE) {
             var mc = Minecraft.getInstance();
             boolean removed = config.name.endsWith("removed");
@@ -384,7 +520,7 @@ public final class ClientBenchmark {
             Rayvox.SHADOW_SOFTNESS.set(config.name.equals("entity-sharp") ? 0 : 2);
         }
         Rayvox.CACHE_RADIUS.set(2); Rayvox.ACTIVE_LIGHTS.set(config.limit); Rayvox.LIGHTS_PER_SECTION.set(config.perTile);
-        if (DIRECTIONAL && !VANILLA_UPSCALING) {
+        if (DIRECTIONAL && !PLAYER_SHADOWS && !VANILLA_UPSCALING && !SHADER_VULKAN) {
             var server = Minecraft.getInstance().getSingleplayerServer();
             setup = CompletableFuture.runAsync(() -> server.overworld().setDayTime(config.name.startsWith("moon-") ? 18000 : 6000), server);
         } else if (config.expectedLights == 64) {
@@ -405,6 +541,11 @@ public final class ClientBenchmark {
             if (config.name.equals("upscale-reloaded")) setup = client.reloadResourcePacks();
         }
         while (glGetError() != GL_NO_ERROR) { }
+        if(SHADER_VULKAN) {
+            Rayvox.SHADOWS.set(!config.name.equals("shader-unlit"));
+            Rayvox.SHADER_REFLECTIONS.set(!config.name.equals("shader-unlit")&&!config.name.equals("shader-shadows"));
+            Rayvox.UPSCALING.set(config.name.equals("vulkan-resized")||config.name.equals("vulkan-reloaded")?UpscalingMode.QUALITY:UpscalingMode.NATIVE);
+        }
         LogUtils.getLogger().info("Rayvox benchmark phase {}", config.name);
     }
 
@@ -420,6 +561,11 @@ public final class ClientBenchmark {
 
     private static void prepareVulkanMaterials(ServerLevel world) {
         var position=new BlockPos.MutableBlockPos();
+        if(SHADER_VULKAN) {
+            world.setDayTime(4000);
+            for(int x=-6;x<=6;x++)for(int z=12;z<=22;z++)world.setBlock(position.set(x,64,z),Blocks.WATER.defaultBlockState(),18);
+            for(int x=-4;x<=4;x++)for(int y=64;y<=75;y++)world.setBlock(position.set(x,y,11),(x<0?Blocks.RED_CONCRETE:Blocks.BLUE_CONCRETE).defaultBlockState(),18);
+        }
         if(SCENE.equals("vulkan-reflective")) {
             for(int x=-6;x<=6;x++)for(int z=-4;z<=6;z++)world.setBlock(position.set(x,64,z),
                     (x<0?Blocks.GOLD_BLOCK:Blocks.IRON_BLOCK).defaultBlockState(),18);
@@ -475,11 +621,20 @@ public final class ClientBenchmark {
         }
         poll();
         if (System.nanoTime() - phaseStart < phases.get(phase).warm * 1_000_000_000L) return;
-        if (VANILLA_UPSCALING && (!setup.isDone() || Minecraft.getInstance().getOverlay() != null)) return;
+        if ((VANILLA_UPSCALING || SURFACES || PLAYER_SHADOWS) && (!setup.isDone() || Minecraft.getInstance().getOverlay() != null)) return;
         // Keep initial chunk residency out of steady-state timing. The recorded
         // warm-up duration and source/artifact hashes identify the measured run.
         if(VULKAN&&dev.rayvox.RenderBackends.pendingSections()>0)return;
-        if (measuredStart == 0) measuredStart = System.nanoTime();
+        if (measuredStart == 0) {
+            // Resource reload replaces the pass objects and resets their draw counters.
+            if ((SURFACES || PLAYER_SHADOWS) && phases.get(phase).name.endsWith("reloaded")) {
+                phasePassDraws = RayvoxEngine.lightingPassDraws();
+                phaseIndirectDraws = RayvoxEngine.indirectPassDraws();
+                phaseCompositionDraws = RayvoxEngine.compositionPassDraws();
+                phaseDynamicDraws = RayvoxEngine.dynamicPassDraws();
+            }
+            measuredStart = System.nanoTime();
+        }
         framePhase = phase; renderStart = System.nanoTime();
         if (timers && !pending[nextQuery]) {
             activeQuery = nextQuery; nextQuery = (nextQuery + 1) % pending.length;
@@ -578,10 +733,26 @@ public final class ClientBenchmark {
                     if (WORLD_CACHE && !Rayvox.WORLD_INDIRECT.get() && RayvoxEngine.worldIndirectReadyBricks() != 0)
                         throw new IllegalStateException("Disabled world probes remained active");
                     if (error != GL_NO_ERROR) throw new IllegalStateException("OpenGL error in " + current.name + ": " + error);
+                    if (SURFACES && dev.rayvox.SurfaceAtlas.texture(mc.getModelManager().getAtlas(
+                            net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_BLOCKS).getId()) == 0)
+                        throw new IllegalStateException("Generated block surface atlas missing");
+                    if(PLAYER_SHADOWS && (RayvoxEngine.playerShadowPartCount()<6 || !RayvoxEngine.replacesEntityShadow(mc.player)))
+                        throw new IllegalStateException("Player model shadow missing or vanilla blob still active: "+RayvoxEngine.playerShadowPartCount());
                     Path screenshot = mc.gameDirectory.toPath().resolve(current.name + ".png");
                     var report = new LinkedHashMap<String, Object>();
                     if (VANILLA_UPSCALING) report.put("imageStats", captureUpscaling(current, screenshot));
                     else try (var image = Screenshot.takeScreenshot(mc.getMainRenderTarget())) { image.writeToFile(screenshot); }
+                    if (SURFACES) {
+                        report.put("textureBump", Rayvox.TEXTURE_BUMP.get());
+                        report.put("metalReflections", Rayvox.METAL_REFLECTIONS.get());
+                        report.put("surfaceRevision", dev.rayvox.SurfaceAtlas.revision());
+                    }
+                    if(PLAYER_SHADOWS) {
+                        report.put("playerShadowParts",RayvoxEngine.playerShadowPartCount());
+                        report.put("vanillaBlobReplaced",RayvoxEngine.replacesEntityShadow(mc.player));
+                        report.put("cameraType",mc.options.getCameraType().name());
+                        report.put("playerPose",mc.player.getPose().name());
+                    }
                     report.put("phase", current.name); report.put("engine", RayvoxEngine.status());
                     report.put("renderer",dev.rayvox.RenderBackends.status());
                     if(VULKAN)report.put("vulkan",dev.rayvox.RenderBackends.diagnostics());
@@ -591,9 +762,12 @@ public final class ClientBenchmark {
                         report.put("upscaleSharpness", Rayvox.UPSCALE_SHARPNESS.get());
                     }
                     if(VANILLA_UPSCALING)reportUpscaling(current, report);
-                    if(VULKAN)report.put("vulkanTimings",VANILLA_VULKAN?dev.rayvox.RenderBackends.rasterTimings():dev.rayvox.RenderBackends.timings());
+                    if(VULKAN)report.put("vulkanTimings",VANILLA_VULKAN||SHADER_VULKAN?dev.rayvox.RenderBackends.rasterTimings():dev.rayvox.RenderBackends.timings());
                     if(VULKAN)report.put("vulkanDynamicMeshes",dev.rayvox.RenderBackends.dynamicMeshCount());
                     if(VULKAN&&current.enabled&&!dev.rayvox.RenderBackends.active())throw new IllegalStateException("Vulkan benchmark fell back: "+dev.rayvox.RenderBackends.status());
+                    if(SHADER_VULKAN&&current.enabled&&(!RenderBackends.shaderLighting()||RenderBackends.pathTracing()||RenderBackends.rasterTimings().terrainDraws()==0||RenderBackends.raster().lightingPasses()==0))throw new IllegalStateException("Shader lighting did not execute on the Vulkan rasterizer");
+                    if(SHADER_VULKAN&&current.enabled)report.put("shaderLightingPasses",RenderBackends.raster().lightingPasses());
+                    if(SHADER_VULKAN&&RenderBackends.raster()!=null&&!RenderBackends.raster().validationMessages().isEmpty())throw new IllegalStateException("Shader lighting validation errors: "+RenderBackends.raster().validationMessages());
                     if(VANILLA_VULKAN&&current.enabled&&(dev.rayvox.RenderBackends.rasterTimings()==null||dev.rayvox.RenderBackends.rasterTimings().terrainDraws()==0))throw new IllegalStateException("Vulkan vanilla did not draw terrain");
                     if(VANILLA_VULKAN&&current.enabled&&ENTITIES&&(dev.rayvox.RenderBackends.rasterTimings().entityDraws()==0||dev.rayvox.RenderBackends.rasterTimings().particleDraws()==0))throw new IllegalStateException("Vulkan vanilla missed entity or particle draws");
                     if(VANILLA_VULKAN&&!VANILLA_UPSCALING&&current.name.equals("vanilla-vulkan-static")&&!ENTITIES)report.put("nativeImageDifference",compareImages(mc.gameDirectory.toPath().resolve("native-static.png"),screenshot));
@@ -874,7 +1048,7 @@ public final class ClientBenchmark {
         result.put("success", true); result.put("gpu", RayvoxEngine.gpu());
         result.put("width", mc.getMainRenderTarget().width); result.put("height", mc.getMainRenderTarget().height);
         result.put("renderDistance", mc.options.renderDistance().get()); result.put("phases", reports);
-        result.put("scene", VANILLA_UPSCALING ? "vulkan-vanilla-upscaling-v1" : WORLD_CACHE ? "world-cache-v1" : HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
+        result.put("scene", SHADER_VULKAN ? "vulkan-shader-v1" : VANILLA_UPSCALING ? "vulkan-vanilla-upscaling-v1" : WORLD_CACHE ? "world-cache-v1" : HELD_PIPELINE ? "pipeline-held-v1" : GOVERNOR_PIPELINE ? "pipeline-governor-v2" : INDIRECT_PIPELINE ? "pipeline-gi-v2" : PIPELINE ? "pipeline-v3" : TEMPORAL ? "temporal-v1" : ENTITIES ? "entities-v1" : DIRECTIONAL_GLASS ? "directional-glass-v1"
                 : DIRECTIONAL ? (DIRECTIONAL_MATERIALS ? "directional-v1" : "directional-basic-v1") : "fixed-room-v3"); result.put("seed", 42);
         if (VANILLA_UPSCALING) {
             result.put("plannedPhaseSeconds", phases.stream().mapToInt(p -> p.warm + p.seconds).sum());

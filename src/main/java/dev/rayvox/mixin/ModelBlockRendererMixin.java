@@ -16,6 +16,6 @@ abstract class ModelBlockRendererMixin {
             "Lcom/mojang/blaze3d/vertex/VertexConsumer;putBulkData(Lcom/mojang/blaze3d/vertex/PoseStack$Pose;Lnet/minecraft/client/renderer/block/model/BakedQuad;[FFFFF[IIZ)V"), index = 7)
     private int[] rayvox$emission(int[] lightmap, @Local(argsOnly = true) BlockAndTintGetter world,
             @Local(argsOnly = true) BlockState state, @Local(argsOnly = true) BlockPos position) {
-        return dev.rayvox.Rayvox.RENDER_BACKEND.get()==dev.rayvox.render.BackendMode.VULKAN_VANILLA?lightmap:EmissiveLight.encode(lightmap, state.getLightEmission(world, position));
+        return dev.rayvox.render.BackendSelection.raster(dev.rayvox.Rayvox.RENDER_BACKEND.get())?lightmap:EmissiveLight.encode(lightmap, state.getLightEmission(world, position));
     }
 }

@@ -15,7 +15,7 @@ final class RayvoxDebugScreen extends Screen {
         int columnWidth = Math.min(220, (width - 24) / 2);
         int x = (width - columnWidth * 2 - 8) / 2;
         int y = height - 176;
-        if(RenderBackends.active()||RenderBackends.selected()==dev.rayvox.render.BackendMode.VULKAN_VANILLA) {
+        if(RenderBackends.active()||dev.rayvox.render.BackendSelection.raster(RenderBackends.selected())) {
             addRenderableWidget(Button.builder(toggleLabel(),button->{Rayvox.ENABLED.set(!Rayvox.ENABLED.get());Rayvox.ENABLED.save();button.setMessage(toggleLabel());}).bounds(x,y,columnWidth,20).build());
             addRenderableWidget(Button.builder(Component.literal("Rendering settings..."),button->minecraft.setScreen(new RayvoxSettingsScreen(this))).bounds(x+columnWidth+8,y,columnWidth,20).build());
             addRenderableWidget(Button.builder(Component.literal("Close"),button->onClose()).bounds(x,y+144,columnWidth*2+8,20).build());
@@ -86,10 +86,10 @@ final class RayvoxDebugScreen extends Screen {
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         super.render(graphics, mouseX, mouseY, partialTick);
         graphics.drawString(font, title, 16, 16, 0xff8080);
-        if(RenderBackends.active()||RenderBackends.selected()==dev.rayvox.render.BackendMode.VULKAN_VANILLA) {
+        if(RenderBackends.active()||dev.rayvox.render.BackendSelection.raster(RenderBackends.selected())) {
             int lineY=36;
             String timings=RenderBackends.rasterTimings()!=null?RenderBackends.rasterTimings().toString():String.valueOf(RenderBackends.timings());
-            for(String line:new String[]{RenderBackends.status(),timings,RenderBackends.pathTracing()?"Realistic lighting: path tracing":"Vanilla lighting: Minecraft lightmaps, shading and fog"})
+            for(String line:new String[]{RenderBackends.status(),timings,RenderBackends.selected()==dev.rayvox.render.BackendMode.VULKAN_SHADER?"Shader lighting: raster sun/moon shadows and screen-space reflections; no path tracing":RenderBackends.pathTracing()?"Realistic lighting: path tracing":"Vanilla lighting: Minecraft lightmaps, shading and fog"})
                 for(var wrapped:font.split(Component.literal(line),Math.max(80,width-32))){graphics.drawString(font,wrapped,16,lineY,0xffffff);lineY+=11;}
             return;
         }
@@ -107,7 +107,7 @@ final class RayvoxDebugScreen extends Screen {
                         : "History reuse: green=reused static light, red=recomputed, blue=history unavailable/off",
                 "Light samples: static up to " + Rayvox.LIGHTS_PER_SECTION.get() + "; moving up to 4; sun 1; "
                         + (RayvoxEngine.shadowSoftness() > 0 ? "4 rays/sample (soft)" : "1 ray/sample (sharp)"),
-                "Entity shadow volumes: " + RayvoxEngine.entityShadowCount() + "/16 within 32 blocks; rounded body bounds",
+                "Entity shadow volumes: " + RayvoxEngine.entityShadowCount() + "/16 within 32 blocks; animated player model parts",
                 "DDA: 128 steps/ray; block ray length " + Rayvox.SHADOW_DISTANCE.get() + "; GI distance 6",
                 "Shadow draw distances: block " + Rayvox.SHADOW_DRAW_DISTANCE.get() + "; sky " + Rayvox.SUN_SHADOW_DISTANCE.get() + " blocks",
                 "GI: eight-sample accumulation, static sources only; deferred gather uses its own cadence; map-color reflectance",

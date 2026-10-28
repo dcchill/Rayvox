@@ -15,6 +15,8 @@ float historyNormalKey(vec3 normal) {
 // Inverse of historyNormalKey: axis keys 1..6, 22-bit octahedral keys from 7, optional sun-colour tag.
 vec3 historyNormal(float key) {
     if (key >= 8388608.0) key = float(uint(key) & 7u);
+    // Bumped axis faces carry a 16-bit shading-normal signature while decoding to the geometric face.
+    if (key >= 4194311.0 && key < 8388608.0) key = mod(key - 4194311.0, 8.0);
     if (key < 0.5) return vec3(0.0);
     if (key < 6.5) {
         int axis = int(key + 0.5);

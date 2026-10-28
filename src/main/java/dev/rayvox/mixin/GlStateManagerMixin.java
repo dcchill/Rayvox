@@ -14,7 +14,7 @@ abstract class GlStateManagerMixin {
     @Inject(method="_texParameter",at=@At("HEAD"))
     private static void rayvox$sampler(CallbackInfo ci){RasterHooks.nativeBoundary();RasterHooks.samplerChanged();}
     @Inject(method="_texImage2D",at=@At("HEAD"))
-    private static void rayvox$textureStorage(CallbackInfo ci){TextureSnapshots.deleted(TextureSnapshots.bound());}
+    private static void rayvox$textureStorage(CallbackInfo ci){TextureSnapshots.deleted(TextureSnapshots.bound());dev.rayvox.SurfaceAtlas.deleted(TextureSnapshots.bound());}
     @Inject(method="_bindTexture",at=@At("HEAD"))
     private static void rayvox$boundTexture(int texture,CallbackInfo ci){TextureSnapshots.bound(texture);}
 }

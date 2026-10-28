@@ -11,26 +11,26 @@ import static org.lwjgl.opengl.GL33C.*;
 final class TerrainShader extends ShaderInstance {
     GpuVoxelCache cache;
     GpuLightCache lights;
-    boolean drawing;
+    boolean drawing, translucent;
     long draws;
     LightingHistory history;
     GpuTimer timer;
     java.util.List<LightSourceManager.Light> dynamic = java.util.List.of();
-    java.util.List<net.minecraft.world.phys.AABB> entityCasters = java.util.List.of();
+    GpuEntityShadows entities;
     double cameraX, cameraY, cameraZ;
     DirectionalLight sun = DirectionalLight.OFF;
     LightSourceManager.Light budgetBoundary;
     MaterialTable materials;
-    private int previousShapes;
+    private int previousShapes, previousSurface, previousEntities;
+    private final int surfaceLocation, surfaceReadyLocation, bumpLocation, metalLocation, translucentLocation;
     private final float[] moving = new float[32];
     private final SectionLightUniforms sectionUniforms;
     private final int shapesLocation, advancedLocation, indirectLocation, transmissionLocation, budgetLocation;
     private final int sunLocation, sunRadianceLocation, dynamicCountLocation, dynamicRecordsLocation, historyValidLocation, deferredLocation;
-    private final int entityCountLocation, entityRecordsLocation, softnessLocation;
+    private final int entityCountLocation, entityDataLocation, softnessLocation;
     private final int culledLocation;
     private final int cullingDisabledLocation;
     private final int historyAvailableLocation;
-    private final float[] entities = new float[EntityShadows.MAX_CASTERS * 8];
     private final float[] distant = new float[LightSourceManager.PER_SECTION * 8];
     private final int[] locations = new int[4];
     private final int[] previous = new int[4];
@@ -48,6 +48,11 @@ final class TerrainShader extends ShaderInstance {
         String[] names = {"VoxelData", "VoxelState", "LightData", "LightLists"};
         for (int i = 0; i < 4; i++) locations[i] = glGetUniformLocation(getId(), names[i]);
         sectionUniforms = new SectionLightUniforms(getId());
+        surfaceLocation = glGetUniformLocation(getId(), "SurfaceAtlas");
+        surfaceReadyLocation = glGetUniformLocation(getId(), "SurfaceReady");
+        bumpLocation = glGetUniformLocation(getId(), "TextureBump");
+        metalLocation = glGetUniformLocation(getId(), "MetalReflections");
+        translucentLocation = glGetUniformLocation(getId(), "TranslucentSurface");
         shapesLocation = glGetUniformLocation(getId(), "VoxelShapes");
         advancedLocation = glGetUniformLocation(getId(), "AdvancedMaterials");
         indirectLocation = glGetUniformLocation(getId(), "IndirectEnabled");
@@ -60,7 +65,7 @@ final class TerrainShader extends ShaderInstance {
         deferredLocation = glGetUniformLocation(getId(), "DeferredLighting");
         budgetLocation = glGetUniformLocation(getId(), "ShadowBudget");
         entityCountLocation = glGetUniformLocation(getId(), "EntityCount");
-        entityRecordsLocation = glGetUniformLocation(getId(), "EntityRecords[0]");
+        entityDataLocation = glGetUniformLocation(getId(), "EntityData");
         softnessLocation = glGetUniformLocation(getId(), "ShadowSoftness");
         culledLocation = glGetUniformLocation(getId(), "CulledLights");
         cullingDisabledLocation = glGetUniformLocation(getId(), "CullingDisabled");
@@ -82,9 +87,26 @@ final class TerrainShader extends ShaderInstance {
     @Override
     public void apply() {
         super.apply();
+        glUniform1i(translucentLocation, translucent ? 1 : 0);
         glUniform1i(cullingDisabledLocation, Rayvox.CULLING.get() ? 0 : 1);
         glUniform2i(culledLocation, RayvoxEngine.culledLightsLow(), RayvoxEngine.culledLightsHigh());
         int active = glGetInteger(GL_ACTIVE_TEXTURE);
+        glActiveTexture(GL_TEXTURE12);
+        previousEntities = glGetInteger(GL_TEXTURE_BINDING_2D);
+        glBindTexture(GL_TEXTURE_2D, entities == null ? 0 : entities.texture);
+        glUniform1i(entityDataLocation,12);
+        glUniform1i(entityCountLocation,entities == null ? 0 : entities.count);
+        if (surfaceLocation >= 0) {
+            glActiveTexture(GL_TEXTURE0);
+            int surface = SurfaceAtlas.texture(glGetInteger(GL_TEXTURE_BINDING_2D));
+            glActiveTexture(GL_TEXTURE11);
+            previousSurface = glGetInteger(GL_TEXTURE_BINDING_2D);
+            glBindTexture(GL_TEXTURE_2D, surface);
+            glUniform1i(surfaceLocation, 11);
+            glUniform1i(surfaceReadyLocation, surface != 0 ? 1 : 0);
+            glUniform1i(bumpLocation, Rayvox.TEXTURE_BUMP.get() ? 1 : 0);
+            glUniform1i(metalLocation, Rayvox.METAL_REFLECTIONS.get() ? 1 : 0);
+        }
         for (int i = 0; i < 4; i++) {
             glActiveTexture(GL_TEXTURE3 + i);
             int target = i < 2 ? GL_TEXTURE_3D : GL_TEXTURE_2D;
@@ -115,9 +137,6 @@ final class TerrainShader extends ShaderInstance {
         glUniform4f(sunLocation, sun.x(), sun.y(), sun.z(), sun.strength());
         glUniform3f(sunRadianceLocation, sun.red(), sun.green(), sun.blue());
         glUniform1i(softnessLocation, RayvoxEngine.shadowSoftness());
-        int entityCount = packEntities(entityCasters, cameraX, cameraY, cameraZ, entities);
-        glUniform1i(entityCountLocation, entityCount);
-        if (entityCount > 0) glUniform4fv(entityRecordsLocation, entities);
         if (budgetBoundary == null) glUniform4f(budgetLocation, 0, 0, 0, 0);
         else glUniform4f(budgetLocation, (float)(budgetBoundary.x() - cameraX),
                 (float)(budgetBoundary.y() - cameraY), (float)(budgetBoundary.z() - cameraZ), 1);
@@ -147,27 +166,6 @@ final class TerrainShader extends ShaderInstance {
         return count;
     }
 
-    /** Camera-relative entity caster records shared by terrain shading and the deferred pass. */
-    static int packEntities(java.util.List<net.minecraft.world.phys.AABB> casters, double cameraX, double cameraY,
-            double cameraZ, float[] out) {
-        int count = Rayvox.ENTITY_SHADOWS.get() ? Math.min(EntityShadows.MAX_CASTERS, casters.size()) : 0;
-        var camera = new net.minecraft.world.phys.Vec3(cameraX, cameraY, cameraZ);
-        for (int i = 0; i < count; i++) {
-            var bounds = casters.get(i);
-            var center = bounds.getCenter();
-            int offset = i * 8;
-            out[offset] = (float)(center.x - cameraX);
-            out[offset + 1] = (float)(center.y - cameraY);
-            out[offset + 2] = (float)(center.z - cameraZ);
-            out[offset + 3] = EntityShadows.weight(bounds, casters, camera);
-            out[offset + 4] = (float)Math.max(0.025, bounds.getXsize() * 0.5);
-            out[offset + 5] = (float)Math.max(0.025, bounds.getYsize() * 0.5);
-            out[offset + 6] = (float)Math.max(0.025, bounds.getZsize() * 0.5);
-            out[offset + 7] = 0;
-        }
-        return count;
-    }
-
     void section(java.util.List<LightSourceManager.Light> selected, LightSourceManager manager, boolean ready, double x, double y, double z) {
         int count = Math.min(LightSourceManager.PER_SECTION, selected.size());
         for (int i = 0; i < count; i++) {
@@ -191,6 +189,12 @@ final class TerrainShader extends ShaderInstance {
         if (timer != null) timer.end();
         if (history != null) history.detach();
         int savedActive = glGetInteger(GL_ACTIVE_TEXTURE);
+        glActiveTexture(GL_TEXTURE12);
+        glBindTexture(GL_TEXTURE_2D,previousEntities);
+        if (surfaceLocation >= 0) {
+            glActiveTexture(GL_TEXTURE11);
+            glBindTexture(GL_TEXTURE_2D, previousSurface);
+        }
         glActiveTexture(GL_TEXTURE9);
         glBindTexture(GL_TEXTURE_3D, previousShapes);
         glActiveTexture(savedActive);

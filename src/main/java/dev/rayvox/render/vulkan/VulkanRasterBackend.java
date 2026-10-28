@@ -18,6 +18,9 @@ import static dev.rayvox.render.vulkan.VulkanContext.check;
 public final class VulkanRasterBackend implements RenderBackend {
     private static final int MAX_DRAWS=8192,MAX_BATCHES=1024;
     private final long memoryBudget;
+    private final boolean shaderLighting;
+    private ShaderLighting lighting;
+    private long lightingPasses;
     private VulkanContext context;
     private SharedSurface surface;
     private int framebuffer;
@@ -61,10 +64,11 @@ public final class VulkanRasterBackend implements RenderBackend {
             try(var stack=MemoryStack.stackPush()) {
                 var out=stack.mallocLong(1);
                 check(vkCreateFence(context.device,VkFenceCreateInfo.calloc(stack).sType$Default().flags(VK_FENCE_CREATE_SIGNALED_BIT),null,out),"create raster fence");fence=out.get(0);
-                var sizes=VkDescriptorPoolSize.calloc(2,stack);
-                sizes.get(0).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(MAX_DRAWS);
-                sizes.get(1).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(MAX_DRAWS*3);
-                check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(MAX_DRAWS).pPoolSizes(sizes),null,out),"create raster descriptors");pool=out.get(0);
+                var sizes=VkDescriptorPoolSize.calloc(shaderLighting?3:2,stack);
+                sizes.get(0).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(MAX_DRAWS+1);
+                sizes.get(1).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(MAX_DRAWS*3+1024);
+                if(shaderLighting)sizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
+                check(vkCreateDescriptorPool(context.device,VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(MAX_DRAWS+1024).pPoolSizes(sizes),null,out),"create raster descriptors");pool=out.get(0);
                 upload=context.buffer(32L*1048576,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,true);
                 if(context.timestampBits!=0){check(vkCreateQueryPool(context.device,VkQueryPoolCreateInfo.calloc(stack).sType$Default().queryType(VK_QUERY_TYPE_TIMESTAMP).queryCount(MAX_BATCHES*2),null,out),"create raster timestamps");query=out.get(0);}
             }catch(RuntimeException|Error failure){close();throw failure;}
@@ -106,10 +110,14 @@ public final class VulkanRasterBackend implements RenderBackend {
             if(fence!=0){vkDestroyFence(context.device,fence,null);fence=0;}
         }
     }
-    public VulkanRasterBackend(long memoryBudget){this.memoryBudget=memoryBudget;}
+    public VulkanRasterBackend(long memoryBudget){this(memoryBudget,false);}
+    public VulkanRasterBackend(long memoryBudget,boolean shaderLighting){this.memoryBudget=memoryBudget;this.shaderLighting=shaderLighting;}
+    public boolean shaderLighting(){return shaderLighting;}
+    public long lightingPasses(){return lightingPasses;}
     public void initialize() {
         try {
             context=new VulkanContext(SharedSurface.deviceUuid(),Boolean.getBoolean("rayvox.vulkan.validation"),false);context.budget=memoryBudget;
+            if(shaderLighting)lighting=new ShaderLighting(context,retired);
             try(var stack=MemoryStack.stackPush()) {
                 var props=VkPhysicalDeviceProperties.calloc(stack);vkGetPhysicalDeviceProperties(context.physical,props);uniformAlignment=(int)props.limits().minUniformBufferOffsetAlignment();
                 var bindings=VkDescriptorSetLayoutBinding.calloc(4,stack);
@@ -133,6 +141,7 @@ public final class VulkanRasterBackend implements RenderBackend {
         // Resolve/detach restores native dimensions before any next-frame sizing decisions.
         detach();resize(main.width,main.height);
         long start=System.nanoTime();frame=frames[slot];frame.complete();waitMillis=(System.nanoTime()-start)/1e6;serial++;
+        if(lighting!=null)lighting.beginFrame();
         attach(main);
     }
     public void endFrame() {
@@ -161,7 +170,7 @@ public final class VulkanRasterBackend implements RenderBackend {
             var key=new PipelineKey(shader.getId(),mesh.state().format(),state);
             var pipeline=pipelines.get(key);
             if(pipeline==null) {
-                var port=shaders.computeIfAbsent(shader.getId(),id->new RasterShader(shaderSource(id,GL_VERTEX_SHADER),shaderSource(id,GL_FRAGMENT_SHADER),mesh.state().format().getElementAttributeNames()));
+                var port=shaders.computeIfAbsent(shader.getId(),id->new RasterShader(shaderSource(id,GL_VERTEX_SHADER),shaderSource(id,GL_FRAGMENT_SHADER),mesh.state().format().getElementAttributeNames(),shaderLighting,shader.getName().equals("rendertype_translucent")?.8f:shader.getName().equals("rendertype_solid")?.12f:0));
                 pipeline=new RasterPipeline(context,pipelineLayout,port,mesh.state().format(),state);pipelines.put(key,pipeline);
             }
             int[] ids=new int[3];var samplers=new RasterSampler[3];int active=glGetInteger(GL_ACTIVE_TEXTURE);
@@ -196,6 +205,7 @@ public final class VulkanRasterBackend implements RenderBackend {
             if(glIsEnabled(GL_SCISSOR_TEST))glGetIntegerv(GL_SCISSOR_BOX,scissor);
             float[] blend=new float[4];glGetFloatv(org.lwjgl.opengl.EXTBlendColor.GL_BLEND_COLOR_EXT,blend);
             draws.add(new Draw(pipeline,gpu,uniforms,ids,samplers,viewport,scissor,blend));frame.drawCount++;
+            if(lighting!=null)lighting.capture(mesh,shader,ids[0],frame);
             if(shader.getName().startsWith("rendertype_entity")||shader.getName().equals("rendertype_eyes"))frame.entityDraws++;
             if(shader.getName().equals("particle"))frame.particleDraws++;
             return true;
@@ -229,8 +239,11 @@ public final class VulkanRasterBackend implements RenderBackend {
             uploads.clear();frame.upload.flush();for(var buffer:frame.buffers)buffer.flush();
             VulkanContext.memoryBarrier(command,VK_PIPELINE_STAGE_TRANSFER_BIT|VK_PIPELINE_STAGE_HOST_BIT,VK_ACCESS_TRANSFER_WRITE_BIT|VK_ACCESS_HOST_WRITE_BIT,VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_INDEX_READ_BIT|VK_ACCESS_UNIFORM_READ_BIT|VK_ACCESS_SHADER_READ_BIT);
             surface.signalComplete();surface.acquire(command);
+            if(lighting!=null)lighting.prepareSurfaces(command);
             try(var stack=MemoryStack.stackPush()) {
-                var color=VkRenderingAttachmentInfo.calloc(1,stack).sType$Default().imageView(surface.color.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                var color=VkRenderingAttachmentInfo.calloc(shaderLighting?2:1,stack);
+                color.get(0).sType$Default().imageView(surface.color.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
+                if(lighting!=null)color.get(1).sType$Default().imageView(lighting.surfaces.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 var depth=VkRenderingAttachmentInfo.calloc(stack).sType$Default().imageView(surface.depth.view).imageLayout(VK_IMAGE_LAYOUT_GENERAL).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD).storeOp(VK_ATTACHMENT_STORE_OP_STORE);
                 var rendering=VkRenderingInfo.calloc(stack).sType$Default().layerCount(1).pColorAttachments(color).pDepthAttachment(depth);rendering.renderArea().extent().set(surface.color.width,surface.color.height);
                 vkCmdBeginRendering(command,rendering);
@@ -277,6 +290,7 @@ public final class VulkanRasterBackend implements RenderBackend {
             // Keep external-image tile row pitches identical across the two drivers. Logical
             // viewports stay exact; padding is excluded from every color/depth sample.
             surface=new SharedSurface(context,(internalWidth+63)&~63,(internalHeight+63)&~63,true);surface.initializeRaster();framebuffer=glGenFramebuffers();
+            if(lighting!=null)lighting.resize(surface.color.width,surface.color.height);
             int read=glGetInteger(GL_READ_FRAMEBUFFER_BINDING),draw=glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);glBindFramebuffer(GL_FRAMEBUFFER,framebuffer);
             glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,surface.colorTexture,0);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,surface.depthTexture,0);
             int status=glCheckFramebufferStatus(GL_FRAMEBUFFER);glBindFramebuffer(GL_READ_FRAMEBUFFER,read);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw);
@@ -295,6 +309,29 @@ public final class VulkanRasterBackend implements RenderBackend {
         }finally{internal=false;}
     }
     public void beforeTargetChange(RenderTarget changed){if(changed==target)detach();}
+    public void resolveWorld() {
+        if(lighting!=null&&lighting.ready()&&frame!=null&&target!=null) {
+            flush();internal=true;
+            try {
+                var command=frame.command();context.begin(command);
+                int query=frame.query!=0&&frame.batches<MAX_BATCHES?frame.batches*2:-1;
+                if(query>=0){vkCmdResetQueryPool(command,frame.query,query,2);vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,frame.query,query);}
+                surface.signalComplete();surface.acquire(command);
+                VulkanContext.memoryBarrier(command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
+                lighting.record(command,frame,textures,surface,internalWidth,internalHeight,uniformAlignment);
+                surface.release(command);
+                if(query>=0){vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,frame.query,query+1);frame.batches++;}
+                check(vkEndCommandBuffer(command),"end shader lighting");
+                try(var stack=MemoryStack.stackPush()) {
+                    var submit=VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(command.address())).pWaitSemaphores(stack.longs(surface.complete)).pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)).pSignalSemaphores(stack.longs(surface.ready));
+                    check(vkQueueSubmit(context.queue,submit,0),"submit shader lighting");
+                    lightingPasses++;
+                }
+                surface.waitForVulkan();
+            }finally{internal=false;}
+        }
+        detach();
+    }
     public void detach() {
         if(target==null)return;
         flush();internal=true;
@@ -327,19 +364,21 @@ public final class VulkanRasterBackend implements RenderBackend {
     public void reload() {
         detach();drain();for(var mesh:geometry.values()){mesh.vertices().buffer().close();mesh.indices().buffer().close();}geometry.clear();
         retired.complete(Long.MAX_VALUE);for(var pipeline:pipelines.values())pipeline.close();pipelines.clear();shaders.clear();samplerUnits.clear();unsupported.clear();samplerStates.clear();textures.close();TextureSnapshots.clear();
+        if(lighting!=null)lighting.clear();
     }
     public record Timings(double gpuMs,double fenceWaitMs,int draws,int batches,int entityDraws,int particleDraws){public int terrainDraws(){return draws-entityDraws-particleDraws;}}
     public Timings timings(){return new Timings(gpuMillis,waitMillis,lastDraws,lastBatches,lastEntityDraws,lastParticleDraws);}
     public boolean rayTracingSupported(){return context.rayTracingSupported;}
     public List<String> validationMessages(){synchronized(context.validationMessages){return List.copyOf(context.validationMessages);}}
-    public void update(Scene.Update update){}
-    public void render(Scene.Camera camera){}
-    public Diagnostics diagnostics(){return new Diagnostics("Vulkan vanilla",context==null?"uninitialized":context.name,reason,surface==null?0:internalWidth,surface==null?0:internalHeight,gpuMillis,context==null?0:context.allocated,geometry.size(),draws.size());}
+    public void update(Scene.Update update){if(lighting!=null)lighting.update(update,serial);}
+    public void render(Scene.Camera camera){if(lighting!=null)lighting.camera(camera);}
+    public Diagnostics diagnostics(){return new Diagnostics(shaderLighting?"Vulkan shader lighting":"Vulkan vanilla",context==null?"uninitialized":context.name,reason,surface==null?0:internalWidth,surface==null?0:internalHeight,gpuMillis,context==null?0:context.allocated,geometry.size(),draws.size());}
     public void close() {
         if(context==null)return;
         detach();drain();retired.complete(Long.MAX_VALUE);
         for(var gpu:geometry.values()){gpu.vertices().buffer().close();gpu.indices().buffer().close();}geometry.clear();
         for(var slot:frames)if(slot!=null)slot.close();for(var pipeline:pipelines.values())pipeline.close();pipelines.clear();
+        if(lighting!=null){lighting.close();lighting=null;}
         if(textures!=null)textures.close();if(depthCopy!=null)depthCopy.close();if(worldResolve!=null)worldResolve.close();if(framebuffer!=0){glDeleteFramebuffers(framebuffer);framebuffer=0;}if(surface!=null){surface.close();surface=null;}
         if(pipelineLayout!=0)vkDestroyPipelineLayout(context.device,pipelineLayout,null);if(descriptorLayout!=0)vkDestroyDescriptorSetLayout(context.device,descriptorLayout,null);
         context.close();context=null;

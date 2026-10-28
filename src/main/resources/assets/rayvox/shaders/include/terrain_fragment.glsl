@@ -1,6 +1,10 @@
 #moj_import <minecraft:fog.glsl>
 
 uniform sampler2D Sampler0;
+uniform sampler2D SurfaceAtlas;
+uniform int SurfaceReady;
+uniform int TextureBump;
+uniform int TranslucentSurface;
 uniform vec4 ColorModulator;
 uniform float FogStart;
 uniform float FogEnd;
@@ -108,6 +112,10 @@ vec3 staticVisibility(vec3 origin, vec3 target, int index, bool shadows, bool oc
 }
 
 #moj_import <rayvox:indirect.glsl>
+#moj_import <rayvox:surface_material.glsl>
+#moj_import <rayvox:surface_reflection.glsl>
+#define RAYVOX_TERRAIN_ENTITY_LIGHTING
+#moj_import <rayvox:entity_lighting.glsl>
 
 void main() {
     cachedLight = vec4(0.0);
@@ -119,10 +127,23 @@ void main() {
     geometryAlbedo = vec4(0.0);
     vec4 albedo = texture(Sampler0, texCoord0) * vertexColor * ColorModulator;
     float alpha = albedo.a * vanillaLight.a;
-    if (alpha < AlphaCutoff) discard;
+    vec3 geometricNormal = surfaceNormal / max(length(surfaceNormal), 0.0001);
+    vec4 surface = SurfaceReady != 0 && (TextureBump != 0 || MetalReflections != 0) ? texture(SurfaceAtlas, texCoord0) : vec4(vec3(128.0 / 255.0), 1);
+    vec3 shadingNormal = TextureBump != 0 ? textureSurfaceNormal(geometricNormal, surfacePosition, texCoord0, surface.rg) : geometricNormal;
+    vec2 material = vec2(MetalReflections != 0 ? surfaceResponse(surface.b) : 0.0, max(surface.a, 0.08));
+    if (alpha < AlphaCutoff && !(TranslucentSurface != 0 && material.x < 0.0)) discard;
     // Fully opaque fog replaces RGB completely; retain the alpha test and skip invisible lighting work.
     if (DebugMode == 0 && vertexDistance > FogStart && vertexDistance >= FogEnd && FogColor.a == 1.0) {
         fragColor = vec4(FogColor.rgb, alpha);
+        return;
+    }
+
+    if (TranslucentSurface != 0) {
+        vec3 position = surfacePosition + CameraFraction + vec3(CameraInCache);
+        vec3 reflection = material.x < 0.0 ? surfaceReflection(position, geometricNormal, shadingNormal, toLinear(albedo.rgb), material) : vec3(0.0);
+        vec4 color = translucentSurfaceColor(vec4(albedo.rgb * vanillaLight.rgb, alpha), reflection);
+        if (color.a < 0.001) discard;
+        fragColor = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
         return;
     }
 
@@ -154,12 +175,16 @@ void main() {
     vec3 normal = surfaceNormal / max(length(surfaceNormal), 0.0001);
     vec3 localPosition = surfacePosition + CameraFraction + vec3(CameraInCache);
     float face = historyNormalKey(normal);
+    bool bumped = TextureBump != 0 && SurfaceReady != 0;
+    // shortcut: bumped slopes bypass reuse; add a separate signature attachment if sloped-model reuse matters.
+    bool bumpedSlope = bumped && face > 6.0;
+    if (bumped && !bumpedSlope) face = 4194311.0 + face + 8.0 * surfacePair(surfaceOct(shadingNormal));
     vec4 receiver = vec4(localPosition, face);
     ivec2 pixel = ivec2(0);
     bool projected = HistoryValid != 0 && historyPixel(surfacePosition, pixel);
     float footprint = max(length(dFdx(localPosition)), length(dFdy(localPosition)));
     vec4 prior = HistoryValid != 0 && projected ? texelFetch(HistoryKey, pixel, 0) : vec4(0.0);
-    bool matchedSurface = HistoryValid != 0 && projected && historySurface(prior, localPosition, normal, face, footprint);
+    bool matchedSurface = !bumpedSlope && HistoryValid != 0 && projected && historySurface(prior, localPosition, normal, face, footprint);
     bool deferred = DeferredLighting != 0;
     // Legacy history is exact-revision; deferred history remains geometry-valid and tracks staleness per pixel.
     bool reused = matchedSurface && !deferred;
@@ -209,16 +234,17 @@ void main() {
                 }
             }
             // Ray-free terms the pass cannot rebuild: per-section far records and which list entries they match.
-            for (int i = 0; i < 8 && deferredState != 0; i++) {
+            for (int i = 0; i < 8 && (deferredState != 0 || EntityCount > 0); i++) {
                 if (i >= count) break;
                 int index = int(texelFetch(LightLists, ivec2(column + i + 1, row), 0).r);
                 if (lightCulled(index)) continue;
                 vec4 light = texelFetch(LightData, ivec2(0, index), 0);
                 vec4 radiance = texelFetch(LightData, ivec2(1, index), 0);
-                vec3 contribution = nearContribution(light, radiance, anchor, normal);
+                vec3 contribution = nearContribution(light, radiance, anchor, shadingNormal);
                 if (all(equal(contribution, vec3(0.0)))) continue;
                 bool matched = FarReady != 0 && farMatched(index);
                 if (matched) farMask += exp2(float(i));
+                if (deferredState == 0) continue;
                 float weight = staticWeight(light.xyz, FarReady != 0, matched);
                 if (weight <= 0.0) continue;
                 if (matched) farBase -= contribution * weight;
@@ -228,7 +254,7 @@ void main() {
         if (deferredState != 0 && FarReady != 0) {
             for (int i = 0; i < 8; i++) {
                 if (i >= FarLightCount) break;
-                farBase += nearContribution(FarLightRecords[i * 2], FarLightRecords[i * 2 + 1], anchorSurface, normal);
+                farBase += nearContribution(FarLightRecords[i * 2], FarLightRecords[i * 2 + 1], anchorSurface, shadingNormal);
             }
         }
         if (deferredState == 2) {
@@ -278,7 +304,7 @@ void main() {
             if (dot(toLight, toLight) >= light.w * light.w || dot(normal, toLight) <= 0.0) continue;
             float distanceToLight = length(toLight);
             float falloff = max(1.0 - distanceToLight / max(light.w, 0.001), 0.0);
-            float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+            float diffuse = max(dot(shadingNormal, toLight / max(distanceToLight, 0.0001)), 0.0);
             if (falloff <= 0.0 || diffuse <= 0.0) continue;
             vec3 visibility = staticVisibility(localPosition + normal * 0.03, light.xyz, index,
                     ShadowsEnabled != 0 && radiance.w > 0.5, tileOccluded(header, i));
@@ -294,7 +320,7 @@ void main() {
             if (dot(toLight, toLight) >= light.w * light.w || dot(normal, toLight) <= 0.0) continue;
             float distanceToLight = length(toLight);
             float falloff = max(1.0 - distanceToLight / max(light.w, 0.001), 0.0);
-            float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+            float diffuse = max(dot(shadingNormal, toLight / max(distanceToLight, 0.0001)), 0.0);
             farDirect += FarLightRecords[i * 2 + 1].rgb * (falloff * falloff * diffuse);
         }
         direct = max(farDirect + direct, vec3(0.0));
@@ -316,7 +342,7 @@ void main() {
             }
         } else {
             vec3 origin = localPosition + normal * 0.03;
-            sunTransmission = softDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
+            sunTransmission = softWorldDirectionalTransmission(origin, origin + SunDirection.xyz * SunShadowDistance,
                     CameraFraction + vec3(CameraInCache), SunShadowDistance);
             sunlight = dot(sunTransmission, vec3(1.0 / 3.0));
             if (AdvancedMaterials != 0 && any(notEqual(sunTransmission, sunTransmission.rrr))) {
@@ -349,10 +375,10 @@ void main() {
         if (dot(toLight, toLight) >= light.w * light.w || dot(normal, toLight) <= 0.0) continue;
         float distanceToLight = length(toLight);
         float falloff = max(1.0 - distanceToLight / max(light.w, 0.001), 0.0);
-        float diffuse = max(dot(normal, toLight / max(distanceToLight, 0.0001)), 0.0);
+        float diffuse = max(dot(shadingNormal, toLight / max(distanceToLight, 0.0001)), 0.0);
         vec3 visibility = vec3(1.0);
         if (ShadowsEnabled != 0 && radiance.w > 0.5 && falloff * diffuse > 0.0)
-            visibility = blockVisibility(localPosition + normal * 0.03, light.xyz + CameraFraction + vec3(CameraInCache));
+            visibility = blockVisibilityCurrent(localPosition + normal * 0.03, light.xyz + CameraFraction + vec3(CameraInCache));
         direct += radiance.rgb * (falloff * falloff * diffuse * visibility);
     }
     vec3 base = mix(toLinear(vanillaLight.rgb), toLinear(skyLight.rgb), FarReady != 0 ? 1.0 : replacement);
@@ -361,7 +387,13 @@ void main() {
                 ? smoothstep(FogStart, FogEnd, vertexDistance) : 1.0;
         geometryBase = vec4(toSrgb(base), replacement);
         geometryEmission = vec4(sourceLight, fog * FogColor.a);
-        geometryAlbedo = vec4(albedo.rgb, alpha);
+        geometryAlbedo = packSurface(vec4(albedo.rgb, alpha), shadingNormal, material);
+    }
+    if (!deferred) {
+        direct=max(direct-entityDirectOcclusion(localPosition,normal,shadingNormal,0.0),vec3(0));
+#ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
+        sunTransmission=max(sunTransmission-entitySunOcclusion(localPosition,normal,shadingNormal),vec3(0));
+#endif
     }
     if (DebugMode == 6) {
         if (HistoryAvailable == 0) {
@@ -385,10 +417,14 @@ void main() {
     }
     // Source budgets and dirty flags must never switch vanilla block lighting back on under RGB shadows.
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
-    base = sunlitBase(base, normal, sunTransmission, length(surfacePosition));
+    base = sunlitBase(base, shadingNormal, sunTransmission, length(surfacePosition));
 #endif
     // A source's own glow is independent of diffuse normals, occlusion and source-list budgets.
     vec3 illumination = max(max(base, direct) + indirect, toLinear(sourceLight));
-    vec3 lit = toSrgb(clamp(toLinear(albedo.rgb) * illumination, 0.0, 1.0));
+    vec3 diffuse = toLinear(albedo.rgb) * illumination * surfaceDiffuseWeight(material.x);
+    // Keep self emission independent of the metallic diffuse reduction.
+    diffuse = max(diffuse, toLinear(albedo.rgb) * toLinear(sourceLight));
+    vec3 specular = deferred ? vec3(0.0) : surfaceReflection(localPosition, normal, shadingNormal, toLinear(albedo.rgb), material);
+    vec3 lit = toSrgb(clamp(diffuse + specular, 0.0, 1.0));
     fragColor = linear_fog(vec4(lit, alpha), vertexDistance, FogStart, FogEnd, FogColor);
 }

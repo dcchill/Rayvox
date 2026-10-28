@@ -32,6 +32,7 @@ public final class Rayvox {
     public static final ModConfigSpec.IntValue ACTIVE_LIGHTS;
     public static final ModConfigSpec.IntValue LIGHTS_PER_SECTION;
     public static final ModConfigSpec.BooleanValue SHADOWS;
+    public static final ModConfigSpec.BooleanValue SHADER_REFLECTIONS;
     public static final ModConfigSpec.BooleanValue CULLING;
     public static final ModConfigSpec.IntValue SHADOW_DISTANCE;
     public static final ModConfigSpec.IntValue SHADOW_DRAW_DISTANCE;
@@ -42,6 +43,8 @@ public final class Rayvox {
     public static final ModConfigSpec.BooleanValue GODRAYS;
     public static final ModConfigSpec.IntValue SUN_SHADOW_DISTANCE;
     public static final ModConfigSpec.BooleanValue MATERIALS;
+    public static final ModConfigSpec.BooleanValue TEXTURE_BUMP;
+    public static final ModConfigSpec.BooleanValue METAL_REFLECTIONS;
     public static final ModConfigSpec.BooleanValue INDIRECT;
     public static final ModConfigSpec.BooleanValue WORLD_INDIRECT;
     public static final ModConfigSpec.IntValue INDIRECT_INTERVAL;
@@ -58,13 +61,13 @@ public final class Rayvox {
 
     static {
         var builder = new ModConfigSpec.Builder();
-        RENDER_BACKEND = builder.comment("Renderer selection; applies between frames. AUTO retains OpenGL until Vulkan playable acceptance is complete. VULKAN_VANILLA preserves Minecraft lighting; VULKAN_PATH_TRACING uses realistic lighting.")
+        RENDER_BACKEND = builder.comment("Renderer selection; applies between frames. AUTO retains OpenGL until Vulkan playable acceptance is complete. VULKAN_VANILLA preserves Minecraft lighting; VULKAN_SHADER adds rasterized sun/moon shadows and screen-space reflections without ray-tracing hardware; VULKAN_PATH_TRACING uses path-traced lighting.")
                 .defineEnum("renderBackend",dev.rayvox.render.BackendMode.AUTO);
         VULKAN_MEMORY = builder.comment("Vulkan GPU memory budget in MiB; applies when a Vulkan renderer initializes.")
                 .defineInRange("vulkanMemoryMiB",2048,512,8192);
         ANTI_ALIASING = builder.comment("World-only anti-aliasing; OFF, FXAA, or path-tracing-only TAA. Does not filter the HUD.")
                 .defineEnum("antiAliasing", AntiAliasing.OFF);
-        UPSCALING = builder.comment("Internal render resolution. Vanilla uses spatial upscaling; path tracing retains temporal reconstruction. ADAPTIVE uses delayed GPU timings on the path tracer only and stays native in vanilla.")
+        UPSCALING = builder.comment("Internal render resolution. Raster Vulkan uses spatial upscaling; path tracing retains temporal reconstruction. ADAPTIVE uses delayed GPU timings on the path tracer only and stays native in raster modes.")
                 .defineEnum("upscaling", UpscalingMode.ADAPTIVE);
         UPSCALER = builder.comment("Path-tracing upscaler: RECONSTRUCTION or optional NVIDIA DLSS. DLSS includes AA; unavailable DLSS falls back to reconstruction and FXAA (or selected TAA). Requires an NGX-enabled build and supported NVIDIA GPU/driver.")
                 .defineEnum("upscaler", dev.rayvox.render.Upscaler.RECONSTRUCTION);
@@ -82,6 +85,8 @@ public final class Rayvox {
         LIGHTS_PER_SECTION = builder.comment("Maximum point lights/rays per fragment, selected within 4-block cells. Key retained for existing configs.")
                 .defineInRange("lightsPerSection", 4, 1, LightSourceManager.PER_SECTION);
         SHADOWS = builder.define("blockShadows", true);
+        SHADER_REFLECTIONS = builder.comment("Screen-space reflections in VULKAN_SHADER; only visible surfaces can be reflected.")
+                .define("shaderReflections", true);
         CULLING = builder.comment("Cull lighting and shadow work using the camera frustum and conservative voxel occlusion.")
                 .define("lightingCulling", true);
         ENTITY_SHADOWS = builder.comment("Real-time shadows from up to 16 nearby visible living/solid entities. Uses rounded bounds rather than animated model geometry.")
@@ -104,6 +109,10 @@ public final class Rayvox {
                 .define("godrays", true);
         SUN_SHADOW_DISTANCE = builder.comment("Sun/moon shadow range in blocks, with gradual receiver and caster fades. Expands the voxel cache only while directional shadows are enabled.")
                 .defineInRange("directionalShadowDistance", 48, 16, 64);
+        TEXTURE_BUMP = builder.comment("OpenGL: subtle bump normals generated from block textures.")
+                .define("textureBumpDetail", true);
+        METAL_REFLECTIONS = builder.comment("OpenGL: metallic highlights and faint glass/ice reflections; four voxel rays bounded to eight blocks.")
+                .define("metalReflections", true);
         MATERIALS = builder.comment("Experimental RGB glass, water attenuation and box/quarter-block partial shadow shapes.")
                 .define("advancedMaterials", false);
         INDIRECT = builder.comment("Experimental one-bounce voxel GI: six-block gathers with eight-sample accumulation. Expensive; no dynamic-light bounce.")
@@ -129,6 +138,12 @@ public final class Rayvox {
         container.registerConfig(ModConfig.Type.CLIENT, SPEC);
         modBus.addListener((RegisterKeyMappingsEvent event) -> event.register(DEBUG_KEY));
         modBus.addListener(RayvoxEngine::registerShaders);
+        modBus.addListener((net.neoforged.fml.event.lifecycle.FMLClientSetupEvent event) -> event.enqueueWork(() -> {
+            // Clear glass needs sorted alpha blending so empty texels can carry faint reflections.
+            var translucent = net.minecraft.client.renderer.RenderType.translucent();
+            net.minecraft.client.renderer.ItemBlockRenderTypes.setRenderLayer(net.minecraft.world.level.block.Blocks.GLASS, translucent);
+            net.minecraft.client.renderer.ItemBlockRenderTypes.setRenderLayer(net.minecraft.world.level.block.Blocks.GLASS_PANE, translucent);
+        }));
         NeoForge.EVENT_BUS.addListener(Rayvox::tick);
         NeoForge.EVENT_BUS.addListener(RayvoxEngine::renderStage);
     }

@@ -37,7 +37,7 @@ public final class RenderBackends {
         if(backend!=null)return;
         selected=Rayvox.RENDER_BACKEND.get();
         try{backend=create(selected);}catch(RuntimeException|LinkageError failure){fallback("Vulkan initialization failed",failure);}
-        if(level!=null&&backend instanceof VulkanBackend)terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
+        if(level!=null&&needsTerrain())terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
     }
     private static RenderBackend create(BackendMode requested) {
         if(requested==BackendMode.OPENGL)return new OpenGlBackend("Selected in settings");
@@ -46,13 +46,15 @@ public final class RenderBackends {
             throw new IllegalStateException("Unsupported custom renderer: "+mod);
         }
         if(Minecraft.getInstance().options.graphicsMode().get()==GraphicsStatus.FABULOUS)throw new IllegalStateException("Vulkan requires Fast or Fancy graphics");
-        RenderBackend candidate=requested==BackendMode.VULKAN_VANILLA?new VulkanRasterBackend(Rayvox.VULKAN_MEMORY.get()*1048576L):new VulkanBackend(Rayvox.VULKAN_MEMORY.get()*1048576L);
+        RenderBackend candidate=BackendSelection.raster(requested)?new VulkanRasterBackend(Rayvox.VULKAN_MEMORY.get()*1048576L,requested==BackendMode.VULKAN_SHADER):new VulkanBackend(Rayvox.VULKAN_MEMORY.get()*1048576L);
         try {
             candidate.initialize();var main=Minecraft.getInstance().getMainRenderTarget();candidate.resize(main.width,main.height);return candidate;
         }catch(RuntimeException|LinkageError failure){try{candidate.close();}catch(RuntimeException cleanup){failure.addSuppressed(cleanup);}throw failure;}
     }
     public static boolean active(){return (backend instanceof VulkanBackend||backend instanceof VulkanRasterBackend)&&Rayvox.ENABLED.get();}
     public static boolean pathTracing(){return backend instanceof VulkanBackend&&Rayvox.ENABLED.get();}
+    public static boolean shaderLighting(){return backend instanceof VulkanRasterBackend raster&&raster.shaderLighting()&&Rayvox.ENABLED.get();}
+    private static boolean needsTerrain(){return backend instanceof VulkanBackend||backend instanceof VulkanRasterBackend raster&&raster.shaderLighting();}
     public static VulkanRasterBackend raster(){return backend instanceof VulkanRasterBackend raster?raster:null;}
     public static boolean renderingWorld(){return renderingWorld&&Rayvox.ENABLED.get();}
     public static boolean realisticLighting(){return BackendSelection.realisticLighting(selected==null?Rayvox.RENDER_BACKEND.get():selected,Rayvox.ENABLED.get());}
@@ -72,7 +74,7 @@ public final class RenderBackends {
         catch(RuntimeException|LinkageError failure){try{candidate.close();}catch(RuntimeException cleanup){failure.addSuppressed(cleanup);}pendingMode=null;fallback("Renderer switch cleanup failed",failure);Rayvox.RENDER_BACKEND.set(selected);Rayvox.RENDER_BACKEND.save();return;}
         backend=candidate;selected=requested;pendingMode=null;switchFailure="";Rayvox.RENDER_BACKEND.set(requested);
         RasterHooks.clear();TextureSnapshots.clear();captured.clear();previousDynamic=Set.of();RayvoxEngine.rendererChanged();
-        if(level!=null&&backend instanceof VulkanBackend)terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
+        if(level!=null&&needsTerrain())terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
         Minecraft.getInstance().levelRenderer.allChanged();Rayvox.RENDER_BACKEND.save();
     }
     public static void beginFrame(){
@@ -89,14 +91,17 @@ public final class RenderBackends {
         previousDynamic=Set.copyOf(captured.keySet());captured.clear();batchCounts.clear();
     }
     public static void endFrame(){
-        if(backend instanceof VulkanRasterBackend raster)try{raster.endFrame();}catch(RuntimeException|LinkageError failure){fallback("Vulkan vanilla frame failed",failure);}
+        if(backend instanceof VulkanRasterBackend raster)try{
+            // Shader lighting runs after AFTER_LEVEL listeners; keep its frame resources alive until resolveWorld.
+            if(raster.shaderLighting())raster.flush();else raster.endFrame();
+        }catch(RuntimeException|LinkageError failure){fallback("Vulkan raster frame failed",failure);}
         capturing=false;renderingWorld=false;
     }
     /** Called after AFTER_LEVEL listeners, before the hand depth clear and any GUI rendering. */
     public static void resolveWorld() {
         if(!active())return;
         try {
-            if(backend instanceof VulkanRasterBackend raster){raster.detach();return;}
+            if(backend instanceof VulkanRasterBackend raster){raster.resolveWorld();raster.endFrame();return;}
             if(backend instanceof VulkanBackend vulkan&&(vulkan.dlssActive()||Rayvox.ANTI_ALIASING.get()!=AntiAliasing.FXAA&&!vulkan.dlssFallbackFxaa()))return;
             var main=Minecraft.getInstance().getMainRenderTarget();
             if(main.width<1||main.height<1)return;
@@ -118,26 +123,28 @@ public final class RenderBackends {
         mesh.close();return true;
     }
     public static void renderStage(RenderLevelStageEvent event) {
-        if(!pathTracing()||event.getStage()!=RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS)return;
+        if((!pathTracing()&&!shaderLighting())||event.getStage()!=RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS)return;
         try {
             var mc=Minecraft.getInstance();if(mc.level==null)return;
             if(mc.getMainRenderTarget().width<1||mc.getMainRenderTarget().height<1)return;
             updateLevel(mc.level);
             var position=event.getCamera().getPosition();
             int atlas=mc.getTextureManager().getTexture(TextureAtlas.LOCATION_BLOCKS).getId();TextureSnapshots.request(atlas);
-            int radius=((VulkanBackend)backend).sceneRadius(mc.options.renderDistance().get());
-            var update=terrain.update(mc.level,position.x,position.y,position.z,radius,atlas,((VulkanBackend)backend).availableMeshSlots());backend.update(update);
-            backend.update(new Scene.Update(List.of(),List.of(),TextureSnapshots.drain(),false));
+            int radius=shaderLighting()?(Rayvox.SUN_SHADOW_DISTANCE.get()+15)/16+1:((VulkanBackend)backend).sceneRadius(mc.options.renderDistance().get());
+            var update=terrain.update(mc.level,position.x,position.y,position.z,radius,atlas,shaderLighting()?4:((VulkanBackend)backend).availableMeshSlots());backend.update(update);
+            if(pathTracing())backend.update(new Scene.Update(List.of(),List.of(),TextureSnapshots.drain(),false));
             var vp=new Matrix4f(event.getProjectionMatrix()).mul(event.getModelViewMatrix());
             float partial=mc.getTimer().getGameTimeDeltaPartialTick(false);
             var sky=mc.level.getSkyColor(position,partial);
             var sun=DirectionalLight.at(mc.level.getSunAngle(partial),mc.level.getMoonBrightness(),mc.level.getRainLevel(partial),mc.level.dimensionType().hasSkyLight()&&Rayvox.SUNLIGHT.get());
             var dynamic=new ArrayList<Scene.Light>();
-            if(Rayvox.DYNAMIC.get())for(var light:DynamicLights.collect(mc.level,position,partial,RayvoxEngine.lightColors())) {
+            if(pathTracing()&&Rayvox.DYNAMIC.get())for(var light:DynamicLights.collect(mc.level,position,partial,RayvoxEngine.lightColors())) {
                 var definition=light.definition();dynamic.add(new Scene.Light(light.x(),light.y(),light.z(),LightDefinition.linear(definition.red())*definition.intensity()*20,LightDefinition.linear(definition.green())*definition.intensity()*20,LightDefinition.linear(definition.blue())*definition.intensity()*20,definition.radius()));
             }
-            backend.resize(mc.getMainRenderTarget().width,mc.getMainRenderTarget().height);
-            mc.getMainRenderTarget().bindWrite(true);
+            if(pathTracing()) {
+                backend.resize(mc.getMainRenderTarget().width,mc.getMainRenderTarget().height);
+                mc.getMainRenderTarget().bindWrite(true);
+            }
             float[] fog=RenderSystem.getShaderFogColor();
             backend.render(new Scene.Camera(new Matrix4f(vp).invert(),vp,position.x,position.y,position.z,
                     new Vector3f(sun.x(),sun.y(),sun.z()),new Vector3f(sun.red(),sun.green(),sun.blue()).mul(sun.strength()*4),new Vector3f((float)sky.x,(float)sky.y,(float)sky.z),dynamic,world,false,
@@ -150,7 +157,7 @@ public final class RenderBackends {
         if(backend instanceof VulkanBackend vulkan)vulkan.clearScene();
         if(backend instanceof VulkanRasterBackend raster){raster.reload();RasterHooks.clear();}
         level=current;world++;captured.clear();previousDynamic=Set.of();
-        if(current!=null&&backend instanceof VulkanBackend)terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
+        if(current!=null&&needsTerrain())terrain=new TerrainScene(world,(state,emission)->RayvoxEngine.lightColors().resolve(state,emission));
     }
     public static void blockChanged(ClientLevel changed,int x,int y,int z){
         if(changed!=level||terrain==null)return;
@@ -171,7 +178,7 @@ public final class RenderBackends {
         com.mojang.logging.LogUtils.getLogger().error(reason,failure);
         try{if(terrain!=null)terrain.close();}catch(RuntimeException cleanup){failure.addSuppressed(cleanup);}finally{terrain=null;}
         try{if(failed instanceof VulkanRasterBackend raster)raster.discardPending();if(failed!=null)failed.close();}catch(RuntimeException cleanup){com.mojang.logging.LogUtils.getLogger().error("Vulkan cleanup failed",cleanup);}
-        backend=new OpenGlBackend(reason+": "+failure.getMessage(),selected==BackendMode.VULKAN_VANILLA);capturing=false;captured.clear();RasterHooks.clear();TextureSnapshots.clear();
+        backend=new OpenGlBackend(reason+": "+failure.getMessage(),BackendSelection.raster(selected));capturing=false;captured.clear();RasterHooks.clear();TextureSnapshots.clear();
         if(Minecraft.getInstance().level!=null)Minecraft.getInstance().levelRenderer.allChanged();
     }
     public static void failed(String reason,Throwable failure){fallback(reason,failure);}

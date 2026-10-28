@@ -1,7 +1,6 @@
 package dev.rayvox;
 
 import java.util.List;
-import net.minecraft.world.phys.AABB;
 import static dev.rayvox.WorldLightingCache.Channel.*;
 
 /** World-owned residency and invalidation. Static indirect probes have an optional GPU producer. */
@@ -14,10 +13,9 @@ final class WorldLightingState implements AutoCloseable {
     private int sunEpoch = -1;
     private DirectionalLight indirectSun;
     private List<LightSourceManager.Light> dynamic = List.of(), testLights = List.of();
-    private List<AABB> casters = List.of();
 
     void update(VoxelGrid grid, long emitters, long sources, LightSourceManager lights,
-            List<LightSourceManager.Light> moving, DirectionalLight sun, List<AABB> entityCasters) {
+            List<LightSourceManager.Light> moving, DirectionalLight sun) {
         if (geometryRevision != grid.snapshotRevision) {
             // Only committed uploaded sections can acquire residency. Never retain mutable extraction buffers.
             for (var slot : grid.slots) if (slot.uploaded)
@@ -48,10 +46,6 @@ final class WorldLightingState implements AutoCloseable {
         if (!sun.equals(indirectSun)) {
             cache.invalidateAll(INDIRECT);
             indirectSun = sun;
-        }
-        if (!casters.equals(entityCasters)) {
-            cache.invalidateAll(STATIC_DIRECT, DIRECTIONAL_VISIBILITY);
-            casters = List.copyOf(entityCasters);
         }
         scheduler.advanceFrame();
     }

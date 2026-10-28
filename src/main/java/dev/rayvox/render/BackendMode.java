@@ -1,3 +1,3 @@
 package dev.rayvox.render;
 
-public enum BackendMode { AUTO, OPENGL, VULKAN_PATH_TRACING, VULKAN_VANILLA }
+public enum BackendMode { AUTO, OPENGL, VULKAN_PATH_TRACING, VULKAN_VANILLA, VULKAN_SHADER }

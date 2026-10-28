@@ -28,7 +28,9 @@ final class RayvoxSettingsScreen extends Screen {
         columnWidth = Math.min(220, (width - 32) / 2);
         left = (width - columnWidth * 2 - 8) / 2;
         boolean vanilla=RenderBackends.requestedMode()==dev.rayvox.render.BackendMode.VULKAN_VANILLA;
-        boolean vulkan=RenderBackends.active()||vanilla;
+        boolean shader=RenderBackends.requestedMode()==dev.rayvox.render.BackendMode.VULKAN_SHADER;
+        boolean raster=vanilla||shader;
+        boolean vulkan=RenderBackends.active()||raster;
         if(vulkan) {
             renderer();
             toggle("Rayvox rendering",Rayvox.ENABLED,"Enable the selected renderer.");
@@ -37,21 +39,28 @@ final class RayvoxSettingsScreen extends Screen {
                 Rayvox.ANTI_ALIASING.set(modes[(Rayvox.ANTI_ALIASING.get().ordinal() + 1) % modes.length]);
                 Rayvox.PRESET.set(QualityPreset.CUSTOM);
                 Rayvox.ANTI_ALIASING.save();
-            }, "OFF or FXAA for either Vulkan renderer; TAA uses path-tracing reprojection and history. Filters only the world, never the HUD.");
+            }, "OFF or FXAA for all Vulkan modes; TAA uses path-tracing reprojection and history. Filters only the world, never the HUD.");
             cycle("Upscaling", () -> Rayvox.UPSCALING.get().name(), () -> {
                 var modes = UpscalingMode.values();
                 Rayvox.UPSCALING.set(modes[(Rayvox.UPSCALING.get().ordinal() + 1) % modes.length]);
                 Rayvox.PRESET.set(QualityPreset.CUSTOM);
                 Rayvox.UPSCALING.save();
-            }, "NATIVE: 100%. QUALITY: 67%. BALANCED: 59%. PERFORMANCE: 50%. Vanilla uses spatial upscaling; path tracing uses temporal reconstruction. ADAPTIVE adjusts path-traced resolution using GPU timings only.");
-            if(!vanilla)cycle("Upscaler",()->Rayvox.UPSCALER.get().name(),()->{
+            }, "NATIVE: 100%. QUALITY: 67%. BALANCED: 59%. PERFORMANCE: 50%. Raster Vulkan uses spatial upscaling; path tracing uses temporal reconstruction. ADAPTIVE adjusts path-traced resolution using GPU timings only.");
+            if(!raster)cycle("Upscaler",()->Rayvox.UPSCALER.get().name(),()->{
                 var modes=dev.rayvox.render.Upscaler.values();
                 Rayvox.UPSCALER.set(modes[(Rayvox.UPSCALER.get().ordinal()+1)%modes.length]);
                 Rayvox.PRESET.set(QualityPreset.CUSTOM);Rayvox.UPSCALER.save();
             },"DLSS: NVIDIA AI upscaling with AA. Requires an NGX-enabled build and a supported NVIDIA GPU/driver. Falls back to reconstruction with FXAA or selected TAA. Diagnostics reports the active path. NATIVE uses DLAA; ADAPTIVE recreates DLSS when the input size changes.");
-                if(vanilla)slider("Upscale sharpness", Rayvox.UPSCALE_SHARPNESS, 0, 100, "%",
-                    "Vanilla Vulkan spatial-upscaling sharpness; 0 disables sharpening. Only applies below native resolution. The hand and HUD stay untouched.");
-            if(!vanilla) {
+                if(raster)slider("Upscale sharpness", Rayvox.UPSCALE_SHARPNESS, 0, 100, "%",
+                    "Vulkan spatial-upscaling sharpness; 0 disables sharpening. Only applies below native resolution. The hand and HUD stay untouched.");
+            if(shader) {
+                toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable sun/moon shadow lighting. Uses raster shadow maps without ray tracing.");
+                toggle("Realtime shadows",Rayvox.SHADOWS,"Rasterized terrain shadows, including nearby off-screen terrain and cutout foliage.");
+                toggle("Entity shadows",Rayvox.ENTITY_SHADOWS,"Add current-frame opaque entity and block-entity geometry to the sun/moon shadow map.");
+                slider("Shadow draw distance",Rayvox.SUN_SHADOW_DISTANCE,16,64," blocks","Sun/moon shadow-map coverage around the camera. Larger distances include more terrain.");
+                toggle("Reflections",Rayvox.SHADER_REFLECTIONS,"Screen-space reflections, strongest on translucent terrain such as water. Only visible surfaces can be reflected; reflections fade at screen edges.");
+            }
+            if(!raster) {
                 toggle("Sun and moon",Rayvox.SUNLIGHT,"Enable directional sun and moon illumination.");
                 toggle("Held item lights",Rayvox.DYNAMIC,"Emissive held blocks illuminate the path-traced world.");
             }
@@ -61,7 +70,7 @@ final class RayvoxSettingsScreen extends Screen {
             toggle("Lighting culling", Rayvox.CULLING,
                     "Skip lighting and shadow work outside the view or fully blocked by opaque geometry. Disable to compare performance.");
             slider("History memory", Rayvox.HISTORY_MEMORY, 64, 2048, " MiB",
-                    "GPU memory limit for lighting history. Full-resolution 4K with deferred indirect lighting needs about 791 MiB. Too small a budget disables reuse.");
+                    "GPU memory limit for lighting history. Full-resolution 4K with deferred indirect lighting needs about 854 MiB. Too small a budget disables reuse.");
             slider("Voxel cache radius", Rayvox.CACHE_RADIUS, 1, 4, " sections",
                     "Minimum cache radius. Shadow draw distances may expand it; larger caches use more memory.");
             slider("Shadowed lights", Rayvox.ACTIVE_LIGHTS, 1, LightSourceManager.MAX_LIGHTS, "",
@@ -109,10 +118,12 @@ final class RayvoxSettingsScreen extends Screen {
                     "Sun/moon shadow range. Larger distances expand the voxel cache and cost more memory and GPU time.");
             toggle("Held item lights", Rayvox.DYNAMIC, "Light from emissive blocks held by nearby players.");
             toggle("Lighting history", Rayvox.HISTORY, "Reuse lighting on stationary surfaces to reduce GPU work.");
+            toggle("Texture bump detail", Rayvox.TEXTURE_BUMP, "OpenGL: subtle surface relief generated from block texture brightness.");
+            toggle("Surface reflections", Rayvox.METAL_REFLECTIONS, "OpenGL: shiny metals and faint glass/ice reflections of nearby voxel colors within eight blocks. Adds GPU work.");
             toggle("Advanced materials", Rayvox.MATERIALS, "Experimental colored glass, water and partial block shadow shapes.");
             toggle("Indirect light", Rayvox.INDIRECT, "Experimental one-bounce lighting. Expensive.");
             toggle("World indirect cache", Rayvox.WORLD_INDIRECT, "Experimental four-block probes reuse bounce lighting as you move. Requires Indirect light, DEFERRED pipeline and Lighting history.");
-            toggle("Entity shadows", Rayvox.ENTITY_SHADOWS, "Real-time shadows from up to 16 nearby entities using rounded body bounds. Requires block shadows.");
+            toggle("Entity shadows", Rayvox.ENTITY_SHADOWS, "Real-time shadows from up to 16 nearby entities; players use animated model parts. Requires block shadows.");
             slider("Shadow softness", Rayvox.SHADOW_SOFTNESS, 0, 4, "",
                     "0: sharp. 1–4: progressively softer block, entity and sky shadows using four area-light samples. Costs more GPU time.");
         }
@@ -133,7 +144,7 @@ final class RayvoxSettingsScreen extends Screen {
             var modes=dev.rayvox.render.BackendMode.values();
             RenderBackends.requestMode(modes[(RenderBackends.requestedMode().ordinal()+1)%modes.length]);
             rebuildWidgets();
-        },"Applies next frame. Vanilla Vulkan uses Minecraft lighting without ray tracing. Realistic Vulkan requires a ray-capable GPU. Fast/Fancy graphics required; failed switches retain the working mode.");
+        },"Applies next frame. VULKAN_SHADER: raster shadows and screen-space reflections, no ray-tracing hardware needed. VULKAN_VANILLA: Minecraft lighting. VULKAN_PATH_TRACING: ray-capable GPU required. Fast/Fancy graphics required; failed switches retain the working mode.");
     }
 
     private void toggle(String label, ModConfigSpec.BooleanValue setting, String help) {
@@ -182,7 +193,7 @@ final class RayvoxSettingsScreen extends Screen {
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
         super.render(graphics, mouseX, mouseY, partialTick);
         graphics.drawCenteredString(font, title, width / 2, 12, 0xffffff);
-        graphics.drawCenteredString(font, Rayvox.RENDER_BACKEND.get()==dev.rayvox.render.BackendMode.VULKAN_VANILLA?"Vulkan vanilla lighting":RenderBackends.pathTracing()?"Vulkan realistic lighting":performance ? "OpenGL performance" : "OpenGL lighting", width / 2, 26, 0xaaaaaa);
+        graphics.drawCenteredString(font, Rayvox.RENDER_BACKEND.get()==dev.rayvox.render.BackendMode.VULKAN_SHADER?"Vulkan shader lighting":Rayvox.RENDER_BACKEND.get()==dev.rayvox.render.BackendMode.VULKAN_VANILLA?"Vulkan vanilla lighting":RenderBackends.pathTracing()?"Vulkan realistic lighting":performance ? "OpenGL performance" : "OpenGL lighting", width / 2, 26, 0xaaaaaa);
     }
 
     @Override public void onClose() { minecraft.setScreen(parent); }

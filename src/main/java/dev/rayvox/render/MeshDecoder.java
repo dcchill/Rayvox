@@ -10,7 +10,13 @@ import org.joml.Vector4f;
 public final class MeshDecoder {
     private MeshDecoder() {}
     public static ByteBuffer decode(MeshData mesh,int material,Matrix4f transform) {
-        var state=mesh.drawState();var format=state.format();
+        return decode(mesh.drawState(),mesh.vertexBuffer(),material,transform);
+    }
+    public static ByteBuffer decode(RasterMesh mesh,int material,Matrix4f transform) {
+        return decode(mesh.state(),mesh.vertices(),material,transform);
+    }
+    private static ByteBuffer decode(MeshData.DrawState state,ByteBuffer vertices,int material,Matrix4f transform) {
+        var format=state.format();
         int position=format.getOffset(VertexFormatElement.POSITION),normal=format.getOffset(VertexFormatElement.NORMAL),
                 color=format.getOffset(VertexFormatElement.COLOR),uv=format.getOffset(VertexFormatElement.UV0),light=format.getOffset(VertexFormatElement.UV2);
         if(position<0)return ByteBuffer.allocateDirect(0);
@@ -21,7 +27,7 @@ public final class MeshDecoder {
         } else if(state.mode()==VertexFormat.Mode.TRIANGLES) {
             indices=new int[state.vertexCount()];for(int i=0;i<indices.length;i++)indices[i]=i;
         } else return ByteBuffer.allocateDirect(0);
-        var source=mesh.vertexBuffer().duplicate().order(ByteOrder.nativeOrder());
+        var source=vertices.duplicate().order(ByteOrder.nativeOrder());
         var target=ByteBuffer.allocateDirect(indices.length*Scene.VERTEX_BYTES).order(ByteOrder.nativeOrder());
         var p=new Vector4f();var n=new Vector3f();
         for(int index:indices) {

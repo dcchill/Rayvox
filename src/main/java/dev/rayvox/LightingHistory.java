@@ -64,7 +64,7 @@ final class LightingHistory implements AutoCloseable {
         begin(width, height, revision, sunRevision, gi, false);
     }
 
-    static int bytesPerPixel(boolean gi, boolean deferred) { return (gi ? 64 : 48) + (deferred ? 36 : 0); }
+    static int bytesPerPixel(boolean gi, boolean deferred) { return (gi ? 64 : 48) + (deferred ? 44 : 0); }
 
     static boolean fitsBudget(int width, int height, boolean gi, boolean deferred) {
         return fitsBudget(width, height, gi, deferred, Rayvox.HISTORY_MEMORY.get() * 1024L * 1024);
@@ -285,7 +285,7 @@ final class LightingHistory implements AutoCloseable {
                 inputs = texture(width, height, GL_RGBA16F);
                 base = texture(width, height, GL_RGBA8);
                 emission = texture(width, height, GL_RGBA8);
-                albedo = texture(width, height, GL_RGBA16F);
+                albedo = texture(width, height, GL_RGBA32F);
                 dynamic = texture(width, height, GL_RGBA16F);
                 composed = texture(width, height, GL_RGBA8);
             }

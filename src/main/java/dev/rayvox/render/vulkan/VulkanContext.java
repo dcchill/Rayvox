@@ -28,6 +28,7 @@ public final class VulkanContext implements AutoCloseable {
     int family, timestampBits;
     int scratchAlignment=256;
     boolean rayTracingSupported;
+    boolean independentBlend;
     boolean dlssExtensions;
     String dlssUnavailable="DLSS was not enabled on this Vulkan device";
     float timestampPeriod;
@@ -147,9 +148,10 @@ public final class VulkanContext implements AutoCloseable {
                 vkGetPhysicalDeviceQueueFamilyProperties(candidate,count,null);
                 var families=VkQueueFamilyProperties.calloc(count.get(0),stack);
                 vkGetPhysicalDeviceQueueFamilyProperties(candidate,count,families);
-                int queueFlags=rayTracing?VK_QUEUE_COMPUTE_BIT:VK_QUEUE_GRAPHICS_BIT;
-                for(int q=0;q<families.remaining();q++) if((families.get(q).queueFlags()&queueFlags)!=0) {
+                int queueFlags=rayTracing?VK_QUEUE_COMPUTE_BIT:VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT;
+                for(int q=0;q<families.remaining();q++) if((families.get(q).queueFlags()&queueFlags)==queueFlags) {
                     physical=candidate; family=q; timestampBits=families.get(q).timestampValidBits();
+                    independentBlend=features.features().independentBlend();
                     rayTracingSupported=ray.rayQuery()&&accel.accelerationStructure()&&f12.bufferDeviceAddress()&&f12.shaderSampledImageArrayNonUniformIndexing()&&f12.descriptorBindingPartiallyBound()&&f13.synchronization2()&&features.features().shaderInt64();
                     name=props.properties().deviceNameString(); timestampPeriod=props.properties().limits().timestampPeriod(); break;
                 }
@@ -180,7 +182,7 @@ public final class VulkanContext implements AutoCloseable {
             var queues=VkDeviceQueueCreateInfo.calloc(1,stack); queues.get(0).sType$Default().queueFamilyIndex(family).pQueuePriorities(stack.floats(1));
             var names=stack.mallocPointer(required.size()); for(String extension:required) names.put(stack.UTF8(extension)); names.flip();
             var deviceInfo=VkDeviceCreateInfo.calloc(stack).sType$Default().pNext(f13.address()).pQueueCreateInfos(queues)
-                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(rayTracing).shaderStorageImageExtendedFormats(dlssExtensions));
+                    .ppEnabledExtensionNames(names).pEnabledFeatures(VkPhysicalDeviceFeatures.calloc(stack).shaderInt64(rayTracing).shaderStorageImageExtendedFormats(dlssExtensions).independentBlend(!rayTracing&&independentBlend));
             int created=vkCreateDevice(physical,deviceInfo,null,out);
             if(created!=VK_SUCCESS&&dlssExtensions) {
                 dlssExtensions=false;dlssUnavailable="DLSS device creation failed (VkResult "+created+")";

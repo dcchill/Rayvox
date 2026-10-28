@@ -31,6 +31,7 @@ public final class RayvoxEngine {
     private static LightSourceManager lights = new LightSourceManager();
     private static final LightingCulling culling = new LightingCulling();
     private static GpuLightCache gpuLights;
+    private static GpuEntityShadows gpuEntities;
     private static DistantLightCache distant = new DistantLightCache();
     private static String status = "Waiting for shader registration";
     private static String gpu = "Not detected";
@@ -45,7 +46,7 @@ public final class RayvoxEngine {
     private static GpuTimer timer;
     private static boolean frozen, profiling;
     private static List<LightSourceManager.Light> dynamic = List.of();
-    private static List<net.minecraft.world.phys.AABB> entityCasters = List.of();
+    private static List<EntityShadows.Caster> entityCasters = List.of();
     private static HistoryStamp historyStamp;
     private static long sourceRevision, historyRevision;
     private static long updateNanos;
@@ -65,7 +66,7 @@ public final class RayvoxEngine {
     // Effective per-frame settings: user configuration capped by the governor's current level.
     private static int effSoftness = 2, effDrawDistance = 32, effLightsPerCell = 4, effSunDistance = 48, effRefresh = 1, effIndirectInterval = 1;
     private static boolean effIndirect;
-    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int drawDistance, int sunDistance, int view, boolean materials, boolean indirect, int softness, boolean entities, DirectionalLight indirectSky, boolean worldIndirect, boolean culling) {}
+    private record HistoryStamp(long grid, long sources, long distant, boolean shadows, int distance, int drawDistance, int sunDistance, int view, boolean materials, boolean indirect, int softness, boolean entities, DirectionalLight indirectSky, boolean worldIndirect, boolean culling, boolean bump) {}
 
     private RayvoxEngine() {}
 
@@ -260,14 +261,16 @@ public final class RayvoxEngine {
                 var nextCasters = Rayvox.SHADOWS.get() && Rayvox.ENTITY_SHADOWS.get()
                         ? EntityShadows.collect(level, camera, event.getPartialTick().getGameTimeDeltaPartialTick(false),
                                 cull ? culling : null, sun, effSunDistance, Rayvox.SHADOW_DISTANCE.get())
-                        : List.<net.minecraft.world.phys.AABB>of();
-                if (!entityCasters.equals(nextCasters)) { entityCasters = nextCasters; historyRevision++; }
+                        : List.<EntityShadows.Caster>of();
+                entityCasters = nextCasters;
+                if(gpuEntities==null)gpuEntities=new GpuEntityShadows();
+                gpuEntities.update(entityCasters,camera);
             }
             if (worldLighting == null) worldLighting = new WorldLightingState();
-            if (!frozen) worldLighting.update(worldCache.grid, distant.revision, sourceRevision, lights, dynamic, sun, entityCasters);
+            if (!frozen) worldLighting.update(worldCache.grid, distant.revision, sourceRevision, lights, dynamic, sun);
             // shortcut: any scene edit invalidates all history; use regional keys if profiling justifies their complexity.
             var stamp = new HistoryStamp(worldCache.grid.snapshotRevision, sourceRevision, distant.revision,
-                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), effDrawDistance, effSunDistance, debugMode, Rayvox.MATERIALS.get(), effIndirect, effSoftness, Rayvox.ENTITY_SHADOWS.get(), effIndirect ? sun : DirectionalLight.OFF, Rayvox.WORLD_INDIRECT.get(), cull);
+                    Rayvox.SHADOWS.get(), Rayvox.SHADOW_DISTANCE.get(), effDrawDistance, effSunDistance, debugMode, Rayvox.MATERIALS.get(), effIndirect, effSoftness, Rayvox.ENTITY_SHADOWS.get(), effIndirect ? sun : DirectionalLight.OFF, Rayvox.WORLD_INDIRECT.get(), cull, Rayvox.TEXTURE_BUMP.get());
             if (!stamp.equals(historyStamp)) { historyStamp = stamp; historyRevision++; }
             boolean historyView = debugMode == 0 || debugMode == 5 || debugMode == 6 || debugMode == 7;
             deferredActive = Rayvox.PIPELINE.get() == LightingPipeline.DEFERRED && lightingPipeline != null && !passFailed
@@ -356,7 +359,7 @@ public final class RayvoxEngine {
     private static LightingPass.Frame lightingFrame(RenderLevelStageEvent event) {
         var camera = event.getCamera().getPosition();
         return new LightingPass.Frame(worldCache.grid, gpuCache, gpuLights, lights.budgetBoundary,
-                camera.x, camera.y, camera.z, sun, materials, entityCasters, Rayvox.SHADOWS.get(),
+                camera.x, camera.y, camera.z, sun, materials, gpuEntities, Rayvox.SHADOWS.get(),
                 Rayvox.SHADOW_DISTANCE.get(), effDrawDistance, effSunDistance, effSoftness, effRefresh, effIndirectInterval,
                 dynamic, effIndirect, debugMode, RenderSystem.getShaderFogColor(), worldIndirect);
     }
@@ -423,6 +426,7 @@ public final class RayvoxEngine {
         deferredActive = false;
         historyStamp = null;
         if (gpuLights != null) { gpuLights.close(); gpuLights = null; }
+        if (gpuEntities != null) { gpuEntities.close(); gpuEntities = null; }
         if (gpuCache != null) {
             gpuCache.close();
             gpuCache = null;
@@ -436,6 +440,7 @@ public final class RayvoxEngine {
     }
 
     public static void close() {
+        SurfaceAtlas.close();
         RenderBackends.close();
         renderingWorld = false;
         closeGpuCache();
@@ -483,12 +488,15 @@ public final class RayvoxEngine {
         RenderSystem.assertOnRenderThread();
         updateLevel(Minecraft.getInstance().level);
         if (terrain == null || level == null || !Rayvox.ENABLED.get() || gpuCache == null || gpuLights == null || worldCache == null) return vanilla;
-        if (layer != RenderType.solid() && layer != RenderType.cutout() && layer != RenderType.cutoutMipped()) return vanilla;
+        boolean translucent = layer == RenderType.translucent() && Rayvox.METAL_REFLECTIONS.get();
+        if (!translucent && layer != RenderType.solid() && layer != RenderType.cutout() && layer != RenderType.cutoutMipped()) return vanilla;
         int variant = (Rayvox.MATERIALS.get() ? 1 : 0) | (sun.strength() > 0 ? 2 : 0) | (effIndirect ? 4 : 0);
         var shader = terrainVariants[variant];
         if (shader == null) return vanilla;
         configureSurfaceShader(shader, cameraX, cameraY, cameraZ);
-        shader.getUniform("AlphaCutoff").set(layer == RenderType.cutout() ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
+        shader.translucent = translucent;
+        if (translucent) shader.history = null;
+        shader.getUniform("AlphaCutoff").set(layer == RenderType.cutout() || translucent ? 0.1f : layer == RenderType.cutoutMipped() ? 0.5f : 0.0f);
         shader.getUniform("DebugMode").set(debugMode);
         return shader;
     }
@@ -512,7 +520,7 @@ public final class RayvoxEngine {
         entityShader.history = null;
         entityShader.timer = null;
         // Bounds approximate casters, not animated receivers: avoid shadowing a mob by its own bounds.
-        entityShader.entityCasters = List.of();
+        entityShader.entities = null;
         entityShader.getUniform("AlphaCutoff").set(name.equals("rendertype_entity_solid") ? 0.0f : 0.1f);
         return entityShader;
     }
@@ -532,7 +540,7 @@ public final class RayvoxEngine {
         shader.history = history;
         shader.timer = timer;
         shader.dynamic = dynamic;
-        shader.entityCasters = entityCasters;
+        shader.entities = gpuEntities;
         shader.sun = sun;
         shader.materials = materials;
         shader.cameraX = cameraX; shader.cameraY = cameraY; shader.cameraZ = cameraZ;
@@ -636,6 +644,11 @@ public final class RayvoxEngine {
     }
 
     public static String status() { return status; }
+    public static boolean replacesEntityShadow(net.minecraft.world.entity.Entity entity) {
+        return !RenderBackends.active() && RenderBackends.realisticLighting() && Rayvox.SHADOWS.get() && Rayvox.ENTITY_SHADOWS.get()
+                && gpuEntities!=null && entityCasters.stream().limit(EntityShadows.MAX_CASTERS).anyMatch(caster -> caster.entityId()==entity.getId());
+    }
+    public static int playerShadowPartCount() { return gpuEntities == null ? 0 : gpuEntities.parts; }
     public static int entityShadowCount() { return Math.min(EntityShadows.MAX_CASTERS, entityCasters.size()); }
     public static String gpu() { return gpu; }
     public static boolean computeAvailable() { return compute; }

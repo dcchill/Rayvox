@@ -34,12 +34,14 @@ final class RasterPipeline implements AutoCloseable {
                     .depthBiasEnable(state.offset()).depthBiasConstantFactor(state.offsetUnits()).depthBiasSlopeFactor(state.offsetFactor());
             var multisample=VkPipelineMultisampleStateCreateInfo.calloc(stack).sType$Default().rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
             var depth=VkPipelineDepthStencilStateCreateInfo.calloc(stack).sType$Default().depthTestEnable(state.depth()).depthWriteEnable(state.depth()&&state.depthWrite()).depthCompareOp(state.depthFunction()-org.lwjgl.opengl.GL11.GL_NEVER);
-            var attachment=VkPipelineColorBlendAttachmentState.calloc(1,stack).blendEnable(state.blend()).colorWriteMask(state.colorMask())
+            var attachment=VkPipelineColorBlendAttachmentState.calloc(shader.lighting?2:1,stack);
+            attachment.get(0).blendEnable(state.blend()).colorWriteMask(state.colorMask())
                     .srcColorBlendFactor(RasterState.factor(state.sourceRgb())).dstColorBlendFactor(RasterState.factor(state.destinationRgb())).colorBlendOp(RasterState.operation(state.rgbOp()))
                     .srcAlphaBlendFactor(RasterState.factor(state.sourceAlpha())).dstAlphaBlendFactor(RasterState.factor(state.destinationAlpha())).alphaBlendOp(RasterState.operation(state.alphaOp()));
+            if(shader.lighting)attachment.get(1).colorWriteMask(15);
             var blend=VkPipelineColorBlendStateCreateInfo.calloc(stack).sType$Default().pAttachments(attachment);
             var dynamic=VkPipelineDynamicStateCreateInfo.calloc(stack).sType$Default().pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_BLEND_CONSTANTS));
-            var rendering=VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(stack.ints(VK_FORMAT_R8G8B8A8_UNORM)).depthAttachmentFormat(VK_FORMAT_D32_SFLOAT);
+            var rendering=VkPipelineRenderingCreateInfo.calloc(stack).sType$Default().pColorAttachmentFormats(shader.lighting?stack.ints(VK_FORMAT_R8G8B8A8_UNORM,VK_FORMAT_R32G32B32A32_SFLOAT):stack.ints(VK_FORMAT_R8G8B8A8_UNORM)).depthAttachmentFormat(VK_FORMAT_D32_SFLOAT);
             var info=VkGraphicsPipelineCreateInfo.calloc(1,stack).sType$Default().pNext(rendering.address()).pStages(stages).pVertexInputState(input).pInputAssemblyState(assembly)
                     .pViewportState(viewport).pRasterizationState(raster).pMultisampleState(multisample).pDepthStencilState(depth).pColorBlendState(blend).pDynamicState(dynamic).layout(layout);
             var out=stack.mallocLong(1);check(vkCreateGraphicsPipelines(context.device,0,info,null,out),"create vanilla raster pipeline");pipeline=out.get(0);

@@ -1,5 +1,5 @@
 // Experimental one-bounce voxel gather; no scene-independent ambient color or screen tint.
-vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
+vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell, int shadowSample) {
     ivec3 slot = cacheSlot(cell);
     int row = slot.x + CacheWidth * (slot.y + CacheWidth * slot.z);
     ivec3 tile = (cell % 16) / 4;
@@ -20,7 +20,7 @@ vec3 bounceLighting(vec3 hit, vec3 normal, ivec3 cell) {
         if (falloff * diffuse <= 0.0) continue;
         vec3 visibility = vec3(1.0);
         if (ShadowsEnabled != 0 && radiance.w > 0.5)
-            visibility = blockVisibility(hit + normal * 0.03, light.xyz, tileOccluded(header, i));
+            visibility = blockVisibility(hit + normal * 0.03, light.xyz, tileOccluded(header, i), shadowSample);
         result += radiance.rgb * falloff * falloff * diffuse * visibility;
     }
 #ifndef RAYVOX_NO_DIRECTIONAL_SHADOWS
@@ -48,8 +48,7 @@ vec3 bounceDirection(vec3 normal, int sampleIndex) {
             + normal * sqrt(1.0 - u);
 }
 
-vec3 bounceSample(vec3 origin, vec3 normal, int sampleIndex) {
-    vec3 ray = bounceDirection(normal, sampleIndex) * 6.0;
+vec3 surfaceRay(vec3 origin, vec3 ray, vec3 normal, bool reflection, int shadowSample) {
     ivec3 cell = ivec3(floor(origin));
     ivec3 stepDir = ivec3(sign(ray));
     vec3 delta = 1.0 / max(abs(ray), vec3(0.0000001));
@@ -72,7 +71,8 @@ vec3 bounceSample(vec3 origin, vec3 normal, int sampleIndex) {
                 || shapeHit(cell, origin, ray, entry, min(nearest, 1.0), (voxel & 64) != 0, hitDistance, subNormal)));
         if (blocked) {
             if (dot(subNormal, subNormal) > 0.0) hitNormal = subNormal;
-            return throughput * bounceLighting(origin + ray * hitDistance, hitNormal, cell);
+            float fade = reflection ? 1.0 - smoothstep(6.0, 8.0, hitDistance * length(ray)) : 1.0;
+            return throughput * bounceLighting(origin + ray * hitDistance, hitNormal, cell, shadowSample) * (reflection ? 2.0 : 1.0) * fade;
         }
         if (AdvancedMaterials != 0 && (material == 3 || material >= 16)) {
             float distance = shapeThickness(cell, origin, ray, entry, min(nearest, 1.0), (voxel & 64) != 0) * length(ray);
@@ -87,4 +87,8 @@ vec3 bounceSample(vec3 origin, vec3 normal, int sampleIndex) {
         entry = nearest;
     }
     return vec3(0.0);
+}
+
+vec3 bounceSample(vec3 origin, vec3 normal, int sampleIndex) {
+    return surfaceRay(origin, bounceDirection(normal, sampleIndex) * 6.0, normal, false, -1);
 }

@@ -13,8 +13,19 @@ final class RasterShader {
     final List<Field> fields=new ArrayList<>();
     final String vertex,fragment;
     final int bytes;
+    final boolean lighting;
 
     RasterShader(String vertex,String fragment,List<String> attributes) {
+        this(vertex,fragment,attributes,false,0);
+    }
+    RasterShader(String vertex,String fragment,List<String> attributes,boolean lighting,float reflectivity) {
+        this.lighting=lighting;
+        if(lighting) {
+            vertex += "\nout float rayvoxSky;\n";
+            vertex=wrapMain(vertex,"rayvoxSky="+(Pattern.compile("\\bin\\s+ivec2\\s+UV2\\s*;").matcher(vertex).find()?"clamp(float(UV2.y)/240.0,0.0,1.0)":"0.0")+";");
+            fragment += "\nin float rayvoxSky;\n";
+            fragment=wrapMain(fragment,"rayvoxSurface=vec4(rayvoxSky,"+reflectivity+",gl_FragCoord.z,1.0);");
+        }
         var definitions=new LinkedHashMap<String,String>();
         for(var source:List.of(vertex,fragment)) {
             var matcher=UNIFORM.matcher(source);
@@ -43,6 +54,10 @@ final class RasterShader {
         while(matcher.find())if(matcher.group(3).equals("out"))varyings.put(matcher.group(5),varyings.size());
         this.vertex=port(vertex,true,attributes,varyings,block.toString());
         this.fragment=port(fragment,false,attributes,varyings,block.toString());
+    }
+    private static String wrapMain(String source,String body) {
+        return source.replaceFirst("\\bvoid\\s+main\\s*\\(\\s*(?:void)?\\s*\\)","void rayvoxVanillaMain()")
+                +"\nvoid main(){rayvoxVanillaMain();"+body+"}\n";
     }
     private static int size(String type) {
         return switch(type) {
@@ -78,7 +93,7 @@ final class RasterShader {
             end--;
             source=source.substring(0,end)+"\ngl_Position.z=(gl_Position.z+gl_Position.w)*0.5;\n"+source.substring(end);
         }
-        return "#version 450\n"+block+source;
+        return "#version 450\n"+block+(!vertex&&source.contains("rayvoxSurface=")?"layout(location=1) out vec4 rayvoxSurface;\n":"")+source;
     }
     void write(ShaderInstance shader,ByteBuffer destination,int base) {
         for(var field:fields) {

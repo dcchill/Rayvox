@@ -13,7 +13,7 @@ bool tileOccluded(uint header, int entry) {
     return CullingDisabled == 0 && (header & (1u << uint(16 + entry))) != 0u;
 }
 
-vec3 blockVisibility(vec3 origin, vec3 target, bool occluded) {
+vec3 blockVisibility(vec3 origin, vec3 target, bool occluded, int sampleIndex) {
 #ifdef RAYVOX_WORLD_PROBES
     // World irradiance has no camera fades, area-light jitter, or moving entity dependencies.
     return occluded || distance(origin, target) > ShadowDistance ? vec3(0.0) : traceTransmission(origin, target, false);
@@ -23,14 +23,19 @@ vec3 blockVisibility(vec3 origin, vec3 target, bool occluded) {
     float cameraDistance = max(length(origin - camera), length(target - camera));
     float fade = 1.0 - smoothstep(ShadowDrawDistance * 0.5, ShadowDrawDistance, cameraDistance);
     if (fade <= 0.0) return vec3(1.0);
-    vec3 visibility = occluded || distance(origin, target) > ShadowDistance ? vec3(0.0) : softTransmission(origin, target);
+    vec3 visibility=occluded||distance(origin,target)>ShadowDistance?vec3(0):sampledTransmission(origin,target,sampleIndex);
     return mix(vec3(1.0), visibility, fade);
 #endif
 }
 
+vec3 blockVisibility(vec3 origin,vec3 target,bool occluded) { return blockVisibility(origin,target,occluded,-1); }
+
 vec3 blockVisibility(vec3 origin, vec3 target) {
     return blockVisibility(origin, target, false);
 }
+
+vec3 blockVisibilityCurrent(vec3 origin,vec3 target,bool occluded) { return blockVisibility(origin,target,occluded,-2); }
+vec3 blockVisibilityCurrent(vec3 origin,vec3 target) { return blockVisibilityCurrent(origin,target,false); }
 
 // Source-budget and cache-range fades for a near static light. Matched records only correct a stable section light.
 #ifndef RAYVOX_WORLD_PROBES
